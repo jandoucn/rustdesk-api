@@ -15,16 +15,91 @@ class MySQLIntegrationTest(unittest.TestCase):
     def setUpClass(cls):
         cls.client = HttpClient(os.environ.get("RUSTDESK_TEST_URL", "http://127.0.0.1:17000"))
         cls.container = os.environ["RUSTDESK_MYSQL_CONTAINER"]
+        cls.api_container = os.environ.get("RUSTDESK_API_CONTAINER")
         cls.password = os.environ.get("RUSTDESK_MYSQL_PASSWORD", "testpass")
 
     @classmethod
-    def sql(cls, statement):
+    def sql(cls, statement, database="rustdesk"):
         command = [
             "docker", "exec", cls.container, "env", f"MYSQL_PWD={cls.password}",
-            "mysql", "--default-character-set=utf8mb4", "-N", "-B", "-urustdesk", "rustdesk", "-e", statement,
+            "mysql", "--default-character-set=utf8mb4", "-N", "-B", "-urustdesk", database, "-e", statement,
         ]
         env = {**os.environ, "HOME": "/tmp/codex-home", "DOCKER_HOST": "unix:///Users/olly/.docker/run/docker.sock"}
         return subprocess.check_output(command, env=env, text=True).strip().splitlines()
+
+    @classmethod
+    def root_sql(cls, statement):
+        command = [
+            "docker", "exec", cls.container, "env", "MYSQL_PWD=rootpass",
+            "mysql", "--default-character-set=utf8mb4", "-N", "-B", "-uroot", "-e", statement,
+        ]
+        env = {**os.environ, "HOME": "/tmp/codex-home", "DOCKER_HOST": "unix:///Users/olly/.docker/run/docker.sock"}
+        return subprocess.check_output(command, env=env, text=True).strip().splitlines()
+
+    def test_00_legacy_v6_database_migrates_without_losing_device_rows(self):
+        if not self.api_container:
+            self.skipTest("RUSTDESK_API_CONTAINER is required for the real MySQL migration test")
+        database = "rustdesk_legacy_v6"
+        self.root_sql(f"DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL ON {database}.* TO 'rustdesk'@'%';")
+        self.sql("CREATE TABLE app_meta (`key` VARCHAR(128) PRIMARY KEY,value TEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; INSERT INTO app_meta VALUES ('schema_version','5');", database)
+        self.sql("CREATE TABLE device_deployments (id VARCHAR(128) PRIMARY KEY,uuid VARCHAR(256) NOT NULL,pk TEXT NOT NULL,uid BIGINT UNSIGNED,payload LONGTEXT NOT NULL,updated_at BIGINT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; INSERT INTO device_deployments VALUES ('LegacyID','LegacyUUID','legacy-pk',NULL,'{\"future\":{\"keep\":1}}',1700000000);", database)
+        self.sql("CREATE TABLE device_reports (id VARCHAR(128) NOT NULL,uuid VARCHAR(256) NOT NULL,payload LONGTEXT NOT NULL,last_seen BIGINT NOT NULL,last_heartbeat BIGINT NOT NULL DEFAULT 0,heartbeat_payload LONGTEXT NOT NULL,PRIMARY KEY(id,uuid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; INSERT INTO device_reports VALUES ('LegacyID','LegacyUUID','{\"hostname\":\"legacy-host\"}',1700000001,1700000002,'{\"ver\":9}');", database)
+        php = (
+            "require '/var/www/html/lib.php';"
+            f"open_database(null,['database'=>'mysql','mysql_host'=>'{self.container}','mysql_port'=>3306,'mysql_database'=>'{database}','mysql_user'=>'rustdesk','mysql_password'=>'{self.password}']);"
+        )
+        command = ["docker", "exec", self.api_container, "php", "-r", php]
+        subprocess.check_call(command, env={**os.environ, "HOME": "/tmp/codex-home", "DOCKER_HOST": "unix:///Users/olly/.docker/run/docker.sock"})
+        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'", database), ["8"])
+        self.assertEqual(self.sql("SELECT id,uuid,pk,JSON_EXTRACT(payload,'$.future.keep') FROM device_deployments", database), ["LegacyID\tLegacyUUID\tlegacy-pk\t1"])
+        self.assertEqual(self.sql("SELECT id,uuid,JSON_UNQUOTE(JSON_EXTRACT(payload,'$.hostname')),JSON_UNQUOTE(JSON_EXTRACT(heartbeat_payload,'$.ver')) FROM device_reports", database), ["LegacyID\tLegacyUUID\tlegacy-host\t9"])
+        self.assertEqual(self.sql("SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION),GROUP_CONCAT(COLLATION_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_deployments' AND COLUMN_NAME IN ('id','uuid')", database), ["id,uuid\tutf8mb4_bin,utf8mb4_bin"])
+        self.assertEqual(self.sql("SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_deployments' AND CONSTRAINT_NAME='PRIMARY'", database), ["id,uuid"])
+
+    def test_00b_web_setup_promotes_existing_mysql_user_in_place(self):
+        if not self.api_container:
+            self.skipTest("RUSTDESK_API_CONTAINER is required for the real MySQL setup parity test")
+        database = "rustdesk_setup_legacy"
+        self.root_sql(f"DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL ON {database}.* TO 'rustdesk'@'%';")
+        self.sql(
+            "CREATE TABLE rustdesk_users (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,username VARCHAR(128) NOT NULL,password VARCHAR(255) NOT NULL,create_time BIGINT NOT NULL DEFAULT 0,delete_time BIGINT NOT NULL DEFAULT 0) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+            "CREATE TABLE rustdesk_token (access_token VARCHAR(128) NOT NULL,username VARCHAR(128) NOT NULL,uid BIGINT UNSIGNED NOT NULL DEFAULT 0,id VARCHAR(128) NOT NULL,uuid VARCHAR(256),login_time BIGINT NOT NULL DEFAULT 0,expire_time BIGINT NOT NULL DEFAULT 0) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+            "CREATE TABLE rustdesk_peers (deviceid BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,uid BIGINT UNSIGNED NOT NULL DEFAULT 0,id VARCHAR(128) NOT NULL,username VARCHAR(128),hostname VARCHAR(255),alias VARCHAR(255),platform VARCHAR(128),tags TEXT,hash VARCHAR(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+            "INSERT INTO rustdesk_users VALUES (1,'admin','legacy-hash',1700000000,0);"
+            "INSERT INTO rustdesk_token VALUES (REPEAT('b',64),'admin',1,'old-device','old-uuid',1700000001,0);"
+            "INSERT INTO rustdesk_peers(uid,id,alias) VALUES (1,'preserved-peer','preserved-alias');",
+            database,
+        )
+        php = (
+            "require '/var/www/html/lib.php';"
+            f"$settings=['database'=>'mysql','mysql_host'=>'{self.container}','mysql_port'=>3306,'mysql_database'=>'{database}','mysql_user'=>'rustdesk','mysql_password'=>'{self.password}'];"
+            "$db=open_database(null,$settings);"
+            "create_initial_administrator($db,'admin',password_hash('new-admin-password',PASSWORD_DEFAULT),static fn()=>null);"
+        )
+        subprocess.check_call(["docker", "exec", self.api_container, "php", "-r", php], env={**os.environ, "HOME": "/tmp/codex-home", "DOCKER_HOST": "unix:///Users/olly/.docker/run/docker.sock"})
+        self.assertEqual(self.sql("SELECT id,username,is_admin,enabled,delete_time,auth_version,password<>'legacy-hash' FROM rustdesk_users WHERE username='admin'", database), ["1\tadmin\t1\t1\t0\t1\t1"])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM rustdesk_users WHERE username='admin'; SELECT COUNT(*) FROM rustdesk_token WHERE uid=1; SELECT alias FROM rustdesk_peers WHERE uid=1 AND id='preserved-peer';", database), ["1", "0", "preserved-alias"])
+
+    def test_00c_duplicate_legacy_username_blocks_setup_without_mutation(self):
+        if not self.api_container:
+            self.skipTest("RUSTDESK_API_CONTAINER is required for the real MySQL setup parity test")
+        database = "rustdesk_setup_duplicates"
+        self.root_sql(f"DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL ON {database}.* TO 'rustdesk'@'%';")
+        self.sql(
+            "CREATE TABLE rustdesk_users (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,username VARCHAR(128) NOT NULL,password VARCHAR(255) NOT NULL,create_time BIGINT NOT NULL DEFAULT 0,delete_time BIGINT NOT NULL DEFAULT 0) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+            "INSERT INTO rustdesk_users(username,password,create_time,delete_time) VALUES ('admin','first-hash',1700000000,0),('admin','second-hash',1700000001,0);",
+            database,
+        )
+        php = (
+            "require '/var/www/html/lib.php';"
+            f"$settings=['database'=>'mysql','mysql_host'=>'{self.container}','mysql_port'=>3306,'mysql_database'=>'{database}','mysql_user'=>'rustdesk','mysql_password'=>'{self.password}'];"
+            "$db=open_database(null,$settings);"
+            "try{create_initial_administrator($db,'admin',password_hash('new-admin-password',PASSWORD_DEFAULT),static fn()=>null);exit(2);}"
+            "catch(InstallationConflict $error){fwrite(STDOUT,$error->getMessage());}"
+        )
+        output = subprocess.check_output(["docker", "exec", self.api_container, "php", "-r", php], env={**os.environ, "HOME": "/tmp/codex-home", "DOCKER_HOST": "unix:///Users/olly/.docker/run/docker.sock"}, text=True)
+        self.assertIn("重复记录", output)
+        self.assertEqual(self.sql("SELECT id,password,is_admin,auth_version FROM rustdesk_users ORDER BY id", database), ["1\tfirst-hash\t0\t0", "2\tsecond-hash\t0\t0"])
 
     def admin_login(self):
         _, session, _ = self.client.json("GET", "/ops-x9/api/session")
@@ -36,7 +111,8 @@ class MySQLIntegrationTest(unittest.TestCase):
         return {"Authorization": "Bearer " + body["access_token"]}
 
     def test_01_public_and_custom_admin_path(self):
-        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'"), ["5"])
+        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'"), ["8"])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_reports' AND COLUMN_NAME IN ('runtime_payload','network_payload')"), ["2"])
         self.assertEqual(
             self.sql("SELECT COUNT(*),COUNT(DISTINCT TABLE_COLLATION),MIN(TABLE_COLLATION) FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()"),
             ["18\t1\tutf8mb4_unicode_ci"],
@@ -83,7 +159,7 @@ class MySQLIntegrationTest(unittest.TestCase):
         auth = self.client_login(device="mysql-device")
         self.client.json("POST", "/api/devices/deploy", {"id": "deploy-mysql", "uuid": "uuid-1", "pk": "pk-1"}, auth)
         self.client.json("POST", "/api/devices/cli", {"id": "deploy-mysql", "uuid": "uuid-1", "device_name": "Managed"}, auth)
-        self.client.request("POST", "/api/sysinfo", {"id": "deploy-mysql", "uuid": "uuid-1", "hostname": "real-host", "os": "linux", "version": "1.4.6"}, expected=(200,))
+        self.client.request("POST", "/api/sysinfo", {"id": "deploy-mysql", "uuid": "uuid-1", "hostname": "real-host", "os": "linux", "version": "1.5.0", "platform": "windows", "distribution": "sos", "install_mode": "portable", "network": {"private_ips": ["10.0.0.8"]}}, expected=(200,))
         nonce = "92233720368547758081234567890"
         self.client.json("POST", "/api/audit/conn", {"id": "deploy-mysql", "uuid": "uuid-1", "nonce": nonce})
         self.client.json("POST", "/api/audit/conn", {"id": "deploy-mysql", "uuid": "uuid-1", "nonce": nonce})
@@ -94,6 +170,7 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.client.request("POST", "/api/record?op=part&filename=e2e.webm&id=mysql-session", b"frame-2", expected=(200,))
         self.assertEqual(self.sql("SELECT id,uuid,JSON_UNQUOTE(JSON_EXTRACT(payload,'$.device_name')) FROM device_deployments WHERE id='deploy-mysql'"), ["deploy-mysql\tuuid-1\tManaged"])
         self.assertEqual(self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.hostname')) FROM device_reports WHERE id='deploy-mysql'"), ["real-host"])
+        self.assertEqual(self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(runtime_payload,'$.distribution')),JSON_UNQUOTE(JSON_EXTRACT(network_payload,'$.private_ips[0]')) FROM device_reports WHERE id='deploy-mysql'"), ["sos\t10.0.0.8"])
         self.assertEqual(self.sql(f"SELECT COUNT(*) FROM audit_events WHERE nonce='{nonce}'"), ["1"])
         self.assertEqual(self.sql("SELECT note FROM audit_notes WHERE guid='mysql-note'"), ["hello"])
         self.assertEqual(self.sql("SELECT signature FROM switch_grants WHERE id='deploy-mysql' AND verifier='v'"), ["sig"])
@@ -383,6 +460,42 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.assertEqual((first["total"], len(first["data"]), len(second["data"])), (205, 200, 5))
         self.assertEqual(len({row["id"] for row in first["data"] + second["data"]}), 205)
         self.assertEqual(self.sql("SELECT COUNT(*) FROM ab_profile_peers WHERE guid='" + guid + "' AND id LIKE 'mysql-admin-page-%'"), ["205"])
+
+    def test_16_device_inventory_uses_id_and_uuid_as_identity(self):
+        csrf = self.admin_login()
+        device_id = "mysql-shared-device"
+        auth = self.client_login(device="mysql-composite")
+        for uuid_value, hostname in (("uuid-a", "mysql-host-a"), ("uuid-b", "mysql-host-b")):
+            self.client.json("POST", "/api/devices/deploy", {"id": device_id, "uuid": uuid_value, "pk": "pk-" + uuid_value}, auth)
+            self.client.request("POST", "/api/sysinfo", {"id": device_id, "uuid": uuid_value, "hostname": hostname, "version": "1.5.0"})
+        self.assertEqual(self.sql(f"SELECT id,uuid FROM device_deployments WHERE id='{device_id}' ORDER BY uuid"), [f"{device_id}\tuuid-a", f"{device_id}\tuuid-b"])
+        self.client.json("DELETE", f"/ops-x9/api/devices/{device_id}?uuid=uuid-a", {}, {"X-CSRF-Token": csrf})
+        self.assertEqual(self.sql(f"SELECT id,uuid FROM device_reports WHERE id='{device_id}' ORDER BY uuid"), [f"{device_id}\tuuid-b"])
+        self.assertEqual(self.sql(f"SELECT id,uuid FROM device_deployments WHERE id='{device_id}' ORDER BY uuid"), [f"{device_id}\tuuid-b"])
+
+    def test_17_device_identity_is_case_sensitive_and_wrong_uuid_is_not_success(self):
+        csrf = self.admin_login()
+        device_id = "mysql-case-device"
+        for uuid_value, hostname in (("CaseUUID", "upper-host"), ("caseuuid", "lower-host")):
+            self.client.request("POST", "/api/sysinfo", {"id": device_id, "uuid": uuid_value, "hostname": hostname, "future": {"nested": {"keep": True}}})
+        self.assertEqual(self.sql(f"SELECT uuid,JSON_UNQUOTE(JSON_EXTRACT(payload,'$.hostname')) FROM device_reports WHERE id='{device_id}' ORDER BY BINARY uuid"), ["CaseUUID\tupper-host", "caseuuid\tlower-host"])
+        self.client.json("DELETE", f"/ops-x9/api/devices/{device_id}?uuid=missing", {}, {"X-CSRF-Token": csrf}, expected=(404,))
+        self.assertEqual(self.sql(f"SELECT COUNT(*) FROM device_reports WHERE id='{device_id}'"), ["2"])
+
+        nested_id = "mysql-nested-json"
+        self.client.request("POST", "/api/sysinfo", {
+            "id": nested_id, "uuid": "nested-uuid", "hostname": "first",
+            "network": {"private_ips": ["10.0.0.8"], "future": {"keep": 1, "replace": "old"}},
+            "future": {"nested": {"keep": True, "replace": "old"}},
+        })
+        self.sql("UPDATE device_reports SET network_payload=JSON_SET(network_payload,'$.future',JSON_OBJECT('keep',1),'$.geo',JSON_OBJECT('city','stale')) WHERE id='mysql-nested-json'")
+        self.client.request("POST", "/api/sysinfo", {
+            "id": nested_id, "uuid": "nested-uuid", "hostname": "second",
+            "network": {"private_ips": ["10.0.0.9"], "future": {"replace": "new"}},
+            "future": {"nested": {"replace": "new"}},
+        })
+        self.assertEqual(self.sql("SELECT JSON_EXTRACT(payload,'$.future.nested.keep'),JSON_UNQUOTE(JSON_EXTRACT(payload,'$.future.nested.replace')),JSON_EXTRACT(payload,'$.network.future.keep'),JSON_UNQUOTE(JSON_EXTRACT(payload,'$.network.future.replace')) FROM device_reports WHERE id='mysql-nested-json'"), ["true\tnew\t1\tnew"])
+        self.assertEqual(self.sql("SELECT JSON_EXTRACT(network_payload,'$.future.keep'),JSON_UNQUOTE(JSON_EXTRACT(network_payload,'$.private_ips[0]')),JSON_CONTAINS_PATH(network_payload,'one','$.geo') FROM device_reports WHERE id='mysql-nested-json'"), ["1\t10.0.0.9\t0"])
 
 
 if __name__ == "__main__":

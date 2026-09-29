@@ -63,11 +63,12 @@ def create_fixture(path: Path) -> None:
     )
     db.execute(
         "INSERT INTO rustdesk_users(id, username, password, create_time, delete_time) VALUES (1, ?, ?, 1700000000, 0), (2, ?, ?, 1700000001, 0)",
-        ("admin", legacy_password("admin123"), "legacy", legacy_password("legacy123")),
+        ("admin", legacy_password("old-admin-password"), "legacy", legacy_password("legacy123")),
     )
     db.execute("INSERT INTO rustdesk_peers(deviceid,uid,id,username,hostname,alias,platform,tags,hash) VALUES (11,2,'legacy-id','alice','old-host','Old alias','windows','prod,blue','legacy-hash')")
     db.execute("INSERT INTO rustdesk_tags(id,uid,tag) VALUES (7,2,'prod'),(8,2,'blue')")
     db.execute("INSERT INTO rustdesk_token(access_token,username,uid,id,uuid,login_time,expire_time) VALUES (?, 'legacy',2,'legacy-id','legacy-uuid',1700000002,0)", ("a" * 64,))
+    db.execute("INSERT INTO rustdesk_token(access_token,username,uid,id,uuid,login_time,expire_time) VALUES (?, 'admin',1,'admin-id','admin-uuid',1700000003,0)", ("b" * 64,))
     db.commit()
     db.close()
 
@@ -129,21 +130,18 @@ class IntegrationTest(unittest.TestCase):
         cls.db = cls.temp / "legacy.db"
         create_fixture(cls.db)
         runtime = Path(cls.runtime or os.environ.get("FRANKENPHP", DEFAULT_RUNTIME))
-        manage = SQLITE_DIR / "manage.php"
-        if not manage.exists():
-            raise RuntimeError("sqlite/manage.php is required by the integration contract")
-        cli = [str(runtime), "php-cli", str(manage), "--db", str(cls.db), "--migrate", "--promote-admin=1"] if runtime.name == "frankenphp" else [str(runtime), str(manage), "--db", str(cls.db), "--migrate", "--promote-admin=1"]
-        migrated = subprocess.run(cli, cwd=ROOT, env={**os.environ, "RUSTDESK_DB": str(cls.db)}, input="", text=True, capture_output=True, timeout=10)
-        if migrated.returncode != 0:
-            raise RuntimeError(f"manage.php migration failed: {migrated.stderr or migrated.stdout}")
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         cls.url = f"http://127.0.0.1:{port}"
         env = os.environ.copy()
         env["RUSTDESK_DB"] = str(cls.db)
+        env["RUSTDESK_INSTALL_CONFIG"] = str(cls.temp / "install.json")
         # Production defaults to a custom path; tests explicitly pin the public path for compatibility cases.
         env["RUSTDESK_ADMIN_PATH"] = "/ops-x9"
+        env["RUSTDESK_TRUSTED_PROXY_IPS"] = "127.0.0.1"
+        if os.environ.get("RUSTDESK_GEOIP_DATABASE"):
+            env["RUSTDESK_GEOIP_DATABASE"] = os.environ["RUSTDESK_GEOIP_DATABASE"]
         if runtime.name == "frankenphp":
             cmd = [str(runtime), "php-server", "--listen", f"127.0.0.1:{port}", "--root", str(SQLITE_DIR)]
         else:
@@ -155,6 +153,18 @@ class IntegrationTest(unittest.TestCase):
             try:
                 status, _, _ = cls.client.request("GET", "/", expected=(200, 404))
                 if status in (200, 404):
+                    _, setup, _ = cls.client.json("GET", "/setup/api/status")
+                    cls.client.json("POST", "/setup/api/install", {
+                        "database": "sqlite", "admin_path": "/ops-x9", "username": "admin",
+                        "password": "admin123", "password_confirm": "admin123",
+                    }, {"X-CSRF-Token": setup["csrf"]})
+                    db = sqlite3.connect(cls.db)
+                    promoted = db.execute("SELECT id,is_admin,enabled,auth_version,password FROM rustdesk_users WHERE username='admin'").fetchone()
+                    count = db.execute("SELECT COUNT(*) FROM rustdesk_users WHERE username='admin'").fetchone()[0]
+                    old_tokens = db.execute("SELECT COUNT(*) FROM rustdesk_token WHERE uid=1").fetchone()[0]
+                    db.close()
+                    if promoted[:4] != (1, 1, 1, 1) or promoted[4] == legacy_password("old-admin-password") or count != 1 or old_tokens != 0:
+                        raise RuntimeError(f"Web setup did not preserve and promote the legacy administrator: {promoted!r}, count={count}, tokens={old_tokens}")
                     return
             except (urllib.error.URLError, TimeoutError):
                 time.sleep(0.1)
@@ -177,17 +187,78 @@ class IntegrationTest(unittest.TestCase):
         if cls.temp:
             shutil.rmtree(cls.temp, ignore_errors=True)
 
+    def test_00_failed_config_publish_rolls_back_legacy_admin_changes(self):
+        db_path = self.temp / "rollback.db"
+        create_fixture(db_path)
+        config_target = self.temp / "config-is-a-directory"
+        config_target.mkdir()
+        script = self.temp / "rollback-test.php"
+        script.write_text(
+            "<?php declare(strict_types=1);"
+            f"require {json.dumps(str(SQLITE_DIR / 'lib.php'))};"
+            "$db=open_database($argv[1]);putenv('RUSTDESK_INSTALL_CONFIG='.$argv[2]);"
+            "try{create_initial_administrator($db,'admin',password_hash('new-admin-password',PASSWORD_DEFAULT),"
+            "static fn()=>write_installation_config(['database'=>'sqlite','admin_path'=>'/ops-x9']));exit(2);}"
+            "catch(Throwable $error){fwrite(STDOUT,$error->getMessage());}",
+            encoding="utf-8",
+        )
+        runtime = Path(self.runtime or os.environ.get("FRANKENPHP", DEFAULT_RUNTIME))
+        command = [str(runtime), "php-cli", str(script), str(db_path), str(config_target)] if runtime.name == "frankenphp" else [str(runtime), str(script), str(db_path), str(config_target)]
+        result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cannot publish installation config", result.stdout)
+        db = sqlite3.connect(db_path)
+        user = db.execute("SELECT password,is_admin,enabled,auth_version FROM rustdesk_users WHERE id=1").fetchone()
+        token_count = db.execute("SELECT COUNT(*) FROM rustdesk_token WHERE uid=1").fetchone()[0]
+        db.close()
+        self.assertEqual(user, (legacy_password("old-admin-password"), 0, 1, 0))
+        self.assertEqual(token_count, 1)
+
+    def test_00b_duplicate_legacy_username_blocks_setup_without_publishing_config(self):
+        db_path = self.temp / "duplicate-admin.db"
+        create_fixture(db_path)
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "INSERT INTO rustdesk_users(username,password,create_time,delete_time) VALUES ('admin',?,1700000004,0)",
+            (legacy_password("second-password"),),
+        )
+        db.commit()
+        db.close()
+        config_target = self.temp / "duplicate-install.json"
+        script = self.temp / "duplicate-admin-test.php"
+        script.write_text(
+            "<?php declare(strict_types=1);"
+            f"require {json.dumps(str(SQLITE_DIR / 'lib.php'))};"
+            "$db=open_database($argv[1]);"
+            "try{create_initial_administrator($db,'admin',password_hash('new-admin-password',PASSWORD_DEFAULT),"
+            "static fn()=>file_put_contents($argv[2],'published'));exit(2);}"
+            "catch(InstallationConflict $error){fwrite(STDOUT,$error->getMessage());}",
+            encoding="utf-8",
+        )
+        runtime = Path(self.runtime or os.environ.get("FRANKENPHP", DEFAULT_RUNTIME))
+        command = [str(runtime), "php-cli", str(script), str(db_path), str(config_target)] if runtime.name == "frankenphp" else [str(runtime), str(script), str(db_path), str(config_target)]
+        result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("重复记录", result.stdout)
+        self.assertFalse(config_target.exists())
+        db = sqlite3.connect(db_path)
+        rows = db.execute("SELECT id,is_admin,auth_version FROM rustdesk_users WHERE username='admin' ORDER BY id").fetchall()
+        db.close()
+        self.assertEqual(rows, [(1, 0, 0), (3, 0, 0)])
+
     def test_01_legacy_fixture_is_preserved_on_startup(self):
         db = sqlite3.connect(self.db)
         row = db.execute("SELECT username,password,create_time,delete_time FROM rustdesk_users WHERE id=2").fetchone()
         peer = db.execute("SELECT uid,id,alias,tags,hash FROM rustdesk_peers WHERE deviceid=11").fetchone()
         token = db.execute("SELECT access_token,expire_time FROM rustdesk_token WHERE uid=2").fetchone()
         schema_version = db.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0]
+        columns = {row[1] for row in db.execute("PRAGMA table_info(device_reports)").fetchall()}
         db.close()
         self.assertEqual(row, ("legacy", legacy_password("legacy123"), 1700000001, 0))
         self.assertEqual(peer, (2, "legacy-id", "Old alias", "prod,blue", "legacy-hash"))
         self.assertEqual(token, ("a" * 64, 0))
-        self.assertEqual(schema_version, "5")
+        self.assertEqual(schema_version, "8")
+        self.assertTrue({"runtime_payload", "network_payload"}.issubset(columns))
         auth = {"Authorization": "Bearer " + ("a" * 64)}
         _, current, _ = self.client.json("POST", "/?s=/api/currentUser", {"id": "legacy-id", "uuid": "legacy-uuid"}, auth)
         self.assertEqual(current.get("name"), "legacy")
@@ -271,10 +342,15 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(json.loads(empty["data"]), {"tags": [], "peers": []})
 
     def test_05_sysinfo_and_anonymous_heartbeat(self):
-        status, text, ctype = self.client.request("POST", "/?s=/api/sysinfo", {"id": "new-id", "uuid": "new-uuid", "version": "1.4.6", "hostname": "host", "os": "linux", "cpu": "x", "memory": "1G"}, expected=(200,))
+        status, text, ctype = self.client.request("POST", "/?s=/api/sysinfo", {"id": "new-id", "uuid": "new-uuid", "version": "1.5.0", "hostname": "host", "os": "linux", "cpu": "x", "memory": "1G", "platform": "linux", "distribution": "portable", "install_mode": "portable", "network": {"private_ips": ["192.168.1.20"]}}, expected=(200,))
         self.assertEqual(status, 200)
         self.assertTrue("text/plain" in ctype)
         self.assertIn("SYSINFO", text)
+        db = sqlite3.connect(self.db)
+        runtime, network = db.execute("SELECT runtime_payload,network_payload FROM device_reports WHERE id='new-id'").fetchone()
+        self.assertEqual(json.loads(runtime)["distribution"], "portable")
+        self.assertEqual(json.loads(network)["private_ips"], ["192.168.1.20"])
+        db.close()
         _, heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {"id": "anonymous", "uuid": str(uuid.uuid4()), "conns": []})
         self.assertIsInstance(heartbeat, dict)
 
@@ -771,6 +847,68 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(len(first["data"]), 200)
         self.assertEqual(len(second["data"]), 5)
         self.assertEqual(len({row["id"] for row in first["data"] + second["data"]}), 205)
+
+    def test_26_device_inventory_uses_id_and_uuid_as_identity(self):
+        csrf = self.admin_csrf()
+        device_id = "shared-device-id"
+        for uuid_value, hostname in (("uuid-a", "host-a"), ("uuid-b", "host-b"), ("CaseUUID", "host-upper"), ("caseuuid", "host-lower")):
+            self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": uuid_value, "ver": 11, "conns": []})
+            self.client.request("POST", "/?s=/api/sysinfo", {"id": device_id, "uuid": uuid_value, "hostname": hostname, "version": "1.5.0"})
+        _, listing, _ = self.client.json("GET", f"/?s=/ops-x9/api/devices&q={device_id}&page=1&pageSize=20")
+        self.assertEqual({(row["id"], row["uuid"], row["hostname"]) for row in listing["data"]}, {
+            (device_id, "uuid-a", "host-a"), (device_id, "uuid-b", "host-b"),
+            (device_id, "CaseUUID", "host-upper"), (device_id, "caseuuid", "host-lower"),
+        })
+        self.client.json("DELETE", f"/?s=/ops-x9/api/devices/{device_id}&uuid=missing", {}, {"X-CSRF-Token": csrf}, expected=(404,))
+        self.client.json("DELETE", f"/?s=/ops-x9/api/devices/{device_id}&uuid=uuid-a", {}, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT id,uuid,json_extract(payload,'$.hostname') FROM device_reports WHERE id=? ORDER BY uuid", (device_id,)).fetchall(), [
+            (device_id, "CaseUUID", "host-upper"), (device_id, "caseuuid", "host-lower"), (device_id, "uuid-b", "host-b"),
+        ])
+        db.close()
+
+    def test_27_sysinfo_recursively_preserves_unknown_json_and_refreshes_ip_geo_together(self):
+        device_id = "nested-json-device"
+        uuid_value = "nested-json-uuid"
+        self.client.request("POST", "/?s=/api/sysinfo", {
+            "id": device_id, "uuid": uuid_value, "hostname": "first-host",
+            "network": {"private_ips": ["10.0.0.8"], "future": {"keep": 1, "replace": "old"}},
+            "future": {"nested": {"keep": True, "replace": "old"}},
+        }, {"X-Real-IP": "81.2.69.160"})
+        db = sqlite3.connect(self.db)
+        stale_network = {"public_ip": "81.2.69.160", "private_ips": ["10.0.0.8"], "future": {"keep": 1}, "geo": {"city": "London"}}
+        db.execute("UPDATE device_reports SET network_payload=? WHERE id=? AND uuid=?", (json.dumps(stale_network), device_id, uuid_value))
+        db.commit()
+        db.close()
+
+        self.client.request("POST", "/?s=/api/sysinfo", {
+            "id": device_id, "uuid": uuid_value, "hostname": "second-host",
+            "network": {"private_ips": ["10.0.0.9"], "future": {"replace": "new"}},
+            "future": {"nested": {"replace": "new"}},
+        }, {"X-Real-IP": "8.8.8.8"})
+        db = sqlite3.connect(self.db)
+        payload_text, network_text = db.execute("SELECT payload,network_payload FROM device_reports WHERE id=? AND uuid=?", (device_id, uuid_value)).fetchone()
+        db.close()
+        payload = json.loads(payload_text)
+        network = json.loads(network_text)
+        self.assertEqual(payload["future"]["nested"], {"keep": True, "replace": "new"})
+        self.assertEqual(payload["network"]["future"], {"keep": 1, "replace": "new"})
+        self.assertEqual(network["future"], {"keep": 1})
+        self.assertEqual(network["private_ips"], ["10.0.0.9"])
+        self.assertEqual(network["public_ip"], "8.8.8.8")
+        self.assertNotIn("geo", network)
+
+    @unittest.skipUnless(os.environ.get("RUSTDESK_GEOIP_DATABASE"), "GeoLite database not configured")
+    def test_28_geolite_city_is_persisted_from_forwarded_public_ip(self):
+        device_id = "geo-device"
+        headers = {"X-Real-IP": "81.2.69.160"}
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": "geo-uuid", "ver": 11, "conns": []}, headers)
+        db = sqlite3.connect(self.db)
+        network = json.loads(db.execute("SELECT network_payload FROM device_reports WHERE id=? AND uuid=?", (device_id, "geo-uuid")).fetchone()[0])
+        db.close()
+        self.assertEqual(network["public_ip"], "81.2.69.160")
+        self.assertEqual(network["geo"]["country_code"], "GB")
+        self.assertEqual(network["geo"]["city"], "London")
 
 
 def main():

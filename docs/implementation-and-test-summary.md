@@ -7,7 +7,7 @@ Updated: 2026-09-29
 - One PHP route tree and one Web UI for SQLite and MySQL.
 - PDO storage abstraction with parameter binding, transactions, upsert and insert-ignore helpers.
 - SQLite legacy migration with verified pre-migration backup.
-- MySQL 8.4 schema: 18 InnoDB/utf8mb4_unicode_ci tables, no hard-coded credentials or default administrator.
+- MySQL 8.4 schema: 18 InnoDB tables; ordinary text uses `utf8mb4_unicode_ci`, while device `id`/`uuid` identity columns use case-sensitive `utf8mb4_bin`. There are no hard-coded credentials or default administrators.
 - Container internal port `80`; Compose external mapping `7000:80`.
 - Management prefix comes only from `RUSTDESK_ADMIN_PATH`, default `/ops-console`.
 - `/`, `/admin`, and unknown non-API paths render `home.html`; only the configured prefix exposes management pages and APIs.
@@ -39,8 +39,8 @@ Management endpoints use `${RUSTDESK_ADMIN_PATH}/api`:
 | GET/POST | `/users` | Search/list or create |
 | PATCH/DELETE | `/users/{id}` | Edit, disable, password change, soft delete |
 | GET | `/devices` | Search/list API clients and online state |
-| PATCH | `/devices/{id}/alias` | Update the current administrator's personal address-book alias |
-| DELETE | `/devices/{id}` | Remove deployment and report records |
+| PATCH | `/devices/{id}/alias?uuid={uuid}` | Update the current administrator's personal address-book alias after exact device validation |
+| DELETE | `/devices/{id}?uuid={uuid}` | Remove the exact deployment and report records |
 | GET | `/address-book` | List the current administrator's merged personal address book |
 | POST | `/address-book/peers` | Add a personal address-book peer |
 | PATCH/DELETE | `/address-book/peers/{id}` | Update or remove a peer in all compatible stores |
@@ -58,11 +58,11 @@ The address-book page merges legacy-only and current-profile-only peers for the 
 
 ## Real data verification
 
-SQLite suite (`tests/integration_test.py`): **25/25 passed in 4.430 seconds** on the latest run. It creates a real legacy four-table database, migrates it to schema v5, starts a real HTTP server, performs CRUD, and checks stored rows. Coverage includes legacy preservation, token lifecycle, exact address-book JSON, sysinfo/heartbeat, modal-user API CRUD with one-character passwords, session revocation, soft delete, nonce deduplication, new address-book CRUD, deploy/CLI, audit notes, switch grants, binary record chunks, client removal, custom-path isolation, heartbeat-only inventory, exact 20/21/90/91-second presence function boundaries, summary/filter behavior, alias authorization/CSRF/input validation, transactional three-store alias consistency, empty alias behavior, unknown-field preservation, and RustDesk API readback. The added personal-address-book tests verify current-user isolation, legacy/profile merging with profile precedence, three-store peer CRUD, old/current RustDesk API readback, inventory preservation on contact removal, exact tag rename/delete, administrator-scoped idempotent favorites, favorite cleanup, validation failures, and a complete 205-peer pagination boundary.
+The SQLite integration suite passed **29 tests with 1 GeoLite-only test skipped** in the host PHP runtime. The suite migrates a real legacy database to schema v8, rejects duplicate legacy administrator names without publishing configuration, verifies recursive unknown-JSON preservation, `(id, uuid)` isolation including case variants, wrong-UUID rejection, exact deletion, address-book behavior and direct SQL state. A PHP 8.3 container with the MaxMind extension separately passed a real MMDB lookup for `81.2.69.160`, persisted `GB / England / London`, then changed the public IP to `8.8.8.8` and atomically cleared the stale location.
 
-MySQL suite (`tests/mysql_integration_test.py`): **15/15 passed in 4.731 seconds** against a fresh MySQL 8.4 container. The six personal-address-book tests mirror the SQLite contracts and include direct SQL JSON/value/count assertions. Initialization assertions verify schema v5, all 18 tables, and one `utf8mb4_unicode_ci` collation.
+MySQL suite (`tests/mysql_integration_test.py`): **20/20 passed** against a fresh MySQL 8.4 container. It includes real v5/v6-style database migration to v8, duplicate legacy administrator rejection without mutation, direct SQL assertions for the case-sensitive composite deployment key, same-ID/different-UUID preservation, wrong-UUID rejection, recursive JSON preservation, atomic network/Geo state, exact deletion, runtime/network JSON, and the existing address-book matrix.
 
-- 18 tables created and normalized to `utf8mb4_unicode_ci`.
+- 18 tables created with `utf8mb4_unicode_ci` defaults; `device_reports` and `device_deployments` use `utf8mb4_bin` on `id` and `uuid`.
 - Address-book Unicode JSON value and tag count.
 - Personal peer rename and tag rename/color, then deletion counts.
 - Deployment UUID/payload, sysinfo hostname, audit nonce deduplication.
@@ -81,7 +81,7 @@ MySQL suite (`tests/mysql_integration_test.py`): **15/15 passed in 4.731 seconds
 
 ## Browser E2E
 
-`tests/e2e/admin.spec.js`: **8/8 real Chromium workflows passed in 20.0 seconds** against the fresh MySQL stack.
+`tests/e2e/admin.spec.js`: the final fresh SQLite container passed **16/16** real Chromium workflows. Geo formatting is driven by persisted `network_payload` data and checked across direct SQL, API output, list rendering and the detail dialog. Composite identities containing delimiter characters are also verified across refresh.
 
 - Public home and old `/admin` fallback.
 - Custom management path login.
@@ -90,36 +90,38 @@ MySQL suite (`tests/mysql_integration_test.py`): **15/15 passed in 4.731 seconds
 - Client page navigation, search, online filter, labelled-only filter and summary visibility.
 - Alias editing, API value readback, sync feedback and confirmed removal.
 - Five-second automatic refresh and pause while the document is hidden.
+- A changed row in the middle of a long device list retains its composite identity, keyboard focus and scroll anchor across automatic refresh; the refreshed details dialog shows the new persisted value.
+- Runtime, network, version and device details are rendered and checked against API values.
+- The network cell renders GeoLite location below the public IP: China omits the country name, foreign addresses retain it, and duplicate province/city names are collapsed.
 - Complete multi-page loading verified with 205 matching clients, including visibility of the 205th row and an exact total of 205.
 - No page or console errors.
-- Client management at mobile viewport `390x844` with no horizontal overflow.
+- Client management at `320`, `390`, `768`, `1024` and `1440` widths with no horizontal overflow.
 - Personal address-book modal cancel, peer add/edit/delete, tag add/delete, favorite toggle/filter and destructive confirmation.
 - The explicit Web-favorite versus RustDesk-native-favorite boundary copy.
 - Personal address-book mobile CRUD at `390x844` with no page overflow or console errors.
 - All 205 matching address-book peers paginated through the rendered fifth page.
 
-The interactive browser surfaces reported `Browser is not available` for both the in-app browser and Chrome. The checked-in Playwright Chromium suite still exercised the real rendered pages; desktop and mobile failure screenshots were also visually inspected while correcting selectors.
+The interactive browser surface was unavailable because the local Codex browser bridge rejected its current API-key authentication mode. The checked-in Playwright Chromium suite still exercised the real rendered pages across both databases and all required breakpoints.
 
 ## Container verification
 
-- Docker image `rustdesk-api:validation` built successfully from PHP 8.3 Alpine.
+- Docker image `rustdesk-api:inventory-v8-final` built successfully from PHP 8.3 Alpine with `maxminddb` and MySQL PDO extensions.
 - The earlier `sqlite3` extension build error was fixed by compiling only `mysqli` and `pdo_mysql`; the base image already supplies PDO SQLite.
-- SQLite container on host test port `17001` served internal port `80`, initialized an administrator, and retained the database across restart (`1` row before and after).
-- MySQL API and MySQL 8.4 ran as separate containers on an isolated Docker network. Host test port `17004` mapped to container port `80` and passed HTTP, SQL and browser tests.
-- Initialization created schema v5 and 18 tables without creating a default administrator; `manage.php --init-admin` created the first administrator from stdin. Repeating `--init-admin=admin` exited nonzero with `Username exists` and preserved the existing password.
-- A forced v4/mixed-collation fixture automatically upgraded to v5 and normalized all 18 tables to `utf8mb4_unicode_ci` on application restart.
-- MySQL persistence was checked across database and API container restarts after all final tests. The direct SQL snapshot stayed exactly `users=4 | device_reports=214 | profile_peers=417 | record_chunks=2 | record_bytes=14` before and after restart.
+- The final SQLite container on host test port `17116` served internal port `80`, initialized an administrator, and retained `users=2 | device_reports=258 | profile_peers=206` across restart.
+- The final MySQL API and MySQL 8.4 ran as separate containers on an isolated Docker network. Host test port `17117` mapped to container port `80` and passed HTTP, SQL and browser tests.
+- Initialization created schema v8 and 18 tables without a default administrator. `/setup` creates a new administrator or promotes an existing legacy user in place with the newly entered password, preserving that user's ID and data while revoking old sessions.
+- A real v5 legacy MySQL fixture with the old single-column deployment key upgraded to v8, retained its report/deployment JSON and timestamps, changed the deployment key to `(id, uuid)`, and converted device identity columns to `utf8mb4_bin`. The version bump also forces already-created v7 databases through the collation repair.
+- MySQL persistence was checked across database and API container restarts after all final tests. The direct SQL snapshot stayed exactly `users=4 | device_reports=268 | profile_peers=417 | record_chunks=2 | record_bytes=14` before and after restart.
 - The configured CSS route returned `200 text/css`, and an internal-container request to `http://127.0.0.1/` proved the service listens on port `80`.
-- A real four-table legacy SQLite fixture migrated to schema v5 with its users, peers and token preserved.
+- A real production SQLite snapshot copy migrated to schema v8 with `PRAGMA integrity_check=ok`, two users and five legacy peers preserved. The source snapshot SHA-256 remained `a2a26ac70a6cffd20532b1ef71d13e7ffd0aa49349812bc9018c9e26291a5108`.
 - Required production mapping is present in both Compose files as `7000:80`.
 
-Host port `7000` could not be bound on this Mac because macOS `ControlCenter`/AirPlay already listens on `*:7000` and returns `Server: AirTunes/980.77.5`. Equivalent container behavior was therefore verified on `17000`, `17001`, and the fresh final stack at `17004`; internal port remained `80`.
+Host port `7000` could not be bound on this Mac because macOS `ControlCenter`/AirPlay already listens on `*:7000` and returns `Server: AirTunes/980.77.5`. Equivalent final container behavior was therefore verified on `17116`, `17117`, and the GeoLite stack at `17118`; internal port remained `80`.
 
 ## Files changed
 
 - `sqlite/index.php`: shared route tree and configurable management routing.
 - `sqlite/lib.php`: PDO SQLite/MySQL storage, schema and migrations.
-- `sqlite/manage.php`: PDO-compatible administration CLI.
 - `sqlite/admin.html`, `sqlite/devices.html`, `sqlite/home.html`, `sqlite/app.css`: management and public pages plus their shared design system.
 - `mysql/index.php`: compatibility entry to the shared application.
 - `docker-compose.yaml`, `docker-compose.mysql.yaml`, `Dockerfile`, `.env.example`: deployment.

@@ -1,4 +1,5 @@
 const { test, expect } = require('@playwright/test');
+const { execFileSync } = require('node:child_process');
 
 const adminPath = process.env.RUSTDESK_ADMIN_PATH || '/ops-x9';
 
@@ -27,6 +28,36 @@ async function reportClient(request, id, hostname = `${id}-host`) {
     data: { id, uuid, hostname, username: 'browser-operator', os: 'linux', version: '1.4.6' },
   });
   expect(sysinfo.ok()).toBeTruthy();
+}
+
+async function reportRichClient(request, id) {
+  const uuid = `${id}-uuid`;
+  await expect((await request.post('/api/heartbeat', { data: { id, uuid, ver: 150, conns: [], modified_at: 0 } })).ok()).toBeTruthy();
+  const response = await request.post('/api/sysinfo', { data: {
+    id, uuid, hostname: `${id}-host`, username: 'mobile-user', os: 'windows 11', cpu: 'Test CPU', memory: '16 GB', version: '1.5.0',
+    platform: 'windows', distribution: 'sos', install_mode: 'portable', client_arch: 'x64', executable_name: 'RustDesk.exe',
+    network: { private_ips: ['192.168.1.20', '10.0.0.8'] },
+  } });
+  expect(response.ok()).toBeTruthy();
+}
+
+function persistNetworkPayload(id, uuid, network) {
+  const container = process.env.RUSTDESK_API_CONTAINER;
+  if (!container) throw new Error('RUSTDESK_API_CONTAINER is required for persisted Geo E2E');
+  const encoded = Buffer.from(JSON.stringify(network), 'utf8').toString('base64');
+  const php = [
+    "require '/var/www/html/lib.php';",
+    '$db=open_database();',
+    "$payload=base64_decode((string)getenv('TEST_NETWORK_PAYLOAD'),true);",
+    "if($payload===false)throw new RuntimeException('invalid payload');",
+    "db_exec($db,'UPDATE device_reports SET network_payload=:payload WHERE id=:id AND uuid=:uuid',['payload'=>$payload,'id'=>getenv('TEST_DEVICE_ID'),'uuid'=>getenv('TEST_DEVICE_UUID')]);",
+    "echo (string)db_one($db,'SELECT network_payload FROM device_reports WHERE id=:id AND uuid=:uuid',['id'=>getenv('TEST_DEVICE_ID'),'uuid'=>getenv('TEST_DEVICE_UUID')])['network_payload'];",
+  ].join('');
+  const output = execFileSync('docker', [
+    'exec', '-e', `TEST_DEVICE_ID=${id}`, '-e', `TEST_DEVICE_UUID=${uuid}`,
+    '-e', `TEST_NETWORK_PAYLOAD=${encoded}`, container, 'php', '-r', php,
+  ], { encoding: 'utf8' });
+  return JSON.parse(output.trim());
 }
 
 test('public routing and user CRUD work through the real browser', async ({ page }) => {
@@ -114,6 +145,94 @@ test('heartbeat-only client supports status filtering, alias sync and confirmed 
   expect(errors).toEqual([]);
 });
 
+test('client inventory keeps runtime and network details aligned with persisted report data', async ({ page, request }) => {
+  const suffix = Date.now().toString(36);
+  const deviceId = `rich-${suffix}`;
+  await reportRichClient(request, deviceId);
+  const adminPath = process.env.RUSTDESK_ADMIN_PATH || '/ops-x9';
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  await expect(row).toContainText('SOS');
+  await expect(row).toContainText('1.5.0');
+  await expect(row).toContainText('2 个内网地址');
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  await expect(page.locator('#details-dialog')).toContainText('Windows');
+  await expect(page.locator('#details-dialog')).toContainText('SOS');
+  await expect(page.locator('#details-dialog')).toContainText('Test CPU');
+  await expect(page.locator('#details-dialog')).toContainText('16 GB');
+  await expect(page.locator('#details-dialog')).toContainText('10.0.0.8');
+  await page.locator('#details-close').click();
+  const api = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
+  const device = api.data.find(item => item.id === deviceId);
+  expect(device.distribution).toBe('sos');
+  expect(device.install_mode).toBe('portable');
+  expect(device.private_ips).toEqual(['192.168.1.20', '10.0.0.8']);
+  await request.post('/api/sysinfo', { data: { id: deviceId, uuid: `${deviceId}-uuid`, hostname: `${deviceId}-host`, os: 'windows 11', version: '1.5.0' } });
+  const legacyReadback = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
+  const preserved = legacyReadback.data.find(item => item.id === deviceId);
+  expect(preserved.distribution).toBe('sos');
+  expect(preserved.private_ips).toEqual(['192.168.1.20', '10.0.0.8']);
+});
+
+test('client inventory formats domestic and foreign IP locations without repeating China', async ({ page, request }) => {
+  test.skip(!process.env.RUSTDESK_API_CONTAINER, 'requires direct SQL assertions in the API container');
+  const deviceId = `geo-format-${Date.now().toString(36)}`;
+  const uuid = `${deviceId}-uuid`;
+  await reportClient(request, deviceId);
+  const guangdong = { public_ip: '223.5.5.5', geo: { country_code: 'CN', country: '中国', region: '广东', city: '深圳' } };
+  expect(persistNetworkPayload(deviceId, uuid, guangdong)).toEqual(guangdong);
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  await expect(row).toContainText('223.5.5.5');
+  await expect(row).toContainText('广东 · 深圳');
+  await expect(row).not.toContainText('中国');
+  let api = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
+  expect(api.data.find(item => item.id === deviceId).geo).toEqual(guangdong.geo);
+
+  const shanghai = { public_ip: '223.6.6.6', geo: { country_code: 'CN', country: '中国', region: '上海', city: '上海' } };
+  expect(persistNetworkPayload(deviceId, uuid, shanghai)).toEqual(shanghai);
+  await page.locator('#refresh').click();
+  await expect(row.getByText('上海', { exact: true })).toBeVisible();
+  await expect(row).not.toContainText('上海 · 上海');
+
+  const london = { public_ip: '81.2.69.160', geo: { country_code: 'GB', country: '英国', region: 'England', city: 'London' } };
+  expect(persistNetworkPayload(deviceId, uuid, london)).toEqual(london);
+  await page.locator('#refresh').click();
+  await expect(row).toContainText('英国 · England · London');
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  await expect(page.locator('#details-dialog')).toContainText('英国 · England · London');
+  api = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
+  expect(api.data.find(item => item.id === deviceId).geo).toEqual(london.geo);
+});
+
+test('client inventory keeps delimiter-bearing composite identities distinct across refresh', async ({ page, request }) => {
+  const suffix = Date.now().toString(36);
+  const devices = [
+    { id: `${suffix}|left`, uuid: 'right', hostname: 'delimiter-first' },
+    { id: suffix, uuid: 'left|right', hostname: 'delimiter-second' },
+  ];
+  for (const device of devices) {
+    await expect((await request.post('/api/sysinfo', { data: { ...device, version: '1.5.0' } })).ok()).toBeTruthy();
+  }
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(suffix);
+  await page.getByRole('button', { name: '搜索' }).click();
+  await expect(page.locator('#rows tr')).toHaveCount(2);
+  await expect(page.getByText('delimiter-first', { exact: true })).toBeVisible();
+  await expect(page.getByText('delimiter-second', { exact: true })).toBeVisible();
+  await page.locator('#refresh').click();
+  await expect(page.locator('#rows tr')).toHaveCount(2);
+  const keys = await page.locator('#rows tr').evaluateAll(rows => rows.map(row => row.dataset.deviceKey));
+  expect(new Set(keys).size).toBe(2);
+});
+
 test('client inventory refreshes every five seconds and pauses while hidden', async ({ page, request }) => {
   const suffix = Date.now().toString(36);
   const firstId = `refresh-first-${suffix}`;
@@ -142,6 +261,32 @@ test('client inventory refreshes every five seconds and pauses while hidden', as
   expect(listRequests).toBe(beforeHidden);
 });
 
+test('long inventory keeps its scroll anchor and focused control when a row changes during refresh', async ({ page, request }) => {
+  const suffix = Date.now().toString(36);
+  const ids = Array.from({ length: 45 }, (_, index) => `stable-${suffix}-${String(index).padStart(2, '0')}`);
+  await Promise.all(ids.map(id => reportClient(request, id)));
+  const deviceId = ids[22];
+  await loginAdmin(page);
+  await page.getByRole('link', { name: '客户端管理' }).click();
+  await page.locator('#q').fill(`stable-${suffix}`);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  const details = row.getByRole('button', { name: '查看客户端详情' });
+  await row.scrollIntoViewIfNeeded();
+  await details.focus();
+  const beforeScroll = await page.evaluate(() => window.scrollY);
+  await row.evaluate(element => { element.dataset.persistenceProbe = 'same-node'; });
+  await request.post('/api/sysinfo', { data: { id: deviceId, uuid: `${deviceId}-uuid`, hostname: 'changed-during-refresh', os: 'linux', version: '1.5.0' } });
+  await page.waitForTimeout(5_500);
+  await expect(row).toHaveAttribute('data-persistence-probe', 'same-node');
+  await expect(row).toContainText('changed-during-refresh');
+  await expect(details).toBeFocused();
+  expect(Math.abs((await page.evaluate(() => window.scrollY)) - beforeScroll)).toBeLessThanOrEqual(1);
+  await details.click();
+  await expect(page.locator('#details-dialog')).toContainText('changed-during-refresh');
+  await page.locator('#details-close').click();
+});
+
 test('client inventory loads and manages devices beyond the first 200 rows', async ({ page, request }) => {
   test.setTimeout(60_000);
   const suffix = Date.now().toString(36);
@@ -159,17 +304,24 @@ test('client inventory loads and manages devices beyond the first 200 rows', asy
   await expect(page.locator('#stat-total')).toHaveText('205');
 });
 
-test('client management has no horizontal page overflow on mobile', async ({ page, request }) => {
+for (const width of [320, 390, 768, 1024, 1440]) test(`client management has no horizontal page overflow at ${width}px`, async ({ page, request }) => {
   const suffix = Date.now().toString(36);
   await reportClient(request, `mobile-client-${suffix}`, `mobile-host-${suffix}`);
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width, height: 844 });
   await loginAdmin(page);
-  await page.getByRole('navigation', { name: '移动端导航' }).getByRole('link', { name: '客户端', exact: true }).click();
+  if (width < 768) await page.getByRole('navigation', { name: '移动端导航' }).getByRole('link', { name: '客户端', exact: true }).click();
+  else await page.getByRole('link', { name: '客户端管理', exact: true }).click();
   await expect(page.getByRole('heading', { name: '客户端管理' })).toBeVisible();
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
   expect(overflow).toBeFalsy();
   await expect(page.locator('#q')).toBeVisible();
   await expect(page.locator('#presence-filter')).toBeVisible();
+  await page.locator('#q').fill(`mobile-client-${suffix}`);
+  await page.getByRole('button', { name: '搜索' }).click();
+  await page.locator(`[data-device-id="mobile-client-${suffix}"]`).getByRole('button', { name: '查看客户端详情' }).click();
+  await expect(page.locator('#details-dialog')).toBeVisible();
+  await expect(page.locator('#details-close')).toBeVisible();
+  await page.locator('#details-close').click();
 });
 
 test('personal address book manages peers tags favorites and confirmation dialogs', async ({ page }) => {
