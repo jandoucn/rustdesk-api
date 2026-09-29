@@ -18,7 +18,13 @@ if LC_ALL=C grep -Eq '[A-Za-z]' <<<"$subject"; then
   exit 1
 fi
 
-if ! grep -Eq '[一-龥]' <<<"$subject"; then
+if ! python3 - "$subject" <<'PY'
+import sys
+
+subject = sys.argv[1]
+raise SystemExit(0 if any("\u4e00" <= char <= "\u9fff" for char in subject) else 1)
+PY
+then
   printf '提交标题必须包含中文: %s\n' "$subject" >&2
   exit 1
 fi
