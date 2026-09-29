@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RustDesk 客户端管理</title>
+  <link rel="stylesheet" href="__ADMIN_PATH__/assets/app.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">RD</span><span class="brand-copy"><strong>RustDesk Console</strong><span>Operations</span></span></div>
+      <nav class="nav" aria-label="主导航">
+        <span class="nav-label">管理</span>
+        <a href="__ADMIN_PATH__"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>用户管理</a>
+        <a class="active" href="__ADMIN_PATH__/devices" aria-current="page"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2" stroke-width="2"/><path d="M8 21h8M12 17v4" stroke-width="2" stroke-linecap="round"/></svg>客户端管理</a>
+        <a href="__ADMIN_PATH__/address-book"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v17H6.5A2.5 2.5 0 0 0 4 21.5v-17Z" stroke-width="2" stroke-linejoin="round"/><path d="M4 19V4.5M8 7h8M8 11h6" stroke-width="2" stroke-linecap="round"/></svg>通讯录管理</a>
+      </nav>
+      <div class="sidebar-foot"><div class="sidebar-user"><span class="avatar" id="avatar">A</span><span id="who">管理员</span></div><button id="logout" class="button ghost" type="button">退出</button></div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="brand"><span class="brand-mark">RD</span><span class="brand-copy"><strong>RustDesk Console</strong></span></div>
+        <nav class="mobile-nav" aria-label="移动端导航"><a href="__ADMIN_PATH__">用户</a><a class="active" href="__ADMIN_PATH__/devices">客户端</a><a href="__ADMIN_PATH__/address-book">通讯录</a><button id="mobile-logout" class="button small" type="button" aria-label="退出登录">退出</button></nav>
+      </header>
+
+      <main class="content">
+        <div class="page-head">
+          <div><p class="eyebrow">Device presence</p><h1>客户端管理</h1><p class="page-description">查看向 API 上报的全部客户端。在线状态按心跳时间计算，部署记录仅作为补充信息。</p></div>
+          <div class="page-actions"><button id="refresh" class="button" type="button"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 11a8 8 0 1 0 2 5.3M20 4v7h-7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>立即刷新</button></div>
+        </div>
+
+        <div class="stats" aria-label="客户端统计">
+          <div class="stat"><span class="stat-label">全部客户端</span><strong class="stat-value" id="stat-total">0</strong></div>
+          <div class="stat"><span class="stat-label"><span class="status-dot online"></span>在线</span><strong class="stat-value" id="stat-online">0</strong></div>
+          <div class="stat"><span class="stat-label"><span class="status-dot recent"></span>最近在线</span><strong class="stat-value" id="stat-recent">0</strong></div>
+          <div class="stat"><span class="stat-label"><span class="status-dot offline"></span>离线</span><strong class="stat-value" id="stat-offline">0</strong></div>
+          <div class="stat"><span class="stat-label"><span class="status-dot unreported"></span>未上报</span><strong class="stat-value" id="stat-unreported">0</strong></div>
+        </div>
+
+        <section class="panel" aria-label="客户端列表">
+          <div class="toolbar">
+            <div class="field grow">
+              <label for="q">搜索客户端</label>
+              <div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m20 20-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><input id="q" class="input" placeholder="搜索 ID、UUID、主机名" autocomplete="off"></div>
+            </div>
+            <div class="field filter"><label for="presence-filter">在线状态</label><select id="presence-filter" class="select"><option value="all">全部状态</option><option value="online">在线</option><option value="recent">最近在线</option><option value="offline">离线</option><option value="unreported">未上报</option></select></div>
+            <button id="search" class="button" type="button">搜索</button>
+            <div class="toolbar-switches">
+              <label class="check" for="labelled-only"><input id="labelled-only" type="checkbox">仅看有备注</label>
+              <label class="check" for="auto-refresh"><input id="auto-refresh" type="checkbox" checked>自动刷新</label>
+            </div>
+          </div>
+          <p id="status" class="feedback" aria-live="polite">正在建立客户端状态视图...</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>客户端</th><th>备注</th><th>登录用户</th><th>平台 / 版本</th><th>状态</th><th>最近活动</th><th>操作</th></tr></thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+          <div id="empty" class="empty-state hidden"><strong>没有匹配的客户端。</strong><p>调整搜索或状态筛选后重试。</p></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="alias-dialog" aria-labelledby="alias-title">
+    <form id="alias-form" class="dialog-form">
+      <div class="dialog-head"><h3 id="alias-title">编辑客户端备注</h3><p id="alias-device">为当前管理员的个人通讯录设置备注。</p></div>
+      <div class="dialog-body"><div class="field"><label for="alias-input">备注</label><input id="alias-input" class="input" maxlength="255" placeholder="例如：上海前台电脑" autocomplete="off"></div><p class="muted">保存后，RustDesk 客户端将在下次同步通讯录时收到新备注。</p></div>
+      <p id="alias-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="alias-cancel" class="button" type="button">取消</button><button id="alias-save" class="button primary" type="submit" aria-label="保存备注">保存备注</button></div>
+    </form>
+  </dialog>
+
+  <script>
+  'use strict';
+  (() => {
+    const $ = id => document.getElementById(id);
+    const labels = { online: '在线', recent: '最近在线', offline: '离线', unreported: '未上报' };
+    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, aliasDevice: null, timer: null, lastUpdated: 0 };
+
+    async function api(url, options = {}) {
+      const headers = new Headers(options.headers || {});
+      headers.set('Accept', 'application/json');
+      if (options.body !== undefined) headers.set('Content-Type', 'application/json');
+      if (state.csrf) headers.set('X-CSRF-Token', state.csrf);
+      const response = await fetch(url, { ...options, headers, credentials: 'same-origin' });
+      const data = await response.json().catch(() => ({ error: '响应无效' }));
+      if (!response.ok) throw Error(data.error || '请求失败');
+      return data;
+    }
+
+    function setFeedback(message, kind = '') { $('status').textContent = message; $('status').className = 'feedback' + (kind ? ' ' + kind : ''); }
+    function presence(device) {
+      if (labels[device.presence]) return device.presence;
+      const heartbeat = Number(device.last_heartbeat || 0);
+      if (!heartbeat) return 'unreported';
+      const age = Math.max(0, Date.now() / 1000 - heartbeat);
+      if (age <= 20) return 'online';
+      if (age <= 90) return 'recent';
+      return 'offline';
+    }
+    function activityAt(device) { return Number(device.last_heartbeat || device.last_seen || device.updated_at || 0); }
+    function relativeTime(timestamp) {
+      if (!timestamp) return '从未上报';
+      const seconds = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
+      if (seconds < 10) return '刚刚';
+      if (seconds < 60) return seconds + ' 秒前';
+      if (seconds < 3600) return Math.floor(seconds / 60) + ' 分钟前';
+      if (seconds < 86400) return Math.floor(seconds / 3600) + ' 小时前';
+      return Math.floor(seconds / 86400) + ' 天前';
+    }
+    function appendCell(row, label, className = '') { const cell = document.createElement('td'); cell.dataset.label = label; if (className) cell.className = className; row.append(cell); return cell; }
+    function textLine(className, value) { const span = document.createElement('span'); span.className = className; span.textContent = value; return span; }
+
+    function visibleDevices() {
+      const selected = $('presence-filter').value;
+      const labelledOnly = $('labelled-only').checked;
+      return state.devices.filter(device => (selected === 'all' || presence(device) === selected) && (!labelledOnly || String(device.alias || '').trim() !== ''));
+    }
+
+    function updateStats() {
+      const summary = { online: 0, recent: 0, offline: 0, unreported: 0 };
+      state.devices.forEach(device => { summary[presence(device)] += 1; });
+      $('stat-total').textContent = String(state.total || state.devices.length);
+      Object.keys(summary).forEach(key => { $('stat-' + key).textContent = String(summary[key]); });
+    }
+
+    function openAlias(device) {
+      state.aliasDevice = device;
+      $('alias-input').value = device.alias || '';
+      $('alias-device').textContent = '客户端 ' + device.id + '。备注属于当前管理员的个人通讯录。';
+      $('alias-error').textContent = '';
+      $('alias-dialog').showModal();
+      requestAnimationFrame(() => $('alias-input').focus());
+    }
+
+    function render() {
+      updateStats();
+      const devices = visibleDevices();
+      const body = $('rows');
+      body.replaceChildren();
+      $('empty').classList.toggle('hidden', devices.length > 0);
+      for (const device of devices) {
+        const row = document.createElement('tr');
+        row.dataset.deviceId = device.id;
+        const primary = appendCell(row, '客户端', 'primary-cell');
+        primary.append(textLine('cell-title', device.hostname || device.id || '未知客户端'));
+        if (device.hostname) primary.append(textLine('cell-subtitle', device.id));
+        if (device.uuid) primary.append(textLine('cell-subtitle', 'UUID ' + device.uuid));
+
+        const aliasCell = appendCell(row, '备注');
+        const alias = String(device.alias || '').trim();
+        aliasCell.append(textLine(alias ? 'cell-title' : 'alias-empty', alias || '未备注'));
+        if (device.deployed) aliasCell.append(textLine('cell-subtitle', '已部署登记'));
+
+        appendCell(row, '登录用户').textContent = device.username || '-';
+        const platformCell = appendCell(row, '平台 / 版本');
+        platformCell.append(textLine('cell-title', device.platform || '-'));
+        if (device.version) platformCell.append(textLine('cell-subtitle', device.version));
+
+        const statusCell = appendCell(row, '状态');
+        const currentPresence = presence(device);
+        const badge = document.createElement('span');
+        badge.className = 'status-badge ' + currentPresence;
+        badge.append(textLine('status-dot ' + currentPresence, ''), document.createTextNode(labels[currentPresence]));
+        statusCell.append(badge);
+
+        const activity = appendCell(row, '最近活动');
+        const timestamp = activityAt(device);
+        activity.append(textLine('cell-title', relativeTime(timestamp)));
+        if (timestamp) activity.append(textLine('cell-subtitle', new Date(timestamp * 1000).toLocaleString()));
+
+        const actionCell = appendCell(row, '操作', 'actions-cell');
+        const actions = document.createElement('div'); actions.className = 'row-actions';
+        const aliasButton = document.createElement('button'); aliasButton.className = 'button small'; aliasButton.type = 'button'; aliasButton.textContent = '编辑备注'; aliasButton.setAttribute('aria-label', '编辑备注'); aliasButton.onclick = () => openAlias(device);
+        const removeButton = document.createElement('button'); removeButton.className = 'button small danger'; removeButton.type = 'button'; removeButton.textContent = '移除'; removeButton.setAttribute('aria-label', '移除'); removeButton.onclick = () => removeDevice(device);
+        actions.append(aliasButton, removeButton); actionCell.append(actions); body.append(row);
+      }
+      const suffix = devices.length === state.devices.length ? '' : '，当前筛选显示 ' + devices.length + ' 台';
+      setFeedback('共 ' + state.total + ' 台客户端' + suffix + '，状态更新于 ' + new Date(state.lastUpdated).toLocaleTimeString(), 'success');
+    }
+
+    async function load(options = {}) {
+      if (state.loading) return;
+      state.loading = true;
+      $('refresh').disabled = true;
+      if (!options.quiet) setFeedback('正在读取客户端上报数据...');
+      try {
+        const pageSize = 200;
+        let page = 1;
+        let devices = [];
+        let total = 0;
+        do {
+          const params = new URLSearchParams({ q: state.q, page: String(page), pageSize: String(pageSize) });
+          const data = await api('__ADMIN_PATH__/api/devices?' + params);
+          const batch = Array.isArray(data.data) ? data.data : [];
+          total = Number(data.total) || 0;
+          devices = devices.concat(batch);
+          if (batch.length === 0) break;
+          page += 1;
+        } while (devices.length < total);
+        state.devices = devices;
+        state.total = total || devices.length;
+        state.lastUpdated = Date.now();
+        render();
+      } catch (error) {
+        if (error.message.includes('登录')) location.href = '__ADMIN_PATH__';
+        else setFeedback(error.message, 'error');
+      } finally {
+        state.loading = false;
+        $('refresh').disabled = false;
+      }
+    }
+
+    async function removeDevice(device) {
+      if (!confirm('确认移除客户端“' + device.id + '”的登记和上报信息？')) return;
+      try {
+        await api('__ADMIN_PATH__/api/devices/' + encodeURIComponent(device.id), { method: 'DELETE', body: '{}' });
+        await load();
+      } catch (error) { setFeedback(error.message, 'error'); }
+    }
+
+    function scheduleRefresh() {
+      if (state.timer) clearInterval(state.timer);
+      state.timer = setInterval(() => {
+        if ($('auto-refresh').checked && !document.hidden) load({ quiet: true });
+      }, 5000);
+    }
+
+    $('search').addEventListener('click', () => { state.q = $('q').value.trim(); load(); });
+    $('q').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); $('search').click(); } });
+    $('refresh').addEventListener('click', () => load());
+    $('presence-filter').addEventListener('change', render);
+    $('labelled-only').addEventListener('change', render);
+    $('auto-refresh').addEventListener('change', () => { setFeedback($('auto-refresh').checked ? '自动刷新已开启，每 5 秒更新' : '自动刷新已暂停', 'success'); });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden && $('auto-refresh').checked) load({ quiet: true }); });
+    $('alias-cancel').addEventListener('click', () => $('alias-dialog').close());
+    $('alias-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      if (!state.aliasDevice) return;
+      $('alias-save').disabled = true;
+      $('alias-error').textContent = '';
+      try {
+        const alias = $('alias-input').value.trim();
+        await api('__ADMIN_PATH__/api/devices/' + encodeURIComponent(state.aliasDevice.id) + '/alias', { method: 'PATCH', body: JSON.stringify({ alias }) });
+        state.aliasDevice.alias = alias;
+        $('alias-dialog').close();
+        render();
+        setFeedback('备注已保存，客户端将在下次通讯录同步时收到更新', 'success');
+      } catch (error) { $('alias-error').textContent = error.message; }
+      finally { $('alias-save').disabled = false; }
+    });
+    async function logout() { try { await api('__ADMIN_PATH__/api/logout', { method: 'POST', body: '{}' }); } catch (_) {} location.href = '__ADMIN_PATH__'; }
+    $('logout').addEventListener('click', logout); $('mobile-logout').addEventListener('click', logout);
+
+    api('__ADMIN_PATH__/api/session').then(data => {
+      state.csrf = data.csrf || '';
+      if (!data.user) { location.href = '__ADMIN_PATH__'; return; }
+      $('who').textContent = '当前：' + data.user.username;
+      $('avatar').textContent = String(data.user.username || 'A').slice(0, 1).toUpperCase();
+      scheduleRefresh();
+      load();
+    }).catch(() => { location.href = '__ADMIN_PATH__'; });
+  })();
+  </script>
+</body>
+</html>

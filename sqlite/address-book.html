@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RustDesk 通讯录管理</title>
+  <link rel="stylesheet" href="__ADMIN_PATH__/assets/app.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">RD</span><span class="brand-copy"><strong>RustDesk Console</strong><span>Operations</span></span></div>
+      <nav class="nav" aria-label="主导航">
+        <span class="nav-label">管理</span>
+        <a href="__ADMIN_PATH__"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>用户管理</a>
+        <a href="__ADMIN_PATH__/devices"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2" stroke-width="2"/><path d="M8 21h8M12 17v4" stroke-width="2" stroke-linecap="round"/></svg>客户端管理</a>
+        <a class="active" href="__ADMIN_PATH__/address-book" aria-current="page"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v17H6.5A2.5 2.5 0 0 0 4 21.5v-17Z" stroke-width="2" stroke-linejoin="round"/><path d="M4 19V4.5M8 7h8M8 11h6" stroke-width="2" stroke-linecap="round"/></svg>通讯录管理</a>
+      </nav>
+      <div class="sidebar-foot"><div class="sidebar-user"><span class="avatar" id="avatar">A</span><span id="who">管理员</span></div><button id="logout" class="button ghost" type="button">退出</button></div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="brand"><span class="brand-mark">RD</span><span class="brand-copy"><strong>RustDesk Console</strong></span></div>
+        <nav class="mobile-nav" aria-label="移动端导航"><a href="__ADMIN_PATH__">用户</a><a href="__ADMIN_PATH__/devices">客户端</a><a class="active" href="__ADMIN_PATH__/address-book">通讯录</a><button id="mobile-logout" class="button small" type="button" aria-label="退出登录">退出</button></nav>
+      </header>
+
+      <main class="content">
+        <div class="page-head">
+          <div><p class="eyebrow">Personal address book</p><h1>通讯录管理</h1><p class="page-description">管理当前管理员的个人通讯录、备注和标签。联系人、别名和标签将在 RustDesk 下次拉取通讯录时同步。</p></div>
+          <div class="page-actions">
+            <button id="create-peer" class="button primary" type="button"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke-width="2" stroke-linecap="round"/></svg>新增客户端</button>
+            <button id="manage-tags" class="button" type="button"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.6 13.6 13.5 20.7a2 2 0 0 1-2.8 0L3.3 13.3A2 2 0 0 1 3 10.9V4h6.9a2 2 0 0 1 1.4.6l9.3 9Z" stroke-width="2" stroke-linejoin="round"/><circle cx="7.5" cy="8.5" r="1" fill="currentColor" stroke="none"/></svg>标签管理</button>
+            <button id="refresh-address-book" class="button icon-only" type="button" aria-label="刷新通讯录" title="刷新通讯录"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 11a8 8 0 1 0 2 5.3M20 4v7h-7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          </div>
+        </div>
+
+        <div class="sync-notice" role="note">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke-width="2"/><path d="M12 11v5M12 8h.01" stroke-width="2" stroke-linecap="round"/></svg>
+          <div><strong>同步边界</strong><span>后台收藏只用于此管理页面筛选，不会同步到 RustDesk 客户端本机的原生收藏栏。</span></div>
+        </div>
+
+        <div class="stats address-book-stats" aria-label="通讯录统计">
+          <div class="stat"><span class="stat-label">通讯录客户端</span><strong class="stat-value" id="stat-address-total">0</strong></div>
+          <div class="stat"><span class="stat-label"><span class="favorite-glyph" aria-hidden="true">★</span>后台收藏</span><strong class="stat-value" id="stat-address-favorites">0</strong></div>
+          <div class="stat"><span class="stat-label">本页有标签</span><strong class="stat-value" id="stat-address-tagged">0</strong></div>
+          <div class="stat"><span class="stat-label">本页无标签</span><strong class="stat-value" id="stat-address-untagged">0</strong></div>
+        </div>
+
+        <section class="panel" aria-label="个人通讯录客户端列表">
+          <div class="toolbar address-toolbar">
+            <div class="field grow"><label for="address-search">搜索通讯录</label><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m20 20-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><input id="address-search" class="input" placeholder="搜索 ID、别名、主机名或说明" autocomplete="off"></div></div>
+            <div class="field filter"><label for="tag-filter">标签</label><select id="tag-filter" class="select"><option value="">全部标签</option></select></div>
+            <button id="search-address-book" class="button" type="button">搜索</button>
+            <div class="toolbar-switches"><label class="check" for="favorite-only"><input id="favorite-only" type="checkbox">仅后台收藏</label></div>
+          </div>
+          <p id="address-book-status" class="feedback" aria-live="polite">正在读取个人通讯录...</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th><span class="sr-only">后台收藏</span></th><th>客户端</th><th>标签</th><th>说明</th><th>客户端信息</th><th>操作</th></tr></thead>
+              <tbody id="address-book-rows"></tbody>
+            </table>
+          </div>
+          <div id="address-book-empty" class="empty-state hidden"><strong>没有匹配的通讯录客户端。</strong><p>调整筛选条件，或新增一个客户端。</p></div>
+          <div class="pager"><button id="address-prev" class="button small" type="button">上一页</button><span id="address-page-info"></span><button id="address-next" class="button small" type="button">下一页</button></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="peer-dialog" aria-labelledby="peer-dialog-title">
+    <form id="peer-form" class="dialog-form">
+      <div class="dialog-head"><h3 id="peer-dialog-title">新增客户端</h3><p id="peer-dialog-description">客户端会添加到当前管理员的个人通讯录。</p></div>
+      <div class="dialog-body">
+        <div class="field"><label for="peer-id">RustDesk ID</label><input id="peer-id" class="input mono" maxlength="128" placeholder="例如：123 456 789" autocomplete="off" required><span class="field-hint">编辑后客户端 ID 不可更改。</span></div>
+        <div class="field"><label for="peer-alias">别名</label><input id="peer-alias" class="input" maxlength="255" placeholder="例如：上海前台电脑" autocomplete="off"></div>
+        <div class="field"><label for="peer-note">说明</label><textarea id="peer-note" class="textarea" maxlength="4096" rows="3" placeholder="内部用途、位置或维护说明"></textarea></div>
+        <fieldset class="tag-picker"><legend>标签</legend><div id="peer-tags" class="tag-options" role="group" aria-label="客户端标签"></div></fieldset>
+        <p class="dialog-note">保存后，RustDesk 客户端会在下次拉取通讯录时收到联系人、别名和标签变更。</p>
+      </div>
+      <p id="peer-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="peer-cancel" class="button" type="button">取消</button><button id="peer-save" class="button primary" type="submit">新增客户端</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="tag-dialog" aria-labelledby="tag-dialog-title">
+    <div class="dialog-form wide-dialog">
+      <div class="dialog-head"><h3 id="tag-dialog-title">标签管理</h3><p>标签名称和颜色会随个人通讯录同步到 RustDesk 客户端。</p></div>
+      <form id="tag-form" class="tag-editor">
+        <div class="field grow"><label for="tag-name">标签名称</label><input id="tag-name" class="input" maxlength="256" placeholder="例如：办公室" autocomplete="off" required></div>
+        <div class="field color-field"><label for="tag-color">颜色</label><input id="tag-color" type="color" value="#176b87" aria-label="标签颜色"></div>
+        <button id="tag-save" class="button primary" type="submit">新增标签</button>
+        <button id="tag-edit-cancel" class="button hidden" type="button">取消编辑</button>
+      </form>
+      <p id="tag-error" class="form-error" role="alert"></p>
+      <div id="tag-list" class="tag-management-list" aria-live="polite"></div>
+      <div class="dialog-actions"><button id="tag-close" class="button" type="button">关闭</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <div class="dialog-form">
+      <div class="dialog-head"><h3 id="confirm-title">确认操作</h3><p id="confirm-message"></p></div>
+      <p id="confirm-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button id="confirm-cancel" class="button" type="button">取消</button><button id="confirm-submit" class="button danger" type="button">确认</button></div>
+    </div>
+  </dialog>
+
+  <script>
+  'use strict';
+  (() => {
+    const $ = id => document.getElementById(id);
+    const state = { csrf: '', user: null, page: 1, size: 50, total: 0, q: '', tag: '', favorite: false, peers: [], tags: [], summary: {}, loading: false, editingPeer: null, editingTag: null, confirmAction: null, returnToTags: false };
+    const starIcon = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9L12 3Z" stroke-width="2" stroke-linejoin="round"/></svg>';
+
+    async function api(url, options = {}) {
+      const headers = new Headers(options.headers || {});
+      headers.set('Accept', 'application/json');
+      if (options.body !== undefined) headers.set('Content-Type', 'application/json');
+      if (state.csrf) headers.set('X-CSRF-Token', state.csrf);
+      const response = await fetch(url, { ...options, headers, credentials: 'same-origin' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw Error(data.error || '请求失败');
+      return data;
+    }
+
+    function setFeedback(message, kind = '') { $('address-book-status').textContent = message; $('address-book-status').className = 'feedback' + (kind ? ' ' + kind : ''); }
+    function appendCell(row, label, className = '') { const cell = document.createElement('td'); cell.dataset.label = label; if (className) cell.className = className; row.append(cell); return cell; }
+    function textLine(className, value) { const span = document.createElement('span'); span.className = className; span.textContent = value; return span; }
+    function normalizedTag(tag) { return typeof tag === 'string' ? { name: tag, color: 0, count: 0 } : { name: String(tag.name || tag.tag || ''), color: Number(tag.color || 0), count: Number(tag.count || tag.peer_count || 0) }; }
+    function peerTags(peer) { return Array.isArray(peer.tags) ? peer.tags.map(String) : []; }
+    function isFavorite(peer) { return peer.favorite === true || peer.favorite === 1 || peer.is_favorite === true || peer.is_favorite === 1; }
+    function colorHex(value) { const number = Number(value); return number ? '#' + ((number >>> 0) & 0xffffff).toString(16).padStart(6, '0') : '#176b87'; }
+    function colorNumber(value) { return Number.parseInt('ff' + String(value).replace('#', ''), 16); }
+    function peerPath(id) { return '__ADMIN_PATH__/api/address-book/peers/' + encodeURIComponent(id); }
+
+    function updatePager() {
+      const pages = Math.max(1, Math.ceil(state.total / state.size));
+      $('address-page-info').textContent = '第 ' + state.page + '/' + pages + ' 页，共 ' + state.total;
+      $('address-prev').disabled = state.loading || state.page <= 1;
+      $('address-next').disabled = state.loading || state.page >= pages;
+    }
+
+    function updateStats() {
+      const fallbackFavorites = state.peers.filter(isFavorite).length;
+      const fallbackTagged = state.peers.filter(peer => peerTags(peer).length > 0).length;
+      const total = Number(state.summary.total ?? state.total) || 0;
+      const favorites = Number(state.summary.favorites ?? state.summary.favorite ?? fallbackFavorites) || 0;
+      const tagged = fallbackTagged;
+      const untagged = Math.max(0, state.peers.length - tagged);
+      $('stat-address-total').textContent = String(total);
+      $('stat-address-favorites').textContent = String(favorites);
+      $('stat-address-tagged').textContent = String(tagged);
+      $('stat-address-untagged').textContent = String(untagged);
+    }
+
+    function renderTagFilter() {
+      const selected = state.tag;
+      const select = $('tag-filter');
+      select.replaceChildren(new Option('全部标签', ''));
+      state.tags.forEach(tag => select.add(new Option(tag.name, tag.name)));
+      select.value = state.tags.some(tag => tag.name === selected) ? selected : '';
+      if (select.value !== selected) state.tag = '';
+    }
+
+    function renderTagPicker(selectedNames = []) {
+      const container = $('peer-tags');
+      container.replaceChildren();
+      if (!state.tags.length) {
+        container.append(textLine('tag-picker-empty', '尚未创建标签，可先在“标签管理”中新增。'));
+        return;
+      }
+      state.tags.forEach((tag, index) => {
+        const label = document.createElement('label'); label.className = 'tag-choice';
+        const input = document.createElement('input'); input.type = 'checkbox'; input.value = tag.name; input.id = 'peer-tag-' + index; input.checked = selectedNames.includes(tag.name);
+        const swatch = document.createElement('span'); swatch.className = 'tag-swatch'; swatch.style.backgroundColor = colorHex(tag.color);
+        label.append(input, swatch, document.createTextNode(tag.name)); container.append(label);
+      });
+    }
+
+    function renderPeers() {
+      const body = $('address-book-rows'); body.replaceChildren();
+      $('address-book-empty').classList.toggle('hidden', state.peers.length > 0);
+      state.peers.forEach(peer => {
+        const id = String(peer.id || '');
+        const row = document.createElement('tr'); row.dataset.peerId = id;
+        const favoriteCell = appendCell(row, '后台收藏', 'favorite-cell');
+        const favorite = document.createElement('button'); favorite.type = 'button'; favorite.className = 'favorite-button' + (isFavorite(peer) ? ' active' : ''); favorite.innerHTML = starIcon; favorite.setAttribute('aria-pressed', String(isFavorite(peer))); favorite.setAttribute('aria-label', isFavorite(peer) ? '取消收藏' : '收藏'); favorite.title = isFavorite(peer) ? '取消后台收藏' : '加入后台收藏'; favorite.addEventListener('click', () => toggleFavorite(peer, favorite)); favoriteCell.append(favorite);
+
+        const primary = appendCell(row, '客户端', 'primary-cell');
+        const alias = String(peer.alias || '').trim();
+        primary.append(textLine('cell-title', alias || id || '未知客户端'));
+        if (alias) primary.append(textLine('cell-subtitle', id));
+        if (peer.hostname) primary.append(textLine('cell-subtitle', String(peer.hostname)));
+
+        const tagsCell = appendCell(row, '标签'); const tagList = document.createElement('div'); tagList.className = 'tag-list';
+        const tags = peerTags(peer);
+        if (tags.length) tags.forEach(name => { const tag = state.tags.find(item => item.name === name); const chip = document.createElement('span'); chip.className = 'tag-chip'; const swatch = document.createElement('span'); swatch.className = 'tag-swatch'; swatch.style.backgroundColor = colorHex(tag?.color || 0); chip.append(swatch, document.createTextNode(name)); tagList.append(chip); });
+        else tagList.append(textLine('alias-empty', '无标签'));
+        tagsCell.append(tagList);
+
+        const noteCell = appendCell(row, '说明'); noteCell.classList.add('note-cell'); noteCell.textContent = String(peer.note || '') || '-'; if (peer.note) noteCell.title = String(peer.note);
+        const infoCell = appendCell(row, '客户端信息');
+        const identity = [peer.username, peer.platform].filter(Boolean).map(String).join(' · '); infoCell.append(textLine(identity ? 'cell-title' : 'muted', identity || '暂无上报信息'));
+
+        const actionsCell = appendCell(row, '操作', 'actions-cell'); const actions = document.createElement('div'); actions.className = 'row-actions';
+        const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'button small'; edit.textContent = '编辑客户端'; edit.setAttribute('aria-label', '编辑客户端'); edit.addEventListener('click', () => openPeerDialog(peer));
+        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button small danger'; remove.textContent = '删除客户端'; remove.setAttribute('aria-label', '删除客户端'); remove.addEventListener('click', () => confirmPeerDelete(peer));
+        actions.append(edit, remove); actionsCell.append(actions); body.append(row);
+      });
+      updateStats(); updatePager();
+    }
+
+    async function load(options = {}) {
+      if (state.loading) return;
+      state.loading = true; $('refresh-address-book').disabled = true; updatePager();
+      if (!options.quiet) setFeedback('正在读取个人通讯录...');
+      try {
+        const params = new URLSearchParams({ q: state.q, tag: state.tag, page: String(state.page), pageSize: String(state.size) });
+        if (state.favorite) params.set('favorite', '1');
+        const data = await api('__ADMIN_PATH__/api/address-book?' + params);
+        state.peers = Array.isArray(data.data) ? data.data : (Array.isArray(data.peers) ? data.peers : []);
+        state.tags = (Array.isArray(data.tags) ? data.tags : []).map(normalizedTag).filter(tag => tag.name !== '');
+        state.total = Number(data.total ?? state.peers.length) || 0;
+        state.summary = data.summary && typeof data.summary === 'object' ? data.summary : {};
+        renderTagFilter(); renderPeers();
+        setFeedback('已加载 ' + state.total + ' 个匹配客户端', 'success');
+      } catch (error) {
+        if (String(error.message).includes('登录')) location.href = '__ADMIN_PATH__';
+        else setFeedback(error.message, 'error');
+      } finally { state.loading = false; $('refresh-address-book').disabled = false; updatePager(); }
+    }
+
+    function openPeerDialog(peer = null) {
+      state.editingPeer = peer;
+      $('peer-form').reset(); $('peer-error').textContent = '';
+      $('peer-id').disabled = Boolean(peer); $('peer-id').value = peer?.id || '';
+      $('peer-alias').value = peer?.alias || ''; $('peer-note').value = peer?.note || '';
+      $('peer-dialog-title').textContent = peer ? '编辑客户端' : '新增客户端';
+      $('peer-dialog-description').textContent = peer ? '更新当前个人通讯录中的客户端信息。' : '客户端会添加到当前管理员的个人通讯录。';
+      $('peer-save').textContent = peer ? '保存修改' : '新增客户端';
+      renderTagPicker(peer ? peerTags(peer) : []); $('peer-dialog').showModal();
+      requestAnimationFrame(() => (peer ? $('peer-alias') : $('peer-id')).focus());
+    }
+
+    async function savePeer(event) {
+      event.preventDefault();
+      const button = $('peer-save'); button.disabled = true; $('peer-error').textContent = '';
+      const id = state.editingPeer ? String(state.editingPeer.id) : $('peer-id').value.trim();
+      const payload = { id, alias: $('peer-alias').value.trim(), note: $('peer-note').value.trim(), tags: Array.from($('peer-tags').querySelectorAll('input:checked'), input => input.value) };
+      try {
+        if (state.editingPeer) await api(peerPath(id), { method: 'PATCH', body: JSON.stringify(payload) });
+        else await api('__ADMIN_PATH__/api/address-book/peers', { method: 'POST', body: JSON.stringify(payload) });
+        $('peer-dialog').close(); state.editingPeer = null; await load({ quiet: true });
+        setFeedback('通讯录已保存，RustDesk 客户端将在下次地址簿同步时收到更新', 'success');
+      } catch (error) { $('peer-error').textContent = error.message; }
+      finally { button.disabled = false; }
+    }
+
+    async function toggleFavorite(peer, button) {
+      const next = !isFavorite(peer); button.disabled = true;
+      try {
+        await api('__ADMIN_PATH__/api/address-book/favorites/' + encodeURIComponent(peer.id), { method: 'PATCH', body: JSON.stringify({ favorite: next }) });
+        await load({ quiet: true }); setFeedback(next ? '已加入后台收藏' : '已取消后台收藏', 'success');
+      } catch (error) { setFeedback(error.message, 'error'); }
+      finally { button.disabled = false; }
+    }
+
+    function openConfirm(title, message, buttonText, action, returnToTags = false) {
+      $('confirm-title').textContent = title; $('confirm-message').textContent = message; $('confirm-submit').textContent = buttonText; $('confirm-error').textContent = ''; state.confirmAction = action; state.returnToTags = returnToTags; $('confirm-dialog').showModal(); requestAnimationFrame(() => $('confirm-cancel').focus());
+    }
+    function confirmPeerDelete(peer) {
+      openConfirm('删除通讯录客户端', '确认将“' + (peer.alias || peer.id) + '”从当前个人通讯录移除？客户端上报和部署记录不会被删除。', '删除客户端', async () => {
+        await api(peerPath(peer.id), { method: 'DELETE' });
+        if (state.peers.length === 1 && state.page > 1) state.page -= 1;
+        await load({ quiet: true }); setFeedback('客户端已从当前个人通讯录移除', 'success');
+      });
+    }
+
+    function renderTagManagement() {
+      const list = $('tag-list'); list.replaceChildren();
+      if (!state.tags.length) { const empty = document.createElement('p'); empty.className = 'tag-management-empty'; empty.textContent = '尚未创建标签。'; list.append(empty); return; }
+      state.tags.forEach(tag => {
+        const row = document.createElement('div'); row.className = 'tag-management-row'; row.dataset.tagName = tag.name;
+        const identity = document.createElement('div'); identity.className = 'tag-management-name'; const swatch = document.createElement('span'); swatch.className = 'tag-swatch large'; swatch.style.backgroundColor = colorHex(tag.color); const copy = document.createElement('span'); copy.append(textLine('cell-title', tag.name), textLine('cell-subtitle', tag.count ? tag.count + ' 个客户端' : '个人通讯录标签')); identity.append(swatch, copy);
+        const actions = document.createElement('div'); actions.className = 'row-actions';
+        const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'button small'; edit.textContent = '编辑'; edit.setAttribute('aria-label', '编辑标签 ' + tag.name); edit.addEventListener('click', () => editTag(tag));
+        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button small danger'; remove.textContent = '删除'; remove.setAttribute('aria-label', '删除标签 ' + tag.name); remove.addEventListener('click', () => confirmTagDelete(tag)); actions.append(edit, remove); row.append(identity, actions); list.append(row);
+      });
+    }
+
+    function resetTagEditor() { state.editingTag = null; $('tag-form').reset(); $('tag-color').value = '#176b87'; $('tag-save').textContent = '新增标签'; $('tag-edit-cancel').classList.add('hidden'); $('tag-error').textContent = ''; }
+    function editTag(tag) { state.editingTag = tag; $('tag-name').value = tag.name; $('tag-color').value = colorHex(tag.color); $('tag-save').textContent = '保存标签'; $('tag-edit-cancel').classList.remove('hidden'); $('tag-error').textContent = ''; $('tag-name').focus(); }
+    async function saveTag(event) {
+      event.preventDefault(); const button = $('tag-save'); button.disabled = true; $('tag-error').textContent = '';
+      const name = $('tag-name').value.trim(); const payload = { name, new: name, old: state.editingTag?.name || '', color: colorNumber($('tag-color').value) };
+      try {
+        if (state.editingTag) await api('__ADMIN_PATH__/api/address-book/tags/' + encodeURIComponent(state.editingTag.name), { method: 'PATCH', body: JSON.stringify(payload) });
+        else await api('__ADMIN_PATH__/api/address-book/tags', { method: 'POST', body: JSON.stringify(payload) });
+        resetTagEditor(); await load({ quiet: true }); renderTagManagement();
+      } catch (error) { $('tag-error').textContent = error.message; }
+      finally { button.disabled = false; }
+    }
+    function confirmTagDelete(tag) {
+      $('tag-dialog').close();
+      openConfirm('删除标签', '确认删除标签“' + tag.name + '”？该标签会从当前个人通讯录的客户端中移除。', '删除标签', async () => {
+        await api('__ADMIN_PATH__/api/address-book/tags/' + encodeURIComponent(tag.name), { method: 'DELETE' });
+        if (state.tag === tag.name) { state.tag = ''; $('tag-filter').value = ''; }
+        await load({ quiet: true }); renderTagManagement();
+      }, true);
+    }
+
+    async function runConfirm() {
+      if (!state.confirmAction) return;
+      const action = state.confirmAction; $('confirm-submit').disabled = true; $('confirm-error').textContent = '';
+      try { await action(); state.confirmAction = null; $('confirm-dialog').close(); if (state.returnToTags) { state.returnToTags = false; renderTagManagement(); $('tag-dialog').showModal(); } }
+      catch (error) { $('confirm-error').textContent = error.message; }
+      finally { $('confirm-submit').disabled = false; }
+    }
+
+    async function logout() { try { await api('__ADMIN_PATH__/api/logout', { method: 'POST', body: '{}' }); } catch (_) {} location.href = '__ADMIN_PATH__'; }
+    $('logout').addEventListener('click', logout); $('mobile-logout').addEventListener('click', logout);
+    $('create-peer').addEventListener('click', () => openPeerDialog()); $('peer-cancel').addEventListener('click', () => $('peer-dialog').close()); $('peer-form').addEventListener('submit', savePeer);
+    $('manage-tags').addEventListener('click', () => { resetTagEditor(); renderTagManagement(); $('tag-dialog').showModal(); }); $('tag-close').addEventListener('click', () => $('tag-dialog').close()); $('tag-form').addEventListener('submit', saveTag); $('tag-edit-cancel').addEventListener('click', resetTagEditor);
+    $('confirm-cancel').addEventListener('click', () => { state.confirmAction = null; $('confirm-dialog').close(); if (state.returnToTags) { state.returnToTags = false; renderTagManagement(); $('tag-dialog').showModal(); } }); $('confirm-submit').addEventListener('click', runConfirm);
+    $('search-address-book').addEventListener('click', () => { state.q = $('address-search').value.trim(); state.page = 1; load(); }); $('address-search').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); $('search-address-book').click(); } });
+    $('tag-filter').addEventListener('change', () => { state.tag = $('tag-filter').value; state.page = 1; load(); }); $('favorite-only').addEventListener('change', () => { state.favorite = $('favorite-only').checked; state.page = 1; load(); }); $('refresh-address-book').addEventListener('click', () => load());
+    $('address-prev').addEventListener('click', () => { if (state.page > 1) { state.page -= 1; load(); } }); $('address-next').addEventListener('click', () => { state.page += 1; load(); });
+
+    api('__ADMIN_PATH__/api/session').then(data => {
+      state.csrf = data.csrf || ''; state.user = data.user || null;
+      if (!state.user) { location.href = '__ADMIN_PATH__'; return; }
+      $('who').textContent = '当前：' + state.user.username; $('avatar').textContent = String(state.user.username || 'A').slice(0, 1).toUpperCase(); load();
+    }).catch(() => { location.href = '__ADMIN_PATH__'; });
+  })();
+  </script>
+</body>
+</html>

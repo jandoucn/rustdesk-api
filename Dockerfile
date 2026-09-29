@@ -1,5 +1,5 @@
-# 使用PHP 7.4 FPM Alpine作为基础镜像
-FROM php:8.3-fpm-alpine as php
+# PHP 8.3 FPM Alpine runtime
+FROM php:8.3-fpm-alpine AS php
 
 # 设置工作目录
 WORKDIR /var/www/
@@ -8,20 +8,27 @@ USER root
 
 # 安装nginx,修改配置文件
 RUN set -eux; \
-    apk add --no-cache \ 
+    apk add --no-cache \
     nginx; \
+    docker-php-ext-install mysqli pdo_mysql; \
     sed  -i  '$a listen.owner = nginx' /usr/local/etc/php-fpm.d/zz-docker.conf; \
     sed  -i  '$a listen.group = nginx' /usr/local/etc/php-fpm.d/zz-docker.conf; \
+    sed  -i  '$a clear_env = no' /usr/local/etc/php-fpm.d/zz-docker.conf; \
     sed  -i  '8i php-fpm -D' /usr/local/bin/docker-php-entrypoint;
 
 # 复制自定义的Nginx配置文件到容器中
 COPY ./config/nginx.conf /etc/nginx/nginx.conf
+COPY ./config/docker-entrypoint.sh /usr/local/bin/rustdesk-entrypoint
+RUN chmod 0755 /usr/local/bin/rustdesk-entrypoint
 
 # 复制应用代码到容器中
 COPY ./sqlite /var/www/html
+ENV RUSTDESK_DB=/var/www/data/rustdesk.db \
+    RUSTDESK_ADMIN_PATH=/ops-console
 
 # 暴露端口
 EXPOSE 80
 
 # 启动Nginx服务器
+ENTRYPOINT ["rustdesk-entrypoint"]
 CMD ["nginx", "-g", "daemon off;"]

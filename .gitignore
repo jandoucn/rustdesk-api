@@ -1,0 +1,13 @@
+# Local databases, backups and credentials must never enter source/images.
+/data/
+/sqlite/data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.bak
+.env
+__pycache__/
+*.pyc

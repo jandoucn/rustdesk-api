@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RustDesk 用户管理</title>
+  <link rel="stylesheet" href="__ADMIN_PATH__/assets/app.css">
+</head>
+<body>
+  <section id="login" class="login-page">
+    <div class="login-context" aria-hidden="true">
+      <div class="brand"><span class="brand-mark">RD</span><span class="brand-copy"><strong>RustDesk Console</strong><span>Operations workspace</span></span></div>
+      <div class="login-message"><p class="eyebrow">Secure operations</p><h1>一处管理用户与远程客户端。</h1><p>面向日常运维的紧凑控制台。所有账号、客户端状态与通讯录备注都在同一工作区内完成。</p></div>
+      <div class="login-signal"><span class="status-dot online"></span><span>API 服务已就绪</span></div>
+    </div>
+    <div class="login-panel">
+      <div class="login-card">
+        <p class="eyebrow">Administrator</p><h2>登录管理后台</h2><p>使用管理员账号继续。</p>
+        <form id="lf">
+          <div class="field"><label for="lu">用户名</label><input class="input" id="lu" autocomplete="username" placeholder="用户名" required></div>
+          <div class="field"><label for="lp">密码</label><input class="input" id="lp" type="password" autocomplete="current-password" placeholder="密码" required></div>
+          <button class="button primary" type="submit">登录</button>
+        </form>
+        <p id="le" class="form-error" role="alert"></p>
+      </div>
+    </div>
+  </section>
+
+  <section id="app" class="shell hidden">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">RD</span><span class="brand-copy"><strong>RustDesk Console</strong><span>Operations</span></span></div>
+      <nav class="nav" aria-label="主导航">
+        <span class="nav-label">管理</span>
+        <a class="active" href="__ADMIN_PATH__" aria-current="page"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>用户管理</a>
+        <a href="__ADMIN_PATH__/devices"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2" stroke-width="2"/><path d="M8 21h8M12 17v4" stroke-width="2" stroke-linecap="round"/></svg>客户端管理</a>
+        <a href="__ADMIN_PATH__/address-book"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v17H6.5A2.5 2.5 0 0 0 4 21.5v-17Z" stroke-width="2" stroke-linejoin="round"/><path d="M4 19V4.5M8 7h8M8 11h6" stroke-width="2" stroke-linecap="round"/></svg>通讯录管理</a>
+      </nav>
+      <div class="sidebar-foot"><div class="sidebar-user"><span class="avatar" id="avatar">A</span><span id="who">当前：admin</span></div><button id="lo" class="button ghost" type="button">退出</button></div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="brand"><span class="brand-mark">RD</span><span class="brand-copy"><strong>RustDesk Console</strong></span></div>
+        <nav class="mobile-nav" aria-label="移动端导航"><a class="active" href="__ADMIN_PATH__">用户</a><a href="__ADMIN_PATH__/devices">客户端</a><a href="__ADMIN_PATH__/address-book">通讯录</a><button id="mobile-logout" class="button small" type="button" aria-label="退出登录">退出</button></nav>
+      </header>
+      <main class="content">
+        <div class="page-head">
+          <div><p class="eyebrow">Access control</p><h1>用户管理</h1><p class="page-description">维护 RustDesk 登录账号、启用状态和管理员凭据。</p></div>
+          <div class="page-actions">
+            <button id="cu" class="button primary" type="button"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke-width="2" stroke-linecap="round"/></svg>新建用户</button>
+            <button id="mp" class="button" type="button"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="11" width="18" height="10" rx="2" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4" stroke-width="2" stroke-linecap="round"/></svg>修改我的密码</button>
+            <button id="rf" class="button icon-only" type="button" aria-label="刷新用户列表" title="刷新用户列表"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 11a8 8 0 1 0 2 5.3M20 4v7h-7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          </div>
+        </div>
+
+        <div class="stats users-stats" aria-label="用户统计">
+          <div class="stat"><span class="stat-label">匹配用户</span><strong class="stat-value" id="stat-total">0</strong></div>
+          <div class="stat"><span class="stat-label"><span class="status-dot online"></span>本页启用</span><strong class="stat-value" id="stat-enabled">0</strong></div>
+          <div class="stat"><span class="stat-label"><span class="status-dot offline"></span>本页停用</span><strong class="stat-value" id="stat-disabled">0</strong></div>
+          <div class="stat"><span class="stat-label">本页管理员</span><strong class="stat-value" id="stat-admins">0</strong></div>
+        </div>
+
+        <section class="panel" aria-label="用户列表">
+          <div class="toolbar">
+            <div class="field grow"><label for="q">搜索用户</label><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m20 20-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><input id="q" class="input" placeholder="搜索用户名" autocomplete="off"></div></div>
+            <button id="sq" class="button" type="button">搜索</button>
+          </div>
+          <p id="st" class="feedback" aria-live="polite">等待加载用户数据</p>
+          <div class="table-wrap"><table><thead><tr><th>ID</th><th>用户名</th><th>管理员</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table></div>
+          <div id="empty" class="empty-state hidden"><strong>没有匹配的用户。</strong><p>调整搜索条件或创建一个新用户。</p></div>
+          <div class="pager"><button id="prev" class="button small" type="button">上一页</button><span id="pi"></span><button id="next" class="button small" type="button">下一页</button></div>
+        </section>
+      </main>
+    </div>
+  </section>
+
+  <dialog id="cd" aria-labelledby="create-title"><form id="cf" class="dialog-form"><div class="dialog-head"><h3 id="create-title">新建用户</h3><p>创建一个可登录 RustDesk 的用户账号。</p></div><div class="dialog-body"><div class="field"><label for="nu">用户名</label><input id="nu" class="input" placeholder="用户名" autocomplete="off" required></div><div class="field"><label for="np">初始密码</label><input id="np" class="input" type="password" placeholder="初始密码" autocomplete="new-password" required></div></div><p id="ce" class="form-error" role="alert"></p><div class="dialog-actions"><button id="cc" class="button" type="button">取消</button><button class="button primary" type="submit">创建</button></div></form></dialog>
+  <dialog id="ed" aria-labelledby="edit-title"><form id="ef" class="dialog-form"><div class="dialog-head"><h3 id="edit-title">编辑用户</h3><p>更新账号名称、密码或启用状态。</p></div><div class="dialog-body"><div class="field"><label for="eu">用户名</label><input id="eu" class="input" required></div><div class="field"><label for="ep">新密码</label><input id="ep" class="input" type="password" placeholder="新密码（留空不改）" autocomplete="new-password"></div><label class="check"><input id="ee" type="checkbox"> 启用此用户</label></div><p id="eee" class="form-error" role="alert"></p><div class="dialog-actions"><button id="ec" class="button" type="button">取消</button><button class="button primary" type="submit">保存</button></div></form></dialog>
+  <dialog id="pd" aria-labelledby="password-title"><form id="pf" class="dialog-form"><div class="dialog-head"><h3 id="password-title">修改我的密码</h3><p>保存后当前会话可能需要重新登录。</p></div><div class="dialog-body"><div class="field"><label for="op">当前密码</label><input id="op" class="input" type="password" placeholder="当前密码" autocomplete="current-password" required></div><div class="field"><label for="mnp">新密码</label><input id="mnp" class="input" type="password" placeholder="新密码" autocomplete="new-password" required></div></div><p id="pe" class="form-error" role="alert"></p><div class="dialog-actions"><button id="pc" class="button" type="button">取消</button><button class="button primary" type="submit">保存</button></div></form></dialog>
+
+  <script>
+  'use strict';
+  (() => {
+    const $ = id => document.getElementById(id);
+    const state = { csrf: '', user: null, page: 1, size: 20, total: 0, q: '', busy: false, id: 0 };
+    const text = (element, value) => { element.textContent = value == null ? '' : String(value); };
+    function setBusy(value) { state.busy = value; document.querySelectorAll('button').forEach(button => { button.disabled = value; }); updatePager(); }
+    function setFeedback(message, kind = '') { const element = $('st'); text(element, message); element.className = 'feedback' + (kind ? ' ' + kind : ''); }
+    function updatePager() { const pages = Math.max(1, Math.ceil(state.total / state.size)); text($('pi'), '第 ' + state.page + '/' + pages + ' 页，共 ' + state.total); $('prev').disabled = state.busy || state.page <= 1; $('next').disabled = state.busy || state.page >= pages; }
+    async function api(url, options = {}) { const headers = new Headers(options.headers || {}); headers.set('Accept', 'application/json'); if (options.body !== undefined) headers.set('Content-Type', 'application/json'); if (state.csrf) headers.set('X-CSRF-Token', state.csrf); const response = await fetch(url, { ...options, headers, credentials: 'same-origin' }); const data = await response.json().catch(() => ({ error: '响应无效' })); if (!response.ok) throw Error(data.error || '请求失败'); return data; }
+    async function session() { const data = await api('__ADMIN_PATH__/api/session'); state.csrf = data.csrf || ''; state.user = data.user || null; return data; }
+    function updateView() { $('login').classList.toggle('hidden', Boolean(state.user)); $('app').classList.toggle('hidden', !state.user); if (!state.user) return; text($('who'), '当前：' + state.user.username); text($('avatar'), String(state.user.username || 'A').slice(0, 1).toUpperCase()); }
+    function appendCell(row, label, value, className = '') { const cell = document.createElement('td'); cell.dataset.label = label; if (className) cell.className = className; text(cell, value); row.append(cell); return cell; }
+    function updateStats(users) { text($('stat-total'), state.total); text($('stat-enabled'), users.filter(user => user.enabled !== false).length); text($('stat-disabled'), users.filter(user => user.enabled === false).length); text($('stat-admins'), users.filter(user => user.is_admin).length); }
+    function render(users) {
+      const body = $('rows'); body.replaceChildren(); $('empty').classList.toggle('hidden', users.length > 0); updateStats(users);
+      users.forEach(user => {
+        const row = document.createElement('tr'); appendCell(row, 'ID', user.id, 'mono'); appendCell(row, '用户名', user.username, 'primary-cell'); appendCell(row, '管理员', user.is_admin ? '是' : '否');
+        const statusCell = appendCell(row, '状态', ''); const badge = document.createElement('span'); badge.className = 'status-badge ' + (user.enabled === false ? 'offline' : 'online'); const dot = document.createElement('span'); dot.className = 'status-dot ' + (user.enabled === false ? 'offline' : 'online'); badge.append(dot, document.createTextNode(user.enabled === false ? '停用' : '启用')); statusCell.append(badge);
+        appendCell(row, '创建时间', user.create_time ? new Date(Number(user.create_time) * 1000).toLocaleString() : '-');
+        const actions = appendCell(row, '操作', '', 'actions-cell'); const group = document.createElement('div'); group.className = 'row-actions'; const editButton = document.createElement('button'); editButton.className = 'button small'; editButton.type = 'button'; editButton.textContent = '编辑'; editButton.onclick = () => editUser(user); const deleteButton = document.createElement('button'); deleteButton.className = 'button small danger'; deleteButton.type = 'button'; deleteButton.textContent = '删除'; deleteButton.onclick = () => deleteUser(user); group.append(editButton, deleteButton); actions.append(group); body.append(row);
+      });
+    }
+    async function load() { if (!state.user) return; setBusy(true); setFeedback('正在加载用户数据...'); try { const params = new URLSearchParams({ q: state.q, page: state.page, pageSize: state.size }); const data = await api('__ADMIN_PATH__/api/users?' + params); state.total = Number(data.total) || 0; render(Array.isArray(data.data) ? data.data : []); setFeedback('已加载 ' + state.total + ' 个匹配用户', 'success'); } catch (error) { setFeedback(error.message, 'error'); } finally { setBusy(false); updatePager(); } }
+    function editUser(user) { state.id = user.id; $('eu').value = user.username || ''; $('ep').value = ''; $('ee').checked = user.enabled !== false; text($('eee'), ''); $('ed').showModal(); }
+    async function deleteUser(user) { if (!confirm('确认删除“' + String(user.username) + '”？软删后地址簿仍保留。')) return; setBusy(true); try { await api('__ADMIN_PATH__/api/users/' + encodeURIComponent(user.id), { method: 'DELETE', body: '{}' }); await load(); } catch (error) { setFeedback(error.message, 'error'); } finally { setBusy(false); } }
+    $('lf').addEventListener('submit', async event => { event.preventDefault(); setBusy(true); text($('le'), ''); try { await api('__ADMIN_PATH__/api/login', { method: 'POST', body: JSON.stringify({ username: $('lu').value, password: $('lp').value }) }); await session(); $('lp').value = ''; updateView(); await load(); } catch (error) { text($('le'), error.message); } finally { setBusy(false); } });
+    async function logout() { setBusy(true); try { await api('__ADMIN_PATH__/api/logout', { method: 'POST', body: '{}' }); } catch (_) {} state.user = null; state.csrf = ''; updateView(); setBusy(false); }
+    $('lo').addEventListener('click', logout); $('mobile-logout').addEventListener('click', logout); $('sq').addEventListener('click', () => { state.q = $('q').value.trim(); state.page = 1; load(); }); $('q').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); $('sq').click(); } }); $('rf').addEventListener('click', load); $('prev').addEventListener('click', () => { if (state.page > 1) { state.page -= 1; load(); } }); $('next').addEventListener('click', () => { state.page += 1; load(); });
+    $('cu').addEventListener('click', () => { $('cf').reset(); text($('ce'), ''); $('cd').showModal(); });
+    $('cc').addEventListener('click', () => $('cd').close());
+    $('cf').addEventListener('submit', async event => { event.preventDefault(); setBusy(true); text($('ce'), ''); try { await api('__ADMIN_PATH__/api/users', { method: 'POST', body: JSON.stringify({ username: $('nu').value.trim(), password: $('np').value, enabled: true }) }); event.target.reset(); $('cd').close(); await load(); } catch (error) { text($('ce'), error.message); } finally { setBusy(false); } });
+    $('ec').addEventListener('click', () => $('ed').close()); $('ef').addEventListener('submit', async event => { event.preventDefault(); setBusy(true); text($('eee'), ''); try { const payload = { username: $('eu').value.trim(), enabled: $('ee').checked }; if ($('ep').value) payload.password = $('ep').value; await api('__ADMIN_PATH__/api/users/' + state.id, { method: 'PATCH', body: JSON.stringify(payload) }); const data = await session(); if (!data.user) { state.user = null; $('ed').close(); updateView(); text($('le'), '账号已修改，请重新登录'); return; } state.user = data.user; updateView(); $('ed').close(); await load(); } catch (error) { text($('eee'), error.message); } finally { setBusy(false); } });
+    $('mp').addEventListener('click', () => { $('pf').reset(); text($('pe'), ''); $('pd').showModal(); }); $('pc').addEventListener('click', () => $('pd').close()); $('pf').addEventListener('submit', async event => { event.preventDefault(); setBusy(true); text($('pe'), ''); try { await api('__ADMIN_PATH__/api/me/password', { method: 'PATCH', body: JSON.stringify({ old_password: $('op').value, password: $('mnp').value }) }); const data = await session(); if (!data.user) { state.user = null; $('pd').close(); $('pf').reset(); updateView(); text($('le'), '密码已修改，请重新登录'); return; } state.user = data.user; $('pd').close(); setFeedback('密码已修改', 'success'); } catch (error) { text($('pe'), error.message); } finally { setBusy(false); } });
+    session().then(() => { updateView(); if (state.user) load(); }).catch(error => text($('le'), error.message));
+  })();
+  </script>
+</body>
+</html>

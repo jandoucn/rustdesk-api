@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""Black-box integration checks for the SQLite RustDesk API.
+
+Only Python's standard library is used.  The test creates a disposable legacy
+database, starts the front controller on a random loopback port, exercises the
+RustDesk contract and the web-admin contract, then removes all temporary data.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import http.cookiejar
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import socket
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SQLITE_DIR = ROOT / "sqlite"
+DEFAULT_RUNTIME = "/tmp/rustdesk-local-runtime/frankenphp"
+
+
+def legacy_password(password: str) -> str:
+    return hashlib.md5((password + "rustdesk").encode()).hexdigest()
+
+
+def create_fixture(path: Path) -> None:
+    """Create the pre-migration four-table shape with sentinel records."""
+    db = sqlite3.connect(path)
+    db.executescript(
+        """
+        CREATE TABLE rustdesk_peers (
+          deviceid INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER NOT NULL DEFAULT 0,
+          id TEXT NOT NULL, username TEXT, hostname TEXT, alias TEXT,
+          platform TEXT, tags TEXT, hash TEXT
+        );
+        CREATE TABLE rustdesk_tags (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER NOT NULL, tag TEXT NOT NULL
+        );
+        CREATE TABLE rustdesk_token (
+          access_token TEXT NOT NULL, username TEXT NOT NULL, uid INTEGER NOT NULL DEFAULT 0,
+          id TEXT NOT NULL, uuid TEXT, login_time INTEGER NOT NULL DEFAULT 0,
+          expire_time INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE rustdesk_users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, password TEXT NOT NULL,
+          create_time INTEGER NOT NULL DEFAULT 0, delete_time INTEGER NOT NULL DEFAULT 0
+        );
+        """,
+    )
+    db.execute(
+        "INSERT INTO rustdesk_users(id, username, password, create_time, delete_time) VALUES (1, ?, ?, 1700000000, 0), (2, ?, ?, 1700000001, 0)",
+        ("admin", legacy_password("admin123"), "legacy", legacy_password("legacy123")),
+    )
+    db.execute("INSERT INTO rustdesk_peers(deviceid,uid,id,username,hostname,alias,platform,tags,hash) VALUES (11,2,'legacy-id','alice','old-host','Old alias','windows','prod,blue','legacy-hash')")
+    db.execute("INSERT INTO rustdesk_tags(id,uid,tag) VALUES (7,2,'prod'),(8,2,'blue')")
+    db.execute("INSERT INTO rustdesk_token(access_token,username,uid,id,uuid,login_time,expire_time) VALUES (?, 'legacy',2,'legacy-id','legacy-uuid',1700000002,0)", ("a" * 64,))
+    db.commit()
+    db.close()
+
+
+class HttpClient:
+    def __init__(self, base: str):
+        self.base = base.rstrip("/")
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+
+    def request(self, method: str, path: str, payload=None, headers=None, expected=None):
+        data = None
+        hdr = {"Accept": "application/json"}
+        if payload is not None:
+            if isinstance(payload, (bytes, bytearray)):
+                data = bytes(payload)
+                hdr["Content-Type"] = "application/octet-stream"
+            elif isinstance(payload, str):
+                data = payload.encode()
+                hdr["Content-Type"] = "text/plain"
+            else:
+                data = json.dumps(payload).encode()
+                hdr["Content-Type"] = "application/json"
+        if headers:
+            hdr.update(headers)
+        req = urllib.request.Request(self.base + path, data=data, headers=hdr, method=method)
+        try:
+            with self.opener.open(req, timeout=8) as resp:
+                raw = resp.read()
+                status = resp.status
+                ctype = resp.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            status = exc.code
+            ctype = exc.headers.get("Content-Type", "")
+            exc.close()
+        text = raw.decode("utf-8", "replace")
+        try:
+            body = json.loads(text)
+        except json.JSONDecodeError:
+            body = text
+        if expected is not None and status not in expected:
+            raise AssertionError(f"{method} {path}: HTTP {status}, body={body!r}")
+        return status, body, ctype
+
+    def json(self, method, path, payload=None, headers=None, expected=(200,)):
+        return self.request(method, path, payload, headers, expected)
+
+
+class IntegrationTest(unittest.TestCase):
+    runtime = None
+    proc = None
+    temp = None
+    client = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = Path(tempfile.mkdtemp(prefix="rustdesk-api-test-"))
+        cls.db = cls.temp / "legacy.db"
+        create_fixture(cls.db)
+        runtime = Path(cls.runtime or os.environ.get("FRANKENPHP", DEFAULT_RUNTIME))
+        manage = SQLITE_DIR / "manage.php"
+        if not manage.exists():
+            raise RuntimeError("sqlite/manage.php is required by the integration contract")
+        cli = [str(runtime), "php-cli", str(manage), "--db", str(cls.db), "--migrate", "--promote-admin=1"] if runtime.name == "frankenphp" else [str(runtime), str(manage), "--db", str(cls.db), "--migrate", "--promote-admin=1"]
+        migrated = subprocess.run(cli, cwd=ROOT, env={**os.environ, "RUSTDESK_DB": str(cls.db)}, input="", text=True, capture_output=True, timeout=10)
+        if migrated.returncode != 0:
+            raise RuntimeError(f"manage.php migration failed: {migrated.stderr or migrated.stdout}")
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        cls.url = f"http://127.0.0.1:{port}"
+        env = os.environ.copy()
+        env["RUSTDESK_DB"] = str(cls.db)
+        # Production defaults to a custom path; tests explicitly pin the public path for compatibility cases.
+        env["RUSTDESK_ADMIN_PATH"] = "/ops-x9"
+        if runtime.name == "frankenphp":
+            cmd = [str(runtime), "php-server", "--listen", f"127.0.0.1:{port}", "--root", str(SQLITE_DIR)]
+        else:
+            cmd = [str(runtime), "-S", f"127.0.0.1:{port}", "-t", str(SQLITE_DIR), str(SQLITE_DIR / "index.php")]
+        cls.proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        cls.client = HttpClient(cls.url)
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            try:
+                status, _, _ = cls.client.request("GET", "/", expected=(200, 404))
+                if status in (200, 404):
+                    return
+            except (urllib.error.URLError, TimeoutError):
+                time.sleep(0.1)
+        cls.tearDownClass()
+        raise RuntimeError("API server did not start")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.proc and cls.proc.poll() is None:
+            cls.proc.terminate()
+            try:
+                cls.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                cls.proc.kill()
+                cls.proc.wait(timeout=3)
+        if cls.proc:
+            for stream in (cls.proc.stdout, cls.proc.stderr):
+                if stream:
+                    stream.close()
+        if cls.temp:
+            shutil.rmtree(cls.temp, ignore_errors=True)
+
+    def test_01_legacy_fixture_is_preserved_on_startup(self):
+        db = sqlite3.connect(self.db)
+        row = db.execute("SELECT username,password,create_time,delete_time FROM rustdesk_users WHERE id=2").fetchone()
+        peer = db.execute("SELECT uid,id,alias,tags,hash FROM rustdesk_peers WHERE deviceid=11").fetchone()
+        token = db.execute("SELECT access_token,expire_time FROM rustdesk_token WHERE uid=2").fetchone()
+        schema_version = db.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0]
+        db.close()
+        self.assertEqual(row, ("legacy", legacy_password("legacy123"), 1700000001, 0))
+        self.assertEqual(peer, (2, "legacy-id", "Old alias", "prod,blue", "legacy-hash"))
+        self.assertEqual(token, ("a" * 64, 0))
+        self.assertEqual(schema_version, "5")
+        auth = {"Authorization": "Bearer " + ("a" * 64)}
+        _, current, _ = self.client.json("POST", "/?s=/api/currentUser", {"id": "legacy-id", "uuid": "legacy-uuid"}, auth)
+        self.assertEqual(current.get("name"), "legacy")
+        db = sqlite3.connect(self.db)
+        migrated = int(db.execute("SELECT value FROM app_meta WHERE key='migrated_at'").fetchone()[0])
+        db.execute("UPDATE app_meta SET value=? WHERE key='migrated_at'", (str(int(time.time()) - 8 * 86400),))
+        db.commit()
+        db.close()
+        self.client.json("POST", "/?s=/api/currentUser", {"id": "legacy-id", "uuid": "legacy-uuid"}, auth, expected=(401,))
+        db = sqlite3.connect(self.db)
+        db.execute("UPDATE app_meta SET value=? WHERE key='migrated_at'", (str(migrated),))
+        db.commit()
+        db.close()
+
+    def test_02_rustdesk_login_current_user_and_logout_revokes_token(self):
+        status, body, _ = self.client.json("POST", "/?s=/api/login", {"username": "legacy", "password": "legacy123", "id": "legacy-id", "uuid": "legacy-uuid"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("type"), "access_token")
+        token = body["access_token"]
+        auth = {"Authorization": "Bearer " + token}
+        _, current, _ = self.client.json("POST", "/?s=/api/currentUser", {"id": "legacy-id", "uuid": "legacy-uuid"}, auth)
+        self.assertEqual(current.get("name"), "legacy")
+        self.client.json("POST", "/?s=/api/logout", {"id": "legacy-id", "uuid": "legacy-uuid"}, auth)
+        status, _, _ = self.client.json("POST", "/?s=/api/currentUser", {"id": "legacy-id", "uuid": "legacy-uuid"}, auth, expected=(401,))
+        self.assertEqual(status, 401)
+
+    def rust_login(self, username="legacy", password="legacy123", device_id="legacy-id"):
+        _, body, _ = self.client.json("POST", "/?s=/api/login", {"username": username, "password": password, "id": device_id, "uuid": "legacy-uuid"})
+        return {"Authorization": "Bearer " + body["access_token"]}
+
+    def admin_csrf(self):
+        _, session, _ = self.client.json("GET", "/?s=/ops-x9/api/session")
+        if session.get("user") is not None:
+            return session["csrf"]
+        for password in ("admin456", "admin123"):
+            status, login, _ = self.client.json(
+                "POST", "/?s=/ops-x9/api/login",
+                {"username": "admin", "password": password},
+                {"X-CSRF-Token": session["csrf"]}, expected=(200, 401),
+            )
+            if status == 200:
+                self.admin_password = password
+                return login["csrf"]
+        self.fail("administrator login failed with both fixture passwords")
+
+    def rust_admin_login(self, device_id):
+        for password in ("admin456", "admin123"):
+            status, body, _ = self.client.json(
+                "POST", "/?s=/api/login",
+                {"username": "admin", "password": password, "id": device_id, "uuid": "admin-book-uuid"},
+                expected=(200, 401),
+            )
+            if status == 200:
+                return {"Authorization": "Bearer " + body["access_token"]}
+        self.fail("RustDesk administrator login failed with both fixture passwords")
+
+    def test_03_address_book_bad_payload_does_not_clear_existing_rows(self):
+        auth = self.rust_login()
+        self.client.json("POST", "/?s=/api/ab", {"data": "not-json"}, auth, expected=(422,))
+        db = sqlite3.connect(self.db)
+        row = db.execute("SELECT id,alias,tags,hash FROM rustdesk_peers WHERE deviceid=11").fetchone()
+        db.close()
+        self.assertEqual(row, ("legacy-id", "Old alias", "prod,blue", "legacy-hash"))
+
+    def test_04_address_book_preserves_unknown_fields_commas_and_empty_set(self):
+        auth = self.rust_login()
+        payload = {
+            "tags": ["comma,tag", "blue"],
+            "peers": [{"id": "roundtrip-id", "username": "u", "hostname": "h", "alias": "a",
+                       "platform": "linux", "tags": ["comma,tag"], "hash": "x", "future_field": {"v": 1}}],
+            "future_top_level": {"enabled": True},
+        }
+        self.client.json("POST", "/?s=/api/ab", {"data": json.dumps(payload, ensure_ascii=False)}, auth)
+        _, result, _ = self.client.json("GET", "/?s=/api/ab", None, auth)
+        returned = json.loads(result["data"])
+        self.assertEqual(returned["future_top_level"], {"enabled": True})
+        self.assertEqual(returned["peers"][0]["future_field"], {"v": 1})
+        self.assertEqual(returned["tags"][0], "comma,tag")
+        self.client.json("POST", "/?s=/api/ab", {"data": json.dumps({"tags": [], "peers": []})}, auth)
+        _, empty, _ = self.client.json("GET", "/?s=/api/ab", None, auth)
+        self.assertEqual(json.loads(empty["data"]), {"tags": [], "peers": []})
+
+    def test_05_sysinfo_and_anonymous_heartbeat(self):
+        status, text, ctype = self.client.request("POST", "/?s=/api/sysinfo", {"id": "new-id", "uuid": "new-uuid", "version": "1.4.6", "hostname": "host", "os": "linux", "cpu": "x", "memory": "1G"}, expected=(200,))
+        self.assertEqual(status, 200)
+        self.assertTrue("text/plain" in ctype)
+        self.assertIn("SYSINFO", text)
+        _, heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {"id": "anonymous", "uuid": str(uuid.uuid4()), "conns": []})
+        self.assertIsInstance(heartbeat, dict)
+
+    def test_06_admin_session_csrf_login_and_user_lifecycle(self):
+        status, session, _ = self.client.json("GET", "/?s=/ops-x9/api/session")
+        self.assertEqual(status, 200)
+        csrf = session.get("csrf")
+        self.assertTrue(csrf)
+        status, login, _ = self.client.json("POST", "/?s=/ops-x9/api/login", {"username": "admin", "password": "admin123"}, {"X-CSRF-Token": csrf}, expected=(200,))
+        self.assertEqual(status, 200)
+        csrf = login["csrf"]
+        _, listing, _ = self.client.json("GET", "/?s=/ops-x9/api/users&page=1&pageSize=100")
+        names = {u.get("username") for u in listing.get("data", listing.get("items", []))}
+        self.assertIn("legacy", names)
+        status, _, _ = self.client.json("POST", "/?s=/ops-x9/api/users", {"username": "managed", "password": "managed123"}, expected=(403,))
+        self.assertEqual(status, 403)
+        _, created, _ = self.client.json("POST", "/?s=/ops-x9/api/users", {"username": "managed", "password": "1", "enabled": True}, {"X-CSRF-Token": csrf}, expected=(200, 201))
+        user_id = created.get("id") or created.get("data", {}).get("id")
+        self.assertTrue(user_id)
+        status, _, _ = self.client.json("POST", "/?s=/ops-x9/api/users", {"username": "managed", "password": "managed123"}, {"X-CSRF-Token": csrf}, expected=(409,))
+        self.assertEqual(status, 409)
+        self.client.json("PATCH", f"/?s=/ops-x9/api/users/{user_id}", {"username": "managed-renamed", "enabled": False}, {"X-CSRF-Token": csrf})
+        status, _, _ = self.client.json("POST", "/?s=/api/login", {"username": "managed-renamed", "password": "1", "id": "managed-id", "uuid": "managed-uuid"}, expected=(401,))
+        self.assertEqual(status, 401)
+        self.client.json("PATCH", f"/?s=/ops-x9/api/users/{user_id}", {"enabled": True}, {"X-CSRF-Token": csrf})
+        _, managed_login, _ = self.client.json("POST", "/?s=/api/login", {"username": "managed-renamed", "password": "1", "id": "managed-id", "uuid": "managed-uuid"})
+        managed_auth = {"Authorization": "Bearer " + managed_login["access_token"]}
+        self.client.json("PATCH", f"/?s=/ops-x9/api/users/{user_id}", {"password": "managed456"}, {"X-CSRF-Token": csrf})
+        self.client.json("POST", "/?s=/api/currentUser", {"id": "managed-id", "uuid": "managed-uuid"}, managed_auth, expected=(401,))
+        self.client.json("DELETE", f"/?s=/ops-x9/api/users/{user_id}", None, {"X-CSRF-Token": csrf}, expected=(200, 204))
+
+    def test_07_admin_password_revokes_session_and_client_tokens(self):
+        status, session, _ = self.client.json("GET", "/?s=/ops-x9/api/session")
+        self.assertEqual(status, 200)
+        csrf = session["csrf"]
+        _, login, _ = self.client.json("POST", "/?s=/ops-x9/api/login", {"username": "admin", "password": "admin123"}, {"X-CSRF-Token": csrf})
+        csrf = login["csrf"]
+        _, client_login, _ = self.client.json("POST", "/?s=/api/login", {"username": "admin", "password": "admin123", "id": "admin-id", "uuid": "admin-uuid"})
+        client_auth = {"Authorization": "Bearer " + client_login["access_token"]}
+        self.client.json("PATCH", "/?s=/ops-x9/api/me/password", {"old_password": "admin123", "password": "admin456"}, {"X-CSRF-Token": csrf})
+        _, after, _ = self.client.json("GET", "/?s=/ops-x9/api/session")
+        self.assertIsNone(after.get("user"))
+        self.client.json("POST", "/?s=/api/currentUser", {"id": "admin-id", "uuid": "admin-uuid"}, client_auth, expected=(401,))
+
+    def test_08_soft_delete_keeps_peer_rows(self):
+        status, session, _ = self.client.json("GET", "/?s=/ops-x9/api/session")
+        self.assertEqual(status, 200)
+        csrf = session["csrf"]
+        _, login, _ = self.client.json("POST", "/?s=/ops-x9/api/login", {"username": "admin", "password": "admin456"}, {"X-CSRF-Token": csrf})
+        csrf = login["csrf"]
+        _, created, _ = self.client.json("POST", "/?s=/ops-x9/api/users", {"username": "keep-peer", "password": "keeppeer123"}, {"X-CSRF-Token": csrf}, expected=(200, 201))
+        user_id = int(created["id"])
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO rustdesk_peers(uid,id,username,hostname,alias,platform,tags,hash) VALUES (?,?,?,?,?,?,?,?)", (user_id, "keep-id", "u", "h", "a", "linux", "", ""))
+        db.commit()
+        self.client.json("DELETE", f"/?s=/ops-x9/api/users/{user_id}", None, {"X-CSRF-Token": csrf}, expected=(200, 204))
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM rustdesk_peers WHERE uid=?", (user_id,)).fetchone()[0], 1)
+        db.close()
+
+    def test_09_audit_big_nonce_is_idempotent(self):
+        nonce = "922337203685477580812345678901234567890"
+        payload = {"id": "audit-id", "uuid": "audit-uuid", "nonce": nonce, "note": "first"}
+        self.client.json("POST", "/?s=/api/audit/conn", payload)
+        self.client.json("POST", "/?s=/api/audit/conn", {**payload, "note": "duplicate"})
+        db = sqlite3.connect(self.db)
+        count = db.execute("SELECT COUNT(*) FROM audit_events WHERE device_id=? AND uuid=? AND nonce=?", ("audit-id", "audit-uuid", nonce)).fetchone()[0]
+        db.close()
+        self.assertEqual(count, 1)
+
+    def test_10_current_client_api_surface(self):
+        auth = self.rust_login()
+        # New RustDesk clients probe these endpoints before selecting the address-book mode.
+        _, settings, _ = self.client.json("POST", "/?s=/api/ab/settings", {}, auth)
+        self.assertIn("max_peer_one_ab", settings)
+        _, personal, _ = self.client.json("POST", "/?s=/api/ab/personal", {}, auth)
+        guid = personal.get("guid")
+        self.assertRegex(guid or "", r"^[0-9a-f-]{36}$")
+        _, profiles, _ = self.client.json("POST", "/?s=/api/ab/shared/profiles&current=1&pageSize=100", {}, auth)
+        self.assertIn("total", profiles)
+        _, peers, _ = self.client.json("POST", f"/?s=/api/ab/peers&ab={guid}&current=1&pageSize=100", {}, auth)
+        self.assertIn("data", peers)
+        _, tags, _ = self.client.json("POST", f"/?s=/api/ab/tags/{guid}", {}, auth)
+        self.assertIsInstance(tags, list)
+
+        peer = {"id": "new-api-peer", "alias": "new", "tags": ["ops"], "note": "n"}
+        self.client.json("POST", f"/?s=/api/ab/peer/add/{guid}", peer, auth)
+        self.client.json("PUT", f"/?s=/api/ab/peer/update/{guid}", {"id": peer["id"], "alias": "renamed"}, auth)
+        _, peers2, _ = self.client.json("POST", f"/?s=/api/ab/peers&ab={guid}&current=1&pageSize=100", {}, auth)
+        self.assertEqual(peers2["data"][0]["alias"], "renamed")
+        self.client.json("POST", f"/?s=/api/ab/tag/add/{guid}", {"name": "ops", "color": 123}, auth)
+        self.client.json("PUT", f"/?s=/api/ab/tag/rename/{guid}", {"old": "ops", "new": "prod"}, auth)
+        self.client.json("DELETE", f"/?s=/api/ab/peer/{guid}", [peer["id"]], auth)
+        self.client.json("DELETE", f"/?s=/api/ab/tag/{guid}", ["prod"], auth)
+
+        _, groups, _ = self.client.json("GET", "/?s=/api/device-group/accessible&current=1&pageSize=100", None, auth)
+        self.assertIn("data", groups)
+        _, version, ctype = self.client.request("POST", "/?s=/api/sysinfo_ver", {}, expected=(200,))
+        self.assertTrue(ctype.startswith("text/plain"))
+        self.assertTrue(version)
+
+    def test_11_deploy_and_assign_contracts(self):
+        auth = self.rust_login()
+        headers = {**auth}
+        _, deploy, _ = self.client.json("POST", "/?s=/api/devices/deploy", {"id": "deploy-id", "uuid": "deploy-uuid", "pk": "pk"}, headers)
+        self.assertEqual(deploy.get("result"), "OK")
+        status, body, _ = self.client.request("POST", "/?s=/api/devices/cli", {"id": "deploy-id", "uuid": "deploy-uuid", "device_name": "Managed"}, headers, expected=(200,))
+        self.assertIn(status, (200, 201))
+
+    def test_12_audit_note_and_switch_grant_are_idempotent(self):
+        auth = self.rust_login()
+        self.client.json("PUT", "/?s=/api/audit", {"guid": "g-1", "note": "hello"}, auth)
+        self.client.json("POST", "/?s=/api/switch-grant", {"id": "id", "switch_code_verifier": "v", "timestamp": str(int(time.time())), "signature": "s"})
+
+    def test_13_record_upload_and_optional_oidc_contract(self):
+        status, body, _ = self.client.request("POST", "/?s=/api/record&op=new&filename=e2e.webm&id=session-1", b"frame-1", expected=(200,))
+        self.assertTrue(body.get("ok"))
+        status, body, _ = self.client.request("POST", "/?s=/api/record&op=part&filename=e2e.webm&id=session-1", b"frame-2", expected=(200,))
+        self.assertTrue(body.get("ok"))
+        self.client.json("POST", "/?s=/api/oidc/auth", {}, expected=(404,))
+        self.client.json("GET", "/?s=/api/oidc/auth-query&code=x&id=i&uuid=u", None, expected=(404,))
+
+    def test_14_audit_variants_and_method_guards(self):
+        for endpoint in ("/api/audit/file", "/api/audit/alarm"):
+            self.client.json("POST", f"/?s={endpoint}", {"id": "device", "uuid": "u", "nonce": "n-" + endpoint.rsplit('/', 1)[-1], "info": {"ok": True}})
+        self.client.request("GET", "/?s=/api/login", expected=(405,))
+        self.client.request("POST", "/?s=/api/login-options", {}, expected=(405,))
+
+    def test_15_admin_client_management(self):
+        csrf = self.admin_csrf()
+        _, devices, _ = self.client.json("GET", "/?s=/ops-x9/api/devices&page=1&pageSize=100")
+        self.assertTrue(any(d["id"] == "deploy-id" for d in devices["data"]))
+        self.client.json("DELETE", "/?s=/ops-x9/api/devices/deploy-id", None, {"X-CSRF-Token": csrf})
+        _, devices, _ = self.client.json("GET", "/?s=/ops-x9/api/devices&page=1&pageSize=100")
+        self.assertFalse(any(d["id"] == "deploy-id" for d in devices["data"]))
+
+    def test_16_custom_admin_path_is_the_only_admin_entry(self):
+        for path in ("/", "/admin", "/admin/devices", "/unknown-page", "/?s=/admin/api/session"):
+            status, body, ctype = self.client.request("GET", path, expected=(200,))
+            self.assertEqual(status, 200)
+            self.assertIn("text/html", ctype)
+            self.assertIn("RustDesk API", body)
+        _, login_page, ctype = self.client.request("GET", "/ops-x9", expected=(200,))
+        self.assertIn("text/html", ctype)
+        self.assertIn("RustDesk 用户管理", login_page)
+        self.assertNotIn("__ADMIN_PATH__", login_page)
+        _, devices_page, _ = self.client.request("GET", "/ops-x9/devices", expected=(200,))
+        self.assertIn("/ops-x9/api/devices", devices_page)
+        self.client.json("GET", "/api/not-found", expected=(404,))
+
+    def test_17_heartbeat_inventory_and_address_book_alias_sync(self):
+        device_id = "heartbeat-only"
+        device_uuid = "heartbeat-uuid"
+        _, heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {
+            "id": device_id, "uuid": device_uuid, "ver": 7, "conns": [], "modified_at": 0,
+        })
+        self.assertTrue(heartbeat.get("sysinfo"))
+        db = sqlite3.connect(self.db)
+        row = db.execute("SELECT id,uuid,last_seen,last_heartbeat,heartbeat_payload FROM device_reports WHERE id=? AND uuid=?", (device_id, device_uuid)).fetchone()
+        self.assertEqual(row[:2], (device_id, device_uuid))
+        self.assertGreater(row[2], 0)
+        self.assertGreater(row[3], 0)
+        self.assertEqual(json.loads(row[4])["ver"], 7)
+        db.close()
+
+        self.client.request("POST", "/?s=/api/sysinfo", {
+            "id": device_id, "uuid": device_uuid, "hostname": "heartbeat-host",
+            "username": "operator", "os": "linux", "version": "1.4.6",
+        }, expected=(200,))
+        csrf = self.admin_csrf()
+        _, devices, _ = self.client.json("GET", "/?s=/ops-x9/api/devices&q=heartbeat-host&page=1&pageSize=20")
+        device = next(row for row in devices["data"] if row["id"] == device_id)
+        self.assertEqual(device["presence"], "online")
+        self.assertIsNone(device["alias"])
+        self.assertFalse(device["deployed"])
+
+        self.client.json("PATCH", f"/?s=/ops-x9/api/devices/{device_id}/alias", {"alias": "机房入口"}, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        profile_alias = db.execute("SELECT json_extract(p.payload,'$.alias') FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=1 AND a.personal=1 AND p.id=?", (device_id,)).fetchone()[0]
+        legacy_alias = db.execute("SELECT alias FROM rustdesk_peers WHERE uid=1 AND id=?", (device_id,)).fetchone()[0]
+        legacy_payload = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=1").fetchone()[0])
+        db.close()
+        self.assertEqual(profile_alias, "机房入口")
+        self.assertEqual(legacy_alias, "机房入口")
+        self.assertEqual(next(p["alias"] for p in legacy_payload["peers"] if p["id"] == device_id), "机房入口")
+
+        auth = self.rust_admin_login("admin-book")
+        _, personal, _ = self.client.json("POST", "/?s=/api/ab/personal", {}, auth)
+        _, peers, _ = self.client.json("POST", f"/?s=/api/ab/peers&ab={personal['guid']}&current=1&pageSize=100", {}, auth)
+        self.assertEqual(next(p["alias"] for p in peers["data"] if p["id"] == device_id), "机房入口")
+
+    def test_18_presence_boundaries_summary_and_filters(self):
+        runtime = Path(self.runtime or os.environ.get("FRANKENPHP", DEFAULT_RUNTIME))
+        code = f'require {json.dumps(str(SQLITE_DIR / "lib.php"))}; echo json_encode([device_presence(80,100),device_presence(79,100),device_presence(10,100),device_presence(9,100),device_presence(0,100)]);'
+        command = [str(runtime), "php-cli", "-r", code] if runtime.name == "frankenphp" else [str(runtime), "-r", code]
+        exact = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=True, timeout=10)
+        self.assertEqual(json.loads(exact.stdout), ["online", "recent", "recent", "offline", "unreported"])
+        csrf = self.admin_csrf()
+        fixtures = {
+            "presence-online-20": 19,
+            "presence-recent-low": 22,
+            "presence-recent-90": 89,
+            "presence-offline": 92,
+        }
+        for device_id in fixtures:
+            self.client.json("POST", "/?s=/api/heartbeat", {
+                "id": device_id, "uuid": device_id + "-uuid", "ver": 8, "conns": [],
+            })
+            self.client.request("POST", "/?s=/api/sysinfo", {
+                "id": device_id, "uuid": device_id + "-uuid",
+                "hostname": device_id + "-host", "username": "boundary",
+                "os": "linux", "version": "1.4.6",
+            }, expected=(200,))
+        db = sqlite3.connect(self.db)
+        now = int(time.time())
+        for device_id, age in fixtures.items():
+            db.execute("UPDATE device_reports SET last_heartbeat=? WHERE id=?", (now - age, device_id))
+        db.commit()
+        db.close()
+        self.client.json("PATCH", "/?s=/ops-x9/api/devices/presence-online-20/alias", {"alias": "boundary-label"}, {"X-CSRF-Token": csrf})
+
+        _, listing, _ = self.client.json("GET", "/?s=/ops-x9/api/devices?page=1&pageSize=200")
+        indexed = {row["id"]: row for row in listing["data"]}
+        self.assertEqual(indexed["presence-online-20"]["presence"], "online")
+        self.assertEqual(indexed["presence-recent-low"]["presence"], "recent")
+        self.assertEqual(indexed["presence-recent-90"]["presence"], "recent")
+        self.assertEqual(indexed["presence-offline"]["presence"], "offline")
+        self.assertEqual(set(listing["summary"]), {"total", "online", "recent", "offline", "unreported", "labelled"})
+        self.assertEqual(listing["summary"]["total"], listing["total"])
+        for presence in ("online", "recent", "offline", "unreported"):
+            _, filtered, _ = self.client.json("GET", f"/?s=/ops-x9/api/devices?presence={presence}&page=1&pageSize=200")
+            self.assertTrue(all(row["presence"] == presence for row in filtered["data"]))
+        _, labelled, _ = self.client.json("GET", "/?s=/ops-x9/api/devices?labelled=1&page=1&pageSize=200")
+        self.assertTrue(any(row["id"] == "presence-online-20" for row in labelled["data"]))
+        self.assertTrue(all(isinstance(row.get("alias"), str) and row["alias"] != "" for row in labelled["data"]))
+
+    def test_19_alias_requires_authentication_csrf_and_valid_input(self):
+        endpoint = "/?s=/ops-x9/api/devices/heartbeat-only/alias"
+        anonymous = HttpClient(self.url)
+        anonymous.json("PATCH", endpoint, {"alias": "blocked"}, expected=(401,))
+        self.client.json("POST", "/?s=/api/heartbeat", {
+            "id": "heartbeat-only", "uuid": "heartbeat-uuid", "ver": 7, "conns": [],
+        })
+        self.client.request("POST", "/?s=/api/sysinfo", {
+            "id": "heartbeat-only", "uuid": "heartbeat-uuid", "hostname": "heartbeat-host",
+            "username": "operator", "os": "linux", "version": "1.4.6",
+        }, expected=(200,))
+        csrf = self.admin_csrf()
+        self.client.json("PATCH", endpoint, {"alias": "blocked"}, expected=(403,))
+        self.client.json("PATCH", endpoint, {"alias": ["invalid"]}, {"X-CSRF-Token": csrf}, expected=(422,))
+        self.client.json("PATCH", endpoint, {"alias": "x" * 256}, {"X-CSRF-Token": csrf}, expected=(422,))
+        self.client.json("PATCH", endpoint, {"alias": "before-clear"}, {"X-CSRF-Token": csrf})
+
+        db = sqlite3.connect(self.db)
+        profile = db.execute("SELECT p.guid,p.payload FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=1 AND a.personal=1 AND p.id='heartbeat-only'").fetchone()
+        profile_payload = json.loads(profile[1])
+        profile_payload["future_field"] = {"preserve": True}
+        db.execute("UPDATE ab_profile_peers SET payload=? WHERE guid=? AND id='heartbeat-only'", (json.dumps(profile_payload, ensure_ascii=False), profile[0]))
+        book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=1").fetchone()[0])
+        book["future_top_level"] = {"preserve": True}
+        db.execute("UPDATE address_books SET payload=? WHERE uid=1", (json.dumps(book, ensure_ascii=False),))
+        db.commit()
+        db.close()
+
+        _, result, _ = self.client.json("PATCH", endpoint, {"alias": ""}, {"X-CSRF-Token": csrf})
+        self.assertEqual(result, {"ok": True, "alias": "", "sync": "next_address_book_pull"})
+        db = sqlite3.connect(self.db)
+        profile_payload = json.loads(db.execute("SELECT payload FROM ab_profile_peers WHERE guid=? AND id='heartbeat-only'", (profile[0],)).fetchone()[0])
+        legacy_alias = db.execute("SELECT alias FROM rustdesk_peers WHERE uid=1 AND id='heartbeat-only'").fetchone()[0]
+        book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=1").fetchone()[0])
+        db.close()
+        self.assertEqual(profile_payload["alias"], "")
+        self.assertEqual(profile_payload["future_field"], {"preserve": True})
+        self.assertEqual(legacy_alias, "")
+        self.assertEqual(book["future_top_level"], {"preserve": True})
+        self.assertEqual(next(p["alias"] for p in book["peers"] if p["id"] == "heartbeat-only"), "")
+
+        auth = self.rust_admin_login("admin-book-clear")
+        _, personal, _ = self.client.json("POST", "/?s=/api/ab/personal", {}, auth)
+        _, peers, _ = self.client.json("POST", f"/?s=/api/ab/peers&ab={personal['guid']}&current=1&pageSize=100", {}, auth)
+        self.assertEqual(next(p["alias"] for p in peers["data"] if p["id"] == "heartbeat-only"), "")
+
+    def test_20_admin_address_book_merges_scoped_stores_with_profile_priority(self):
+        csrf = self.admin_csrf()
+        admin_auth = self.rust_admin_login("admin-book-merge")
+        self.client.json("POST", "/?s=/api/ab/personal", {}, admin_auth)
+        db = sqlite3.connect(self.db)
+        admin_profile = db.execute("SELECT guid FROM ab_profiles WHERE uid=1 AND personal=1").fetchone()[0]
+        legacy_profile = db.execute("SELECT guid FROM ab_profiles WHERE uid=2 AND personal=1").fetchone()
+        if legacy_profile is None:
+            legacy_profile = str(uuid.uuid4())
+            db.execute(
+                "INSERT INTO ab_profiles(guid,uid,name,owner,note,rule,personal,created_at) VALUES (?,?,?,?,?,3,1,?)",
+                (legacy_profile, 2, "legacy personal", "legacy", "", int(time.time())),
+            )
+        else:
+            legacy_profile = legacy_profile[0]
+        db.execute(
+            "INSERT OR REPLACE INTO rustdesk_peers(uid,id,username,hostname,alias,platform,tags,hash) VALUES (1,'admin-legacy-only','u','legacy-host','legacy-only','linux','legacy-tag','h')"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO rustdesk_peers(uid,id,username,hostname,alias,platform,tags,hash) VALUES (1,'admin-merged','legacy-user','legacy-host','legacy-alias','linux','legacy-tag','legacy-hash')"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO ab_profile_peers(guid,id,payload,updated_at) VALUES (?,?,?,?)",
+            (admin_profile, "admin-profile-only", json.dumps({"id": "admin-profile-only", "alias": "profile-only", "tags": ["profile-tag"], "future": {"keep": 1}}), int(time.time())),
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO ab_profile_peers(guid,id,payload,updated_at) VALUES (?,?,?,?)",
+            (admin_profile, "admin-merged", json.dumps({"id": "admin-merged", "alias": "profile-wins", "hostname": "profile-host", "tags": ["profile-tag"], "future": {"keep": 2}}), int(time.time())),
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO ab_profile_peers(guid,id,payload,updated_at) VALUES (?,?,?,?)",
+            (legacy_profile, "other-user-only", json.dumps({"id": "other-user-only", "alias": "must-not-leak"}), int(time.time())),
+        )
+        db.commit()
+        db.close()
+
+        _, listing, _ = self.client.json("GET", "/?s=/ops-x9/api/address-book&page=1&pageSize=200")
+        indexed = {peer["id"]: peer for peer in listing["data"]}
+        self.assertIn("admin-legacy-only", indexed)
+        self.assertIn("admin-profile-only", indexed)
+        self.assertEqual(indexed["admin-merged"]["alias"], "profile-wins")
+        self.assertEqual(indexed["admin-merged"]["hostname"], "profile-host")
+        self.assertNotIn("other-user-only", indexed)
+        self.assertEqual(set(listing["summary"]), {"total", "favorites", "labelled", "tags"})
+        self.assertGreaterEqual(listing["summary"]["total"], 3)
+        self.assertEqual(listing["summary"]["favorites"], 0)
+        self.assertIn("profile-tag", {tag["name"] for tag in listing["tags"]})
+
+    def test_21_admin_address_book_peer_crud_syncs_three_stores_and_client_apis(self):
+        csrf = self.admin_csrf()
+        peer_id = "admin-book-crud"
+        payload = {
+            "id": peer_id,
+            "alias": "入口机器",
+            "hostname": "entry-host",
+            "username": "operator",
+            "platform": "linux",
+            "tags": ["ops", "ops-prod"],
+            "note": "future payload stays",
+            "future_field": {"preserve": True},
+        }
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers", payload, {"X-CSRF-Token": csrf}, expected=(201,))
+
+        db = sqlite3.connect(self.db)
+        profile_raw = db.execute(
+            "SELECT p.payload FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=1 AND a.personal=1 AND p.id=?",
+            (peer_id,),
+        ).fetchone()[0]
+        legacy_row = db.execute(
+            "SELECT alias,hostname,username,platform,tags FROM rustdesk_peers WHERE uid=1 AND id=?", (peer_id,)
+        ).fetchone()
+        exact_book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=1").fetchone()[0])
+        self.assertEqual(json.loads(profile_raw)["future_field"], {"preserve": True})
+        self.assertEqual(legacy_row, ("入口机器", "entry-host", "operator", "linux", "ops,ops-prod"))
+        self.assertEqual(next(p for p in exact_book["peers"] if p["id"] == peer_id)["note"], "future payload stays")
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM device_reports WHERE id=?", (peer_id,)).fetchone()[0], 0)
+        db.close()
+
+        self.client.json(
+            "PATCH", f"/?s=/ops-x9/api/address-book/peers/{peer_id}",
+            {"alias": "入口机器-更新", "hostname": "entry-host-2"}, {"X-CSRF-Token": csrf},
+        )
+        admin_auth = self.rust_admin_login("admin-book-readback")
+        _, legacy_book, _ = self.client.json("GET", "/?s=/api/ab", None, admin_auth)
+        legacy_peer = next(p for p in json.loads(legacy_book["data"])["peers"] if p["id"] == peer_id)
+        self.assertEqual((legacy_peer["alias"], legacy_peer["hostname"]), ("入口机器-更新", "entry-host-2"))
+        self.assertEqual(legacy_peer["future_field"], {"preserve": True})
+        _, personal, _ = self.client.json("POST", "/?s=/api/ab/personal", {}, admin_auth)
+        _, current_peers, _ = self.client.json(
+            "POST", f"/?s=/api/ab/peers&ab={personal['guid']}&current=1&pageSize=200", {}, admin_auth
+        )
+        current_peer = next(p for p in current_peers["data"] if p["id"] == peer_id)
+        self.assertEqual(current_peer["alias"], "入口机器-更新")
+        self.assertEqual(current_peer["future_field"], {"preserve": True})
+
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": peer_id, "uuid": "book-device-uuid", "ver": 10, "conns": []})
+        self.client.json("DELETE", f"/?s=/ops-x9/api/address-book/peers/{peer_id}", None, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        counts = db.execute(
+            "SELECT "
+            "(SELECT COUNT(*) FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=1 AND a.personal=1 AND p.id=?),"
+            "(SELECT COUNT(*) FROM rustdesk_peers WHERE uid=1 AND id=?),"
+            "(SELECT COUNT(*) FROM device_reports WHERE id=?)",
+            (peer_id, peer_id, peer_id),
+        ).fetchone()
+        deleted_book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=1").fetchone()[0])
+        db.close()
+        self.assertEqual(counts, (0, 0, 1))
+        self.assertFalse(any(p["id"] == peer_id for p in deleted_book["peers"]))
+
+    def test_22_admin_address_book_tags_rename_exact_values_in_all_stores(self):
+        csrf = self.admin_csrf()
+        peer_id = "admin-tag-peer"
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/tags", {"name": "ops", "color": 4283215696}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/tags", {"name": "ops-prod", "color": 4292030255}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.client.json(
+            "POST", "/?s=/ops-x9/api/address-book/peers",
+            {"id": peer_id, "alias": "tag-peer", "tags": ["ops", "ops-prod"], "note": "ops must remain in free text"},
+            {"X-CSRF-Token": csrf}, expected=(201,),
+        )
+        self.client.json(
+            "PATCH", "/?s=/ops-x9/api/address-book/tags/ops",
+            {"name": "core", "color": 4278255360}, {"X-CSRF-Token": csrf},
+        )
+
+        db = sqlite3.connect(self.db)
+        profile_payload = json.loads(db.execute(
+            "SELECT p.payload FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=1 AND a.personal=1 AND p.id=?",
+            (peer_id,),
+        ).fetchone()[0])
+        legacy_tags = db.execute("SELECT tags FROM rustdesk_peers WHERE uid=1 AND id=?", (peer_id,)).fetchone()[0]
+        exact_book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=1").fetchone()[0])
+        exact_peer = next(p for p in exact_book["peers"] if p["id"] == peer_id)
+        tag_rows = db.execute(
+            "SELECT name,color FROM ab_profile_tags WHERE guid=(SELECT guid FROM ab_profiles WHERE uid=1 AND personal=1) ORDER BY name"
+        ).fetchall()
+        db.close()
+        self.assertEqual(set(profile_payload["tags"]), {"core", "ops-prod"})
+        self.assertEqual(profile_payload["note"], "ops must remain in free text")
+        self.assertEqual(set(legacy_tags.split(",")), {"core", "ops-prod"})
+        self.assertEqual(set(exact_peer["tags"]), {"core", "ops-prod"})
+        self.assertIn(("core", 4278255360), tag_rows)
+        self.assertNotIn(("ops", 4283215696), tag_rows)
+
+        self.client.json("DELETE", "/?s=/ops-x9/api/address-book/tags/core", None, {"X-CSRF-Token": csrf})
+        _, listing, _ = self.client.json("GET", f"/?s=/ops-x9/api/address-book&q={peer_id}&page=1&pageSize=20")
+        peer = next(row for row in listing["data"] if row["id"] == peer_id)
+        self.assertEqual(peer["tags"], ["ops-prod"])
+        self.assertEqual({tag["name"] for tag in listing["tags"]} & {"core", "ops-prod"}, {"ops-prod"})
+
+    def test_23_admin_address_book_favorites_are_scoped_idempotent_and_deleted_with_peer(self):
+        csrf = self.admin_csrf()
+        peer_id = "admin-favorite-peer"
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers", {"id": peer_id, "alias": "favorite"}, {"X-CSRF-Token": csrf}, expected=(201,))
+        endpoint = f"/?s=/ops-x9/api/address-book/favorites/{peer_id}"
+        self.client.json("PATCH", endpoint, {"favorite": True}, {"X-CSRF-Token": csrf})
+        self.client.json("PATCH", endpoint, {"favorite": True}, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT OR IGNORE INTO admin_peer_favorites(uid,id,created_at) VALUES (2,?,?)", (peer_id, int(time.time())))
+        db.commit()
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM admin_peer_favorites WHERE uid=1 AND id=?", (peer_id,)).fetchone()[0], 1)
+        db.close()
+        _, listing, _ = self.client.json("GET", f"/?s=/ops-x9/api/address-book?q={peer_id}&page=1&pageSize=20")
+        self.assertTrue(next(row for row in listing["data"] if row["id"] == peer_id)["favorite"])
+        self.assertEqual(listing["summary"]["favorites"], 1)
+
+        self.client.json("PATCH", endpoint, {"favorite": False}, {"X-CSRF-Token": csrf})
+        self.client.json("PATCH", endpoint, {"favorite": False}, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM admin_peer_favorites WHERE uid=1 AND id=?", (peer_id,)).fetchone()[0], 0)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM admin_peer_favorites WHERE uid=2 AND id=?", (peer_id,)).fetchone()[0], 1)
+        db.close()
+
+        self.client.json("PATCH", endpoint, {"favorite": True}, {"X-CSRF-Token": csrf})
+        self.client.json("DELETE", f"/?s=/ops-x9/api/address-book/peers/{peer_id}", None, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM admin_peer_favorites WHERE uid=1 AND id=?", (peer_id,)).fetchone()[0], 0)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM admin_peer_favorites WHERE uid=2 AND id=?", (peer_id,)).fetchone()[0], 1)
+        db.close()
+
+    def test_24_admin_address_book_requires_session_csrf_and_valid_payloads(self):
+        anonymous = HttpClient(self.url)
+        anonymous.json("GET", "/?s=/ops-x9/api/address-book", expected=(401,))
+        csrf = self.admin_csrf()
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers", {"id": "blocked"}, expected=(403,))
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/tags", {"name": "blocked"}, expected=(403,))
+        self.client.json("PATCH", "/?s=/ops-x9/api/address-book/favorites/blocked", {"favorite": True}, expected=(403,))
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers", {"id": "", "alias": "bad"}, {"X-CSRF-Token": csrf}, expected=(422,))
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers", {"id": "x" * 129}, {"X-CSRF-Token": csrf}, expected=(422,))
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/tags", {"name": ""}, {"X-CSRF-Token": csrf}, expected=(422,))
+        self.client.json("PATCH", "/?s=/ops-x9/api/address-book/favorites/missing", {"favorite": "yes"}, {"X-CSRF-Token": csrf}, expected=(422,))
+        self.client.json("PATCH", "/?s=/ops-x9/api/address-book/favorites/missing", {"favorite": True}, {"X-CSRF-Token": csrf}, expected=(404,))
+
+    def test_25_admin_address_book_paginates_beyond_two_hundred_peers(self):
+        self.admin_csrf()
+        admin_auth = self.rust_admin_login("admin-book-pages")
+        self.client.json("POST", "/?s=/api/ab/personal", {}, admin_auth)
+        db = sqlite3.connect(self.db)
+        guid = db.execute("SELECT guid FROM ab_profiles WHERE uid=1 AND personal=1").fetchone()[0]
+        now = int(time.time())
+        for index in range(205):
+            peer_id = f"admin-page-{index:03d}"
+            payload = json.dumps({"id": peer_id, "alias": f"page-{index:03d}", "tags": []})
+            db.execute(
+                "INSERT OR REPLACE INTO ab_profile_peers(guid,id,payload,updated_at) VALUES (?,?,?,?)",
+                (guid, peer_id, payload, now + index),
+            )
+        db.commit()
+        db.close()
+        _, first, _ = self.client.json("GET", "/?s=/ops-x9/api/address-book?q=admin-page-&page=1&pageSize=200")
+        _, second, _ = self.client.json("GET", "/?s=/ops-x9/api/address-book?q=admin-page-&page=2&pageSize=200")
+        self.assertEqual(first["total"], 205)
+        self.assertEqual(len(first["data"]), 200)
+        self.assertEqual(len(second["data"]), 5)
+        self.assertEqual(len({row["id"] for row in first["data"] + second["data"]}), 205)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--frankenphp", help="Path to FrankenPHP runtime")
+    args, extra = parser.parse_known_args()
+    if args.frankenphp:
+        IntegrationTest.runtime = args.frankenphp
+    unittest.main(argv=[sys.argv[0], *extra])
+
+
+if __name__ == "__main__":
+    main()

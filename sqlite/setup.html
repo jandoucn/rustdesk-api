@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>初始化 RustDesk API</title>
+  <link rel="stylesheet" href="/setup/assets/setup.css">
+</head>
+<body>
+  <header class="setup-header">
+    <div class="brand"><span class="brand-mark">RD</span><span><strong>RustDesk API</strong><small>系统初始化</small></span></div>
+    <ol class="steps" aria-label="初始化进度">
+      <li class="active" data-step-indicator="1"><span>1</span>数据库</li>
+      <li data-step-indicator="2"><span>2</span>系统设置</li>
+      <li data-step-indicator="3"><span>3</span>确认</li>
+      <li data-step-indicator="4"><span>4</span>完成</li>
+    </ol>
+  </header>
+
+  <main class="setup-main">
+    <form id="setup-form" novalidate>
+      <section class="setup-step" data-step="1">
+        <div class="section-head"><p class="eyebrow">Storage</p><h1>选择数据库</h1><p>SQLite 适合单机部署；MySQL 适合独立数据库与长期扩展。</p></div>
+        <div class="choice-grid" role="radiogroup" aria-label="数据库类型">
+          <label class="choice"><input type="radio" name="database" value="sqlite" checked><span class="choice-body"><strong>SQLite</strong><small>无需额外数据库容器</small><span class="meta">推荐快速部署</span></span></label>
+          <label class="choice"><input type="radio" name="database" value="mysql"><span class="choice-body"><strong>MySQL 8.4</strong><small>托管创建或连接已有实例</small><span class="meta">适合生产环境</span></span></label>
+        </div>
+        <div id="mysql-options" class="mysql-options hidden">
+          <div class="segmented" role="radiogroup" aria-label="MySQL 部署方式">
+            <label><input type="radio" name="mysql_mode" value="managed" checked><span>自动创建</span></label>
+            <label><input type="radio" name="mysql_mode" value="existing"><span>已有 MySQL</span></label>
+          </div>
+          <p id="managed-note" class="notice">自动创建 MySQL 8.4 容器、私有数据卷和随机数据库密码。</p>
+          <div id="managed-fields" class="field-grid"><div class="field"><label for="project-name">项目名称</label><input id="project-name" name="project_name" value="rustdesk-api" maxlength="63"></div></div>
+          <div id="existing-fields" class="field-grid hidden">
+            <div class="field"><label for="mysql-host">主机</label><input id="mysql-host" name="mysql_host" value="mysql" maxlength="255"></div>
+            <div class="field"><label for="mysql-port">端口</label><input id="mysql-port" name="mysql_port" type="number" value="3306" min="1" max="65535"></div>
+            <div class="field"><label for="mysql-database">数据库</label><input id="mysql-database" name="mysql_database" value="rustdesk" maxlength="64"></div>
+            <div class="field"><label for="mysql-user">用户名</label><input id="mysql-user" name="mysql_user" value="rustdesk" maxlength="128"></div>
+            <div class="field full"><label for="mysql-password">数据库密码</label><input id="mysql-password" name="mysql_password" type="password" maxlength="256" autocomplete="new-password"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="setup-step hidden" data-step="2">
+        <div class="section-head"><p class="eyebrow">Console</p><h1>设置管理后台</h1><p>创建首个管理员并配置唯一的后台入口。</p></div>
+        <div class="field-grid">
+          <div class="field full"><label for="admin-path">后台路径</label><div class="path-input"><span>/</span><input id="admin-path" name="admin_path" value="yanolly" maxlength="255" autocomplete="off"></div></div>
+          <div class="field full"><label for="admin-username">管理员用户名</label><input id="admin-username" name="username" value="olly" maxlength="128" autocomplete="username"></div>
+          <div class="field"><label for="password">管理员密码</label><input id="password" name="password" type="password" maxlength="72" autocomplete="new-password"></div>
+          <div class="field"><label for="password-confirm">确认密码</label><input id="password-confirm" name="password_confirm" type="password" maxlength="72" autocomplete="new-password"></div>
+        </div>
+      </section>
+
+      <section class="setup-step hidden" data-step="3">
+        <div class="section-head"><p class="eyebrow">Review</p><h1>确认初始化配置</h1><p>提交后将创建数据库结构和首个管理员。</p></div>
+        <dl id="summary" class="summary"></dl>
+        <label class="confirm"><input id="confirm-install" type="checkbox"> <span>确认开始初始化</span></label>
+      </section>
+
+      <section class="setup-step hidden" data-step="4" aria-live="polite">
+        <div id="installing" class="result"><span class="spinner" aria-hidden="true"></span><p class="eyebrow">Provisioning</p><h1>正在初始化</h1><p>正在创建数据库、管理员与运行配置。</p></div>
+        <div id="complete" class="result hidden"><span class="result-icon">✓</span><p class="eyebrow">Ready</p><h1>初始化完成</h1><p>正在进入管理后台。</p><a id="console-link" class="button primary" href="#">进入管理后台</a></div>
+      </section>
+
+      <p id="form-error" class="form-error" role="alert"></p>
+      <div id="actions" class="actions"><button id="back" class="button" type="button">上一步</button><button id="next" class="button primary" type="button">下一步</button><button id="install" class="button primary hidden" type="submit">开始初始化</button></div>
+    </form>
+  </main>
+  <script src="/setup/assets/setup.js" defer></script>
+</body>
+</html>

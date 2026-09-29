@@ -1,9 +1,14 @@
 services:
   api:
-    image: v5star/rustdesk-api
-    restart: always
+    build: .
+    restart: unless-stopped
     container_name: rustdesk-api
     ports:
-      - 80:80
+      - "7000:80"
+    environment:
+      RUSTDESK_DB_DRIVER: sqlite
+      RUSTDESK_DB: /var/www/data/rustdesk.db
+      # 必须以 / 开头；示例：/ops-console-9f31
+      RUSTDESK_ADMIN_PATH: ${RUSTDESK_ADMIN_PATH:-/ops-console}
     volumes:
       - ./data:/var/www/data
