@@ -10,6 +10,7 @@ NETWORK_NAME="${RUSTDESK_NETWORK_NAME:-rustdesk-api-net}"
 DATA_VOLUME="${RUSTDESK_DATA_VOLUME:-rustdesk-api-data}"
 STATE_VOLUME="${RUSTDESK_PROVISIONER_STATE_VOLUME:-rustdesk-api-provisioner-state}"
 START_PORT="${RUSTDESK_PORT:-7000}"
+OFFLINE_MODE="${RUSTDESK_OFFLINE:-0}"
 
 log() { printf '\n\033[1;34m%s\033[0m\n' "$*"; }
 die() { printf '\n错误: %s\n' "$*" >&2; exit 1; }
@@ -43,25 +44,37 @@ elif command -v service >/dev/null 2>&1; then
 fi
 docker info >/dev/null 2>&1 || die "Docker daemon 未运行"
 
-GHCR_USERNAME="${GHCR_USERNAME:-}"
-GHCR_TOKEN="${GHCR_TOKEN:-}"
-if [[ -z "$GHCR_USERNAME" ]]; then
-  [[ -r /dev/tty ]] || die "缺少 GHCR_USERNAME"
-  read -r -p "GitHub 用户名: " GHCR_USERNAME </dev/tty
-fi
-if [[ -z "$GHCR_TOKEN" ]]; then
-  [[ -r /dev/tty ]] || die "缺少 GHCR_TOKEN"
-  read -r -s -p "GitHub classic PAT (read:packages): " GHCR_TOKEN </dev/tty
-  printf '\n' >/dev/tty
-fi
-[[ "$GHCR_USERNAME" =~ ^[A-Za-z0-9-]{1,39}$ ]] || die "GitHub 用户名格式错误"
-[[ -n "$GHCR_TOKEN" ]] || die "GitHub Token 不能为空"
+case "$OFFLINE_MODE" in
+  0)
+    GHCR_USERNAME="${GHCR_USERNAME:-}"
+    GHCR_TOKEN="${GHCR_TOKEN:-}"
+    if [[ -z "$GHCR_USERNAME" ]]; then
+      [[ -r /dev/tty ]] || die "缺少 GHCR_USERNAME"
+      read -r -p "GitHub 用户名: " GHCR_USERNAME </dev/tty
+    fi
+    if [[ -z "$GHCR_TOKEN" ]]; then
+      [[ -r /dev/tty ]] || die "缺少 GHCR_TOKEN"
+      read -r -s -p "GitHub classic PAT (read:packages): " GHCR_TOKEN </dev/tty
+      printf '\n' >/dev/tty
+    fi
+    [[ "$GHCR_USERNAME" =~ ^[A-Za-z0-9-]{1,39}$ ]] || die "GitHub 用户名格式错误"
+    [[ -n "$GHCR_TOKEN" ]] || die "GitHub Token 不能为空"
 
-log "登录私有 GHCR 并拉取镜像"
-printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin >/dev/null
-unset GHCR_TOKEN
-docker pull "$API_IMAGE"
-docker pull "$PROVISIONER_IMAGE"
+    log "登录私有 GHCR 并拉取镜像"
+    printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin >/dev/null
+    unset GHCR_TOKEN
+    docker pull "$API_IMAGE"
+    docker pull "$PROVISIONER_IMAGE"
+    ;;
+  1)
+    log "离线模式：检查已经导入的 GHCR 镜像"
+    docker image inspect "$API_IMAGE" >/dev/null 2>&1 || die "缺少离线镜像: $API_IMAGE"
+    docker image inspect "$PROVISIONER_IMAGE" >/dev/null 2>&1 || die "缺少离线镜像: $PROVISIONER_IMAGE"
+    ;;
+  *)
+    die "RUSTDESK_OFFLINE 只能是 0 或 1"
+    ;;
+esac
 
 port_in_use() {
   if command -v ss >/dev/null 2>&1; then

@@ -41,6 +41,54 @@ Managed MySQL defaults to the mainland accelerator image `docker.1ms.run/mysql:8
 The GitHub Actions workflow `.github/workflows/ghcr.yml` publishes both images. Keep the packages private and give deployment Tokens `read:packages`; organization SSO must also authorize the Token when enabled.
 Every build publishes a `commit-<short-sha>` image tag and OCI revision metadata in addition to `latest` on the default branch, so each image can be traced back to its source commit.
 
+### Mainland China offline image transfer
+
+When direct private-GHCR pulls are too slow, build a self-contained transfer bundle on a machine that can access GHCR. The exporter always logs in with a temporary Docker configuration and runs a fresh `docker pull --platform linux/amd64` for both `latest` images before saving them. It does not package an old local image silently.
+
+```sh
+./installer/export-offline-bundle.sh
+```
+
+The Token is read without echoing and is not placed in shell history. The output is approximately 112 MiB:
+
+```text
+dist/rustdesk-api-offline-linux-amd64-latest.tar
+dist/rustdesk-api-offline-linux-amd64-latest.tar.sha256
+```
+
+Upload both files from the machine where they were generated:
+
+```sh
+scp dist/rustdesk-api-offline-linux-amd64-latest.tar* \
+  root@47.100.7.221:/opt/1panel/apps/
+```
+
+Termark can transfer the same files without configuring a private key inside the source server:
+
+```sh
+termark upload <NTServer-SH-asset-id> \
+  dist/rustdesk-api-offline-linux-amd64-latest.tar \
+  /opt/1panel/apps/rustdesk-api-offline-linux-amd64-latest.tar
+termark upload <NTServer-SH-asset-id> \
+  dist/rustdesk-api-offline-linux-amd64-latest.tar.sha256 \
+  /opt/1panel/apps/rustdesk-api-offline-linux-amd64-latest.tar.sha256
+```
+
+Then load and deploy on the server:
+
+```sh
+cd /opt/1panel/apps
+sha256sum -c rustdesk-api-offline-linux-amd64-latest.tar.sha256
+mkdir -p rustdesk-api-offline
+tar -xf rustdesk-api-offline-linux-amd64-latest.tar -C rustdesk-api-offline
+sudo env RUSTDESK_PORT=7000 \
+  bash rustdesk-api-offline/install-offline-bundle.sh
+```
+
+The loader verifies the files, imports both images, and invokes the normal installer with `RUSTDESK_OFFLINE=1`. Database selection and administrator creation still happen in the browser. Managed MySQL continues to pull `docker.1ms.run/mysql:8.4`; SQLite needs no database image.
+
+Do not run `scp -r /opt/1panel/apps/rustdesk-data root@47.100.7.221:/opt/1panel/apps/` from `NTServer-SH` itself. That address resolves back to the same server, the source and destination are the same path, and the server has no private key for its own public SSH endpoint.
+
 ### Compose deployment
 
 The container always listens on port `80`; Compose publishes host port `7000`.

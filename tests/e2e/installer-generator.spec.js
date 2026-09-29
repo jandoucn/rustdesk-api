@@ -18,7 +18,7 @@ test('desktop generator includes private GHCR credentials and selected port', as
   expect(command).toContain("curl -fsSL 'https://ghfast.top/https://raw.githubusercontent.com/jandoucn/rustdesk-api/main/installer/install.sh'");
   expect(command).toContain("GHCR_USERNAME='jandoucn' GHCR_TOKEN='ghp_browser_test_token' RUSTDESK_PORT=8123 bash \"$f\"");
   expect(command).toContain('sha256sum -c -');
-  expect(command).toContain('519b2181c5088b3c732d1acc75859cef141153d2c027a6d6628e7dda4be31bae');
+  expect(command).toContain('b6edcc481e2aae81de10ea7d84598e7002ea4b09124498389498b6d623333996');
   await expect(page.locator('#history-warning')).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBeTruthy();
 });

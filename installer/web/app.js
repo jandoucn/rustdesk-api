@@ -6,7 +6,7 @@
   const error = document.getElementById('form-error');
   const warning = document.getElementById('history-warning');
   const scriptInput = form.elements.script_url;
-  const installerSha256 = '519b2181c5088b3c732d1acc75859cef141153d2c027a6d6628e7dda4be31bae';
+  const installerSha256 = 'b6edcc481e2aae81de10ea7d84598e7002ea4b09124498389498b6d623333996';
   scriptInput.value = 'https://ghfast.top/https://raw.githubusercontent.com/jandoucn/rustdesk-api/main/installer/install.sh';
 
   function shellQuote(value) {
