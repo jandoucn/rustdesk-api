@@ -2,6 +2,7 @@ name: 检查中文提交说明
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
