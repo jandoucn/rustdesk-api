@@ -55,7 +55,7 @@
           <p id="status" class="feedback" aria-live="polite">正在建立客户端状态视图...</p>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>客户端</th><th>备注</th><th>登录用户</th><th>平台 / 版本</th><th>状态</th><th>最近活动</th><th>操作</th></tr></thead>
+              <thead><tr><th>客户端</th><th>备注</th><th>版本 / 发行形态</th><th>网络</th><th>状态</th><th>最近活动</th><th>操作</th></tr></thead>
               <tbody id="rows"></tbody>
             </table>
           </div>
@@ -72,6 +72,9 @@
       <p id="alias-error" class="form-error" role="alert"></p>
       <div class="dialog-actions"><button id="alias-cancel" class="button" type="button">取消</button><button id="alias-save" class="button primary" type="submit" aria-label="保存备注">保存备注</button></div>
     </form>
+  </dialog>
+  <dialog id="details-dialog" aria-labelledby="details-title">
+    <div class="dialog-form"><div class="dialog-head"><h3 id="details-title">客户端详情</h3><p id="details-device"></p></div><div id="details-body" class="details-grid"></div><div class="dialog-actions"><button id="details-close" class="button" type="button">关闭</button></div></div>
   </dialog>
 
   <script>
@@ -137,47 +140,65 @@
       requestAnimationFrame(() => $('alias-input').focus());
     }
 
+    function detailValue(value) { return value === undefined || value === null || value === '' ? '未上报' : String(value); }
+    function platformLabel(value) { const key = String(value || '').toLowerCase(); return key.startsWith('windows') ? 'Windows' : key.startsWith('android') ? 'Android' : key.startsWith('ios') ? 'iOS' : key.startsWith('mac') ? 'macOS' : key.startsWith('linux') ? 'Linux' : detailValue(value); }
+    function distributionLabel(value) { const key = String(value || '').toLowerCase(); return ({ sos: 'SOS', portable: '便携版', installed: '安装版', msi: 'MSI', appimage: 'AppImage', mobile: '移动端' })[key] || (key ? value : '未声明'); }
+    function geoLabel(geo = {}) {
+      const country = String(geo.country || '').trim();
+      const countryCode = String(geo.country_code || '').trim().toUpperCase();
+      const domestic = countryCode === 'CN' || countryCode === 'CHN' || ['中国', '中华人民共和国', 'China', "People's Republic of China"].includes(country);
+      const parts = domestic ? [geo.region, geo.city] : [country, geo.region, geo.city];
+      return parts.map(value => String(value || '').trim()).filter((value, index, values) => value && values.indexOf(value) === index).join(' · ');
+    }
+    function deviceKey(device) { return JSON.stringify([String(device.id || ''), String(device.uuid || '')]); }
+    function openDetails(device) {
+      $('details-device').textContent = (device.alias || device.hostname || device.id) + ' · ' + device.id;
+      const groups = [
+        ['身份', [['设备 ID', device.id], ['UUID', device.uuid], ['主机名', device.hostname], ['系统用户', device.username]]],
+        ['系统', [['操作系统', device.os || device.platform], ['CPU', device.cpu], ['内存', device.memory]]],
+        ['版本', [['平台', platformLabel(device.platform)], ['客户端版本', device.version_text || device.version], ['心跳协议版本', device.heartbeat_version], ['发行形态', distributionLabel(device.distribution)], ['运行模式', distributionLabel(device.install_mode)], ['架构', device.client_arch], ['可执行文件', device.executable_name]]],
+        ['网络', [['公网 IP', device.public_ip], ['地区', geoLabel(device.geo)], ['时区', device.geo?.timezone], ['内网 IP', Array.isArray(device.private_ips) ? device.private_ips.join('、') : device.private_ips]]],
+        ['状态', [['当前状态', labels[presence(device)]], ['最后心跳', device.last_heartbeat ? new Date(Number(device.last_heartbeat) * 1000).toLocaleString() : '从未上报'], ['当前连接数', Array.isArray(device.heartbeat_payload?.conns) ? device.heartbeat_payload.conns.length : '未上报']]],
+      ];
+      const body = $('details-body'); body.replaceChildren();
+      groups.forEach(([title, entries]) => { const section = document.createElement('section'); section.className = 'details-section'; const heading = document.createElement('h4'); heading.textContent = title; section.append(heading); entries.forEach(([label, value]) => { const line = document.createElement('div'); line.className = 'details-line'; line.append(textLine('details-label', label), textLine('details-value', detailValue(value))); section.append(line); }); body.append(section); });
+      $('details-dialog').showModal();
+    }
+
+    function renderDevice(device, row) {
+      row.replaceChildren(); row.dataset.deviceId = device.id; row.dataset.deviceKey = deviceKey(device);
+      const primary = appendCell(row, '客户端', 'primary-cell'); primary.append(textLine('cell-title', device.hostname || device.id || '未知客户端')); primary.append(textLine('cell-subtitle mono', device.id));
+      if (device.uuid) primary.append(textLine('cell-subtitle mono', 'UUID ' + device.uuid));
+      const aliasCell = appendCell(row, '备注'); const alias = String(device.alias || '').trim(); aliasCell.append(textLine(alias ? 'cell-title' : 'alias-empty', alias || '未备注')); if (device.deployed) aliasCell.append(textLine('cell-subtitle', '已部署登记'));
+      const platformCell = appendCell(row, '版本 / 发行形态'); platformCell.append(textLine('cell-title', [platformLabel(device.platform), distributionLabel(device.distribution)].join(' · '))); platformCell.append(textLine('cell-subtitle', device.version || '版本未上报'));
+      const networkCell = appendCell(row, '网络'); networkCell.append(textLine('cell-title mono', device.public_ip || '公网 IP 未上报')); const location = geoLabel(device.geo); if (location) networkCell.append(textLine('cell-subtitle', location)); const privateIps = Array.isArray(device.private_ips) ? device.private_ips : []; if (privateIps.length) networkCell.append(textLine('cell-subtitle', privateIps.length + ' 个内网地址'));
+      const statusCell = appendCell(row, '状态'); const currentPresence = presence(device); const badge = document.createElement('span'); badge.className = 'status-badge ' + currentPresence; badge.append(textLine('status-dot ' + currentPresence, ''), document.createTextNode(labels[currentPresence])); statusCell.append(badge);
+      const activity = appendCell(row, '最近活动'); const timestamp = activityAt(device); activity.append(textLine('cell-title', relativeTime(timestamp))); if (timestamp) activity.append(textLine('cell-subtitle', new Date(timestamp * 1000).toLocaleString()));
+      const actionCell = appendCell(row, '操作', 'actions-cell'); const actions = document.createElement('div'); actions.className = 'row-actions'; const detailButton = document.createElement('button'); detailButton.className = 'button small'; detailButton.type = 'button'; detailButton.textContent = '详情'; detailButton.setAttribute('aria-label', '查看客户端详情'); detailButton.onclick = () => openDetails(device); const aliasButton = document.createElement('button'); aliasButton.className = 'button small'; aliasButton.type = 'button'; aliasButton.textContent = '编辑备注'; aliasButton.setAttribute('aria-label', '编辑备注'); aliasButton.onclick = () => openAlias(device); const removeButton = document.createElement('button'); removeButton.className = 'button small danger'; removeButton.type = 'button'; removeButton.textContent = '移除'; removeButton.setAttribute('aria-label', '移除'); removeButton.onclick = () => removeDevice(device); actions.append(detailButton, aliasButton, removeButton); actionCell.append(actions);
+      row.dataset.renderSignature = JSON.stringify(device);
+    }
+
     function render() {
+      const activeRow = document.activeElement?.closest?.('tr');
+      const activeKey = activeRow?.dataset.deviceKey || '';
+      const activeLabel = document.activeElement?.getAttribute?.('aria-label') || '';
+      const scrollX = window.scrollX; const scrollY = window.scrollY;
       updateStats();
       const devices = visibleDevices();
       const body = $('rows');
-      body.replaceChildren();
+      const existing = new Map(Array.from(body.children).map(row => [row.dataset.deviceKey, row]));
       $('empty').classList.toggle('hidden', devices.length > 0);
+      let cursor = body.firstElementChild;
       for (const device of devices) {
-        const row = document.createElement('tr');
-        row.dataset.deviceId = device.id;
-        const primary = appendCell(row, '客户端', 'primary-cell');
-        primary.append(textLine('cell-title', device.hostname || device.id || '未知客户端'));
-        if (device.hostname) primary.append(textLine('cell-subtitle', device.id));
-        if (device.uuid) primary.append(textLine('cell-subtitle', 'UUID ' + device.uuid));
-
-        const aliasCell = appendCell(row, '备注');
-        const alias = String(device.alias || '').trim();
-        aliasCell.append(textLine(alias ? 'cell-title' : 'alias-empty', alias || '未备注'));
-        if (device.deployed) aliasCell.append(textLine('cell-subtitle', '已部署登记'));
-
-        appendCell(row, '登录用户').textContent = device.username || '-';
-        const platformCell = appendCell(row, '平台 / 版本');
-        platformCell.append(textLine('cell-title', device.platform || '-'));
-        if (device.version) platformCell.append(textLine('cell-subtitle', device.version));
-
-        const statusCell = appendCell(row, '状态');
-        const currentPresence = presence(device);
-        const badge = document.createElement('span');
-        badge.className = 'status-badge ' + currentPresence;
-        badge.append(textLine('status-dot ' + currentPresence, ''), document.createTextNode(labels[currentPresence]));
-        statusCell.append(badge);
-
-        const activity = appendCell(row, '最近活动');
-        const timestamp = activityAt(device);
-        activity.append(textLine('cell-title', relativeTime(timestamp)));
-        if (timestamp) activity.append(textLine('cell-subtitle', new Date(timestamp * 1000).toLocaleString()));
-
-        const actionCell = appendCell(row, '操作', 'actions-cell');
-        const actions = document.createElement('div'); actions.className = 'row-actions';
-        const aliasButton = document.createElement('button'); aliasButton.className = 'button small'; aliasButton.type = 'button'; aliasButton.textContent = '编辑备注'; aliasButton.setAttribute('aria-label', '编辑备注'); aliasButton.onclick = () => openAlias(device);
-        const removeButton = document.createElement('button'); removeButton.className = 'button small danger'; removeButton.type = 'button'; removeButton.textContent = '移除'; removeButton.setAttribute('aria-label', '移除'); removeButton.onclick = () => removeDevice(device);
-        actions.append(aliasButton, removeButton); actionCell.append(actions); body.append(row);
+        const key = deviceKey(device); const row = existing.get(key) || document.createElement('tr'); existing.delete(key);
+        const signature = JSON.stringify(device); if (row.dataset.renderSignature !== signature) renderDevice(device, row);
+        if (row !== cursor) body.insertBefore(row, cursor); cursor = row.nextElementSibling;
+      }
+      existing.forEach(row => row.remove());
+      if (activeKey && activeLabel) {
+        const focusedRow = Array.from(body.children).find(row => row.dataset.deviceKey === activeKey);
+        const focusedControl = focusedRow && Array.from(focusedRow.querySelectorAll('[aria-label]')).find(control => control.getAttribute('aria-label') === activeLabel);
+        focusedControl?.focus({ preventScroll: true }); window.scrollTo(scrollX, scrollY);
       }
       const suffix = devices.length === state.devices.length ? '' : '，当前筛选显示 ' + devices.length + ' 台';
       setFeedback('共 ' + state.total + ' 台客户端' + suffix + '，状态更新于 ' + new Date(state.lastUpdated).toLocaleTimeString(), 'success');
@@ -218,7 +239,7 @@
     async function removeDevice(device) {
       if (!confirm('确认移除客户端“' + device.id + '”的登记和上报信息？')) return;
       try {
-        await api('__ADMIN_PATH__/api/devices/' + encodeURIComponent(device.id), { method: 'DELETE', body: '{}' });
+        await api('__ADMIN_PATH__/api/devices/' + encodeURIComponent(device.id) + '?uuid=' + encodeURIComponent(device.uuid), { method: 'DELETE', body: '{}' });
         await load();
       } catch (error) { setFeedback(error.message, 'error'); }
     }
@@ -238,6 +259,7 @@
     $('auto-refresh').addEventListener('change', () => { setFeedback($('auto-refresh').checked ? '自动刷新已开启，每 5 秒更新' : '自动刷新已暂停', 'success'); });
     document.addEventListener('visibilitychange', () => { if (!document.hidden && $('auto-refresh').checked) load({ quiet: true }); });
     $('alias-cancel').addEventListener('click', () => $('alias-dialog').close());
+    $('details-close').addEventListener('click', () => $('details-dialog').close());
     $('alias-form').addEventListener('submit', async event => {
       event.preventDefault();
       if (!state.aliasDevice) return;
@@ -245,8 +267,10 @@
       $('alias-error').textContent = '';
       try {
         const alias = $('alias-input').value.trim();
-        await api('__ADMIN_PATH__/api/devices/' + encodeURIComponent(state.aliasDevice.id) + '/alias', { method: 'PATCH', body: JSON.stringify({ alias }) });
-        state.aliasDevice.alias = alias;
+        await api('__ADMIN_PATH__/api/devices/' + encodeURIComponent(state.aliasDevice.id) + '/alias?uuid=' + encodeURIComponent(state.aliasDevice.uuid), { method: 'PATCH', body: JSON.stringify({ alias }) });
+        const current = state.devices.find(device => device.id === state.aliasDevice.id && device.uuid === state.aliasDevice.uuid);
+        if (current) current.alias = alias;
+        state.aliasDevice = current || state.aliasDevice;
         $('alias-dialog').close();
         render();
         setFeedback('备注已保存，客户端将在下次通讯录同步时收到更新', 'success');

@@ -30,6 +30,100 @@ function json_body(): array
     if (!$obj instanceof stdClass) fail(400, '请求必须为 JSON 对象');
     return json_decode($raw, true, 64, JSON_THROW_ON_ERROR | JSON_BIGINT_AS_STRING);
 }
+function json_object_text(mixed $value): string
+{
+    return json_encode(is_array($value) ? $value : [], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+}
+function report_runtime_payload(array $data): array
+{
+    $runtime = [];
+    $allowed = ['distribution' => ['desktop','mobile','sos','installed','portable','msi','appimage','linux_package','unknown'], 'install_mode' => ['installed','portable','live','unknown']];
+    foreach (['platform', 'distribution', 'install_mode', 'client_arch', 'executable_name'] as $key) {
+        if (array_key_exists($key, $data) && is_string($data[$key]) && strlen($data[$key]) <= 128) {
+            $value = strtolower(trim($data[$key]));
+            $runtime[$key] = isset($allowed[$key]) ? (in_array($value, $allowed[$key], true) ? $value : 'unknown') : $value;
+        }
+    }
+    return $runtime;
+}
+function report_network_payload(array $data): array
+{
+    $network = is_array($data['network'] ?? null) ? $data['network'] : [];
+    $private = $network['private_ips'] ?? ($data['private_ips'] ?? []);
+    if (!is_array($private)) $private = [];
+    $private = array_slice(array_values(array_unique(array_filter(array_map(static function ($ip) {
+        if (!is_string($ip) || !filter_var($ip, FILTER_VALIDATE_IP)) return null;
+        $normalized = strtolower($ip);
+        if ($normalized === '::1' || str_starts_with($normalized, '127.') || str_starts_with($normalized, '169.254.') || str_starts_with($normalized, 'fe80:')) return null;
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            $n = ip2long($ip); $ranges = [[ip2long('10.0.0.0'), ip2long('10.255.255.255')], [ip2long('172.16.0.0'), ip2long('172.31.255.255')], [ip2long('192.168.0.0'), ip2long('192.168.255.255')]];
+            foreach ($ranges as [$start, $end]) if ($n >= $start && $n <= $end) return $ip;
+            return null;
+        }
+        return str_starts_with($normalized, 'fc') || str_starts_with($normalized, 'fd') ? $ip : null;
+    }, $private)))), 0, 16);
+    return ['private_ips' => $private];
+}
+function request_public_ip(): string
+{
+    $remote = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+    $trusted = array_values(array_filter(array_map('trim', explode(',', (string)(getenv('RUSTDESK_TRUSTED_PROXY_IPS') ?: '')))));
+    if ($trusted && in_array($remote, $trusted, true)) {
+        $forwarded = (string)($_SERVER['HTTP_X_REAL_IP'] ?? '');
+        if (!$forwarded) $forwarded = trim(explode(',', (string)($_SERVER['HTTP_X_FORWARDED_FOR'] ?? ''))[0] ?? '');
+        if (filter_var($forwarded, FILTER_VALIDATE_IP)) return $forwarded;
+    }
+    return filter_var($remote, FILTER_VALIDATE_IP) ? $remote : '';
+}
+function public_ip_geo(string $ip): array
+{
+    $database = (string)(getenv('RUSTDESK_GEOIP_DATABASE') ?: '/var/www/data/GeoLite2-City.mmdb');
+    if ($ip === '' || !is_file($database) || !class_exists('MaxMind\\Db\\Reader')) return [];
+    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return [];
+    try {
+        $reader = new MaxMind\Db\Reader($database); $record = $reader->get($ip); $reader->close();
+        if (!is_array($record)) return [];
+        $name = static fn($node) => is_array($node) ? (string)($node['names']['zh-CN'] ?? $node['names']['en'] ?? '') : '';
+        $location = is_array($record['location'] ?? null) ? $record['location'] : [];
+        $subdivision = is_array($record['subdivisions'][0] ?? null) ? $record['subdivisions'][0] : [];
+        return array_filter([
+            'country_code'=>(string)($record['country']['iso_code'] ?? ''),'country'=>$name($record['country'] ?? []),
+            'region_code'=>(string)($subdivision['iso_code'] ?? ''),'region'=>$name($subdivision),'city'=>$name($record['city'] ?? []),
+            'timezone'=>(string)($location['time_zone'] ?? ''),'latitude'=>$location['latitude'] ?? null,'longitude'=>$location['longitude'] ?? null,
+        ], static fn($value) => $value !== '' && $value !== null);
+    } catch (Throwable $error) { error_log('GeoLite lookup failed: '.$error->getMessage()); return []; }
+}
+function merge_json_objects(array $existing, array $incoming): array
+{
+    foreach ($incoming as $key => $value) {
+        $existingObject = isset($existing[$key]) && is_array($existing[$key]) && !array_is_list($existing[$key]);
+        $incomingObject = is_array($value) && (!array_is_list($value) || ($value === [] && $existingObject));
+        if ($existingObject && $incomingObject) {
+            $existing[$key] = merge_json_objects($existing[$key], $value);
+        } else {
+            $existing[$key] = $value;
+        }
+    }
+    return $existing;
+}
+function refresh_public_network(array $network): array
+{
+    $network['public_ip'] = request_public_ip();
+    $geo = public_ip_geo($network['public_ip']);
+    if ($geo) $network['geo'] = $geo; else unset($network['geo']);
+    return $network;
+}
+function device_uuid(PDO $db, string $id, string $provided): string
+{
+    if ($provided !== '') {
+        $exists = db_one($db, 'SELECT uuid FROM device_reports WHERE id=:id AND uuid=:uuid', ['id'=>$id, 'uuid'=>$provided])
+            ?? db_one($db, 'SELECT uuid FROM device_deployments WHERE id=:id AND uuid=:uuid', ['id'=>$id, 'uuid'=>$provided]);
+        if (!$exists) fail(404, '设备不存在');
+        return $provided;
+    }
+    $rows=db_all($db,'SELECT uuid FROM device_reports WHERE id=:id UNION SELECT uuid FROM device_deployments WHERE id=:id',['id'=>$id]);
+    if(count($rows)===0)fail(404,'设备不存在');if(count($rows)>1)fail(409,'同一设备 ID 存在多个 UUID，请指定 UUID');return (string)$rows[0]['uuid'];
+}
 function text_field(array $data, string $key, int $max = 256, string $default = ''): string
 {
     $value = $data[$key] ?? $default;
@@ -79,10 +173,6 @@ function validated_admin_path(array $data): string
     if(!preg_match('#^/[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*$#',$value)||str_contains($value,'..')||in_array($value,['/admin','/api','/index.php','/setup'],true))fail(422,'后台路径格式错误或使用了保留路径');
     return $value;
 }
-function has_administrator(PDO $db): bool
-{
-    return (int)(db_one($db,'SELECT COUNT(*) AS n FROM rustdesk_users WHERE is_admin=1 AND enabled=1 AND delete_time=0')['n']??0)>0;
-}
 function setup_mysql_existing(array $data): array
 {
     $host=trim(text_field($data,'mysql_host',255,'mysql'));$port=$data['mysql_port']??3306;$database=trim(text_field($data,'mysql_database',64,'rustdesk'));$user=trim(text_field($data,'mysql_user',128,'rustdesk'));$password=text_field($data,'mysql_password',256);
@@ -110,14 +200,6 @@ function setup_provisioner_complete(string $project='rustdesk-api'): void
     $payload=json_encode(['project_name'=>$project],JSON_THROW_ON_ERROR);
     $context=stream_context_create(['http'=>['method'=>'POST','header'=>"Content-Type: application/json\r\nAuthorization: Bearer $secret\r\n",'content'=>$payload,'timeout'=>5,'ignore_errors'=>true]]);
     @file_get_contents($url.'/v1/complete',false,$context);
-}
-function create_initial_administrator(PDO $db,string $name,string $hash): void
-{
-    txn($db,function()use($db,$name,$hash){
-        if(has_administrator($db))fail(409,'系统已经完成初始化');
-        if(db_one($db,'SELECT id FROM rustdesk_users WHERE username=:name',['name'=>$name]))fail(409,'管理员用户名已经存在');
-        db_exec($db,'INSERT INTO rustdesk_users(username,password,create_time,delete_time,is_admin,enabled,auth_version) VALUES(:name,:password,:at,0,1,1,0)',['name'=>$name,'password'=>$hash,'at'=>time()]);
-    });
 }
 function render_page(string $file): never
 {
@@ -270,10 +352,10 @@ function decoded_payload(?string $raw): array
     catch (JsonException) { return []; }
     return is_array($value) ? $value : [];
 }
-function sync_admin_device_alias(PDO $db, array $actor, string $id, string $alias): void
+function sync_admin_device_alias(PDO $db, array $actor, string $id, string $uuid, string $alias): void
 {
-    $report = db_one($db, 'SELECT payload FROM device_reports WHERE id=:id ORDER BY last_seen DESC', ['id'=>$id]);
-    $deployment = db_one($db, 'SELECT payload FROM device_deployments WHERE id=:id', ['id'=>$id]);
+    $report = db_one($db, 'SELECT payload FROM device_reports WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
+    $deployment = db_one($db, 'SELECT payload FROM device_deployments WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
     if (!$report && !$deployment) fail(404, '设备不存在');
 
     $info = decoded_payload($report['payload'] ?? null);
@@ -606,7 +688,7 @@ try {
                 if(has_administrator($db))fail(409,'系统已经完成初始化');
                 if($driver==='sqlite'){$config+=['database'=>'sqlite','sqlite_path'=>database_path()];$target=$db;}
                 else{$mode=text_field($data,'mysql_mode',16,'managed');$mysql=$mode==='managed'?setup_mysql_managed($data):($mode==='existing'?setup_mysql_existing($data):fail(422,'MySQL 部署方式错误'));$config+=$mysql;$target=open_database(null,$config);}
-                create_initial_administrator($target,$name,$hash);write_installation_config($config);
+                create_initial_administrator($target,$name,$hash,static fn()=>write_installation_config($config));
                 $user=db_one($target,'SELECT * FROM rustdesk_users WHERE username=:name AND is_admin=1 AND enabled=1 AND delete_time=0',['name'=>$name]);
                 session_regenerate_id(true);$_SESSION=['uid'=>(int)$user['id'],'auth_version'=>(int)$user['auth_version'],'expires'=>time()+28800,'csrf'=>bin2hex(random_bytes(32))];
                 setup_provisioner_complete($driver==='mysql'&&($mode??'')==='managed'?text_field($data,'project_name',63,'rustdesk-api'):'rustdesk-api');
@@ -816,12 +898,13 @@ try {
         reply(['ok'=>true,'old'=>$old,'name'=>$new,'color'=>$color,'sync'=>'next_address_book_pull']);
     }
     if ($adminApi && preg_match('#^/admin/api/devices/([^/]+)/alias$#', $path, $match)) {
-        method('PATCH'); $actor = admin_user($db); csrf_check(); $id = rawurldecode($match[1]);
+        method('PATCH'); $actor = admin_user($db); csrf_check(); $id = rawurldecode($match[1]); $uuid=text_field($_GET,'uuid',256);
         if ($id === '' || strlen($id) > 128) fail(422, '设备 ID 格式错误');
+        $uuid=device_uuid($db,$id,$uuid);
         $d = json_body();
         if (!array_key_exists('alias', $d) || !is_string($d['alias']) || strlen($d['alias']) > 255) fail(422, 'alias 字段格式错误');
         if (preg_match('/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/', $d['alias'])) fail(422, 'alias 字段格式错误');
-        txn($db, function () use ($db, $actor, $id, $d) { sync_admin_device_alias($db, $actor, $id, $d['alias']); });
+        txn($db, function () use ($db, $actor, $id, $uuid, $d) { sync_admin_device_alias($db, $actor, $id, $uuid, $d['alias']); });
         reply(['ok'=>true, 'alias'=>$d['alias'], 'sync'=>'next_address_book_pull']);
     }
     if ($adminApi && preg_match('#^/admin/api/devices(?:/([^/]+))?$#', $path, $match)) {
@@ -843,15 +926,20 @@ try {
                 if(!array_key_exists($peer['id'],$aliases))$aliases[$peer['id']]=['value'=>$peer['alias']===null?'':(string)$peer['alias'],'owned'=>true];
             }
             $deployments=[];
-            foreach(db_all($db,'SELECT id,uuid,uid,payload,updated_at FROM device_deployments') as $deployment)$deployments[$deployment['id']]=$deployment;
+            foreach(db_all($db,'SELECT id,uuid,uid,payload,updated_at FROM device_deployments') as $deployment)$deployments[$deployment['id']."\0".$deployment['uuid']]=$deployment;
             $inventory=[]; $reportedIds=[]; $now=time();
-            foreach(db_all($db,'SELECT id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload FROM device_reports') as $reportRow){
-                $reportedIds[$reportRow['id']]=true; $deployment=$deployments[$reportRow['id']]??null;
+            foreach(db_all($db,'SELECT id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload,runtime_payload,network_payload FROM device_reports') as $reportRow){
+                $identity=$reportRow['id']."\0".$reportRow['uuid'];$reportedIds[$identity]=true; $deployment=$deployments[$identity]??null;
                 $report=decoded_payload($reportRow['payload']); $deploy=decoded_payload($deployment['payload']??null);
+                $runtime=decoded_payload($reportRow['runtime_payload']??null); $network=decoded_payload($reportRow['network_payload']??null);
                 $aliasEntry=$aliases[$reportRow['id']]??null; $lastHeartbeat=(int)$reportRow['last_heartbeat'];
                 $inventory[]=['id'=>$reportRow['id'],'uuid'=>$reportRow['uuid'],'owner_id'=>$deployment&&$deployment['uid']!==null?(int)$deployment['uid']:null,
                     'hostname'=>$report['hostname']??($deploy['device_name']??''),'username'=>$report['username']??($deploy['device_username']??''),
-                    'platform'=>$report['os']??($report['platform']??($deploy['platform']??'')),'version'=>$report['version']??'',
+                    'platform'=>$report['platform']??($report['os']??($deploy['platform']??'')),'os'=>$report['os']??'','cpu'=>$report['cpu']??'','memory'=>$report['memory']??'','version'=>$report['version']??'',
+                    'distribution'=>$runtime['distribution']??'','install_mode'=>$runtime['install_mode']??'','client_arch'=>$runtime['client_arch']??'','executable_name'=>$runtime['executable_name']??'',
+                    'public_ip'=>$network['public_ip']??'','private_ips'=>$network['private_ips']??[],'geo'=>$network['geo']??[],
+                    'version_text'=>$report['version']??'','heartbeat_version'=>decoded_payload($reportRow['heartbeat_payload']??null)['ver']??null,
+                    'heartbeat_payload'=>decoded_payload($reportRow['heartbeat_payload']??null),
                     'last_seen'=>(int)$reportRow['last_seen'],'last_heartbeat'=>$lastHeartbeat,
                     'updated_at'=>$deployment?(int)$deployment['updated_at']:(int)$reportRow['last_seen'],'presence'=>device_presence($lastHeartbeat,$now),
                     'deployed'=>$deployment!==null,'alias'=>$aliasEntry['value']??null,
@@ -859,10 +947,12 @@ try {
                     '_search'=>json_encode([$reportRow['id'],$reportRow['uuid'],$report,$deploy,$aliasEntry['value']??''],JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)];
             }
             foreach($deployments as $deployment){
-                if(isset($reportedIds[$deployment['id']]))continue; $deploy=decoded_payload($deployment['payload']); $aliasEntry=$aliases[$deployment['id']]??null;
+                $identity=$deployment['id']."\0".$deployment['uuid'];if(isset($reportedIds[$identity]))continue; $deploy=decoded_payload($deployment['payload']); $aliasEntry=$aliases[$deployment['id']]??null;
                 $inventory[]=['id'=>$deployment['id'],'uuid'=>$deployment['uuid'],'owner_id'=>$deployment['uid']===null?null:(int)$deployment['uid'],
                     'hostname'=>$deploy['device_name']??($deploy['hostname']??''),'username'=>$deploy['device_username']??($deploy['username']??''),
-                    'platform'=>$deploy['platform']??($deploy['os']??''),'version'=>$deploy['version']??'',
+                    'platform'=>$deploy['platform']??($deploy['os']??''),'os'=>$deploy['os']??'','cpu'=>$deploy['cpu']??'','memory'=>$deploy['memory']??'','version'=>$deploy['version']??'',
+                    'distribution'=>$deploy['distribution']??'','install_mode'=>$deploy['install_mode']??'','client_arch'=>$deploy['client_arch']??'','executable_name'=>$deploy['executable_name']??'',
+                    'public_ip'=>'','private_ips'=>[],'geo'=>[],'version_text'=>$deploy['version']??'','heartbeat_version'=>null,
                     'last_seen'=>null,'last_heartbeat'=>0,'updated_at'=>(int)$deployment['updated_at'],'presence'=>'unreported','deployed'=>true,
                     'alias'=>$aliasEntry['value']??null,'alias_owner_id'=>$aliasEntry?(int)$actor['id']:null,'alias_owner_name'=>$aliasEntry?$actor['username']:null,
                     '_search'=>json_encode([$deployment['id'],$deployment['uuid'],$deploy,$aliasEntry['value']??''],JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)];
@@ -872,12 +962,12 @@ try {
             foreach($inventory as $row){$summary[$row['presence']]++;if(is_string($row['alias'])&&$row['alias']!=='')$summary['labelled']++;}
             if($presenceFilter!==''&&$presenceFilter!=='all')$inventory=array_values(array_filter($inventory,fn($row)=>$row['presence']===$presenceFilter));
             if($labelledFilter)$inventory=array_values(array_filter($inventory,fn($row)=>is_string($row['alias'])&&$row['alias']!==''));
-            usort($inventory,fn($a,$b)=>max((int)$b['last_heartbeat'],(int)($b['last_seen']??0),(int)$b['updated_at'])<=>max((int)$a['last_heartbeat'],(int)($a['last_seen']??0),(int)$a['updated_at']) ?: strcmp($a['id'],$b['id']));
+            usort($inventory,fn($a,$b)=>((int)($b['alias']!==null&&$b['alias']!=='')<=>((int)($a['alias']!==null&&$a['alias']!==''))) ?: strcasecmp((string)($a['alias']??$a['hostname']??''),(string)($b['alias']??$b['hostname']??'')) ?: strcmp($a['id'].'|'.$a['uuid'],$b['id'].'|'.$b['uuid']));
             $total=count($inventory); $data=array_slice($inventory,$offset,$limit); foreach($data as &$row)unset($row['_search']); unset($row);
             reply(['total'=>$total,'summary'=>$summary,'data'=>$data]);
         }
-        method('DELETE'); csrf_check(); if($id==='') fail(404,'设备不存在');
-        txn($db,function()use($db,$id,$actor){db_exec($db,'DELETE FROM device_deployments WHERE id=:id',['id'=>$id]);db_exec($db,'DELETE FROM device_reports WHERE id=:id',['id'=>$id]);admin_event($db,(int)$actor['id'],'delete_device',0);}); reply(['ok'=>true]);
+        method('DELETE'); csrf_check(); if($id==='') fail(404,'设备不存在');$uuid=device_uuid($db,$id,text_field($_GET,'uuid',256));
+        txn($db,function()use($db,$id,$uuid,$actor){db_exec($db,'DELETE FROM device_deployments WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);db_exec($db,'DELETE FROM device_reports WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);admin_event($db,(int)$actor['id'],'delete_device',0);}); reply(['ok'=>true]);
     }
     if ($path === '/api/login') {
         method('POST'); $d = json_body(); $u = authenticate($db, $d, false);
@@ -968,12 +1058,12 @@ try {
     }
     if ($path === '/api/devices/deploy') {
         method('POST'); $u = api_user($db); $d = json_body(); $id=text_field($d,'id',128); $uuid=text_field($d,'uuid',256); $pk=text_field($d,'pk',1024); if ($id===''||$uuid===''||$pk==='') fail(422,'设备登记参数不完整');
-        db_upsert($db,'device_deployments',['id'=>$id,'uuid'=>$uuid,'pk'=>$pk,'uid'=>$u['id'],'payload'=>json_encode($d,JSON_THROW_ON_ERROR),'updated_at'=>time()],['id'],['uuid','pk','uid','payload','updated_at']); reply(['result'=>'OK']);
+        db_upsert($db,'device_deployments',['id'=>$id,'uuid'=>$uuid,'pk'=>$pk,'uid'=>$u['id'],'payload'=>json_encode($d,JSON_THROW_ON_ERROR),'updated_at'=>time()],['id','uuid'],['pk','uid','payload','updated_at']); reply(['result'=>'OK']);
     }
     if ($path === '/api/devices/cli') {
-        method('POST'); $u=api_user($db); $d=json_body(); $id=text_field($d,'id',128); if($id==='') fail(422,'设备 ID 不能为空');
-        $existing=db_one($db,'SELECT payload FROM device_deployments WHERE id=:id',['id'=>$id]); $payload=$existing?json_decode($existing['payload'],true,64,JSON_THROW_ON_ERROR):[]; foreach($d as $k=>$v)$payload[$k]=$v;
-        db_upsert($db,'device_deployments',['id'=>$id,'uuid'=>text_field($d,'uuid',256),'pk'=>text_field($payload,'pk',1024),'uid'=>$u['id'],'payload'=>json_encode($payload,JSON_THROW_ON_ERROR),'updated_at'=>time()],['id'],['uid','payload','updated_at']); action_ok();
+        method('POST'); $u=api_user($db); $d=json_body(); $id=text_field($d,'id',128);$uuid=text_field($d,'uuid',256); if($id===''||$uuid==='') fail(422,'设备 ID 或 UUID 不能为空');
+        $existing=db_one($db,'SELECT payload FROM device_deployments WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]); $payload=$existing?json_decode($existing['payload'],true,64,JSON_THROW_ON_ERROR):[]; foreach($d as $k=>$v)$payload[$k]=$v;
+        db_upsert($db,'device_deployments',['id'=>$id,'uuid'=>$uuid,'pk'=>text_field($payload,'pk',1024),'uid'=>$u['id'],'payload'=>json_encode($payload,JSON_THROW_ON_ERROR),'updated_at'=>time()],['id','uuid'],['pk','uid','payload','updated_at']); action_ok();
     }
     if ($path === '/api/audit') {
         method('PUT'); api_user($db); $d=json_body(); $guid=text_field($d,'guid',256); $note=text_field($d,'note',4096); if($guid==='') fail(422,'guid不能为空'); db_upsert($db,'audit_notes',['guid'=>$guid,'note'=>$note,'updated_at'=>time()],['guid'],['note','updated_at']); action_ok();
@@ -1001,18 +1091,26 @@ try {
         method('POST'); $d = json_body(); $id = text_field($d, 'id', 128); $uuid = text_field($d, 'uuid', 256);
         if ($id === '' || $uuid === '') fail(422, '缺少设备 ID 或 UUID');
         if ($path === '/api/sysinfo') {
+            $existing = db_one($db, 'SELECT payload,runtime_payload,network_payload FROM device_reports WHERE id=:id AND uuid=:uuid', ['id'=>$id, 'uuid'=>$uuid]);
+            $runtime = merge_json_objects(decoded_payload($existing['runtime_payload'] ?? null), report_runtime_payload($d));
+            $incomingNetwork = report_network_payload($d);
+            if (!array_key_exists('network', $d) && !array_key_exists('private_ips', $d)) unset($incomingNetwork['private_ips']);
+            $network = refresh_public_network(merge_json_objects(decoded_payload($existing['network_payload'] ?? null), $incomingNetwork));
             db_upsert($db,'device_reports',[
-                'id'=>$id,'uuid'=>$uuid,'payload'=>json_encode($d,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR),
+                'id'=>$id,'uuid'=>$uuid,'payload'=>json_encode(merge_json_objects(decoded_payload($existing['payload'] ?? null), $d),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR),
                 'last_seen'=>time(),'last_heartbeat'=>0,'heartbeat_payload'=>'{}',
-            ],['id','uuid'],['payload','last_seen']);
+                'runtime_payload'=>json_object_text($runtime),'network_payload'=>json_object_text($network),
+            ],['id','uuid'],['payload','last_seen','runtime_payload','network_payload']);
             header('Content-Type: text/plain; charset=utf-8'); echo 'SYSINFO_UPDATED'; exit;
         }
         $known = db_one($db, 'SELECT id FROM device_reports WHERE id=:id AND uuid=:uuid', ['id' => $id, 'uuid' => $uuid]);
         $now=time();
+        $existingNetwork = refresh_public_network(decoded_payload(db_one($db, 'SELECT network_payload FROM device_reports WHERE id=:id AND uuid=:uuid', ['id'=>$id, 'uuid'=>$uuid])['network_payload'] ?? null));
         db_upsert($db,'device_reports',[
             'id'=>$id,'uuid'=>$uuid,'payload'=>'{}','last_seen'=>$now,'last_heartbeat'=>$now,
             'heartbeat_payload'=>json_encode($d,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR),
-        ],['id','uuid'],['last_seen','last_heartbeat','heartbeat_payload']);
+            'runtime_payload'=>null,'network_payload'=>json_object_text($existingNetwork),
+        ],['id','uuid'],['last_seen','last_heartbeat','heartbeat_payload','network_payload']);
         reply($known ? new stdClass() : ['sysinfo' => true]);
     }
     if (in_array($path, ['/api/audit/conn', '/api/audit/file', '/api/audit/alarm'], true)) {
@@ -1028,6 +1126,8 @@ try {
     fail(404, '接口未实现');
 } catch (RequestError $error) {
     reply(['error' => $error->getMessage()], $error->status);
+} catch (InstallationConflict $error) {
+    reply(['error' => $error->getMessage()], 409);
 } catch (Throwable $error) {
     error_log('RustDesk API failure: ' . get_class($error) . ': ' . $error->getMessage());
     reply(['error' => '服务端处理失败，请检查数据库及服务器日志'], 500);

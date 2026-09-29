@@ -14,6 +14,8 @@ services:
       RUSTDESK_INSTALL_CONFIG: /var/www/data/install.json
       RUSTDESK_PROVISIONER_URL: http://rustdesk-api-provisioner:8080
       RUSTDESK_PROVISIONER_SECRET: ${RUSTDESK_PROVISIONER_SECRET:?set RUSTDESK_PROVISIONER_SECRET}
+      RUSTDESK_TRUSTED_PROXY_IPS: ${RUSTDESK_TRUSTED_PROXY_IPS:-}
+      RUSTDESK_GEOIP_DATABASE: ${RUSTDESK_GEOIP_DATABASE:-/var/www/data/GeoLite2-City.mmdb}
     volumes:
       - ./data:/var/www/data
     networks:

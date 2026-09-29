@@ -9,8 +9,11 @@ USER root
 # 安装nginx,修改配置文件
 RUN set -eux; \
     apk add --no-cache \
-    nginx; \
+    nginx libmaxminddb-libs libmaxminddb-dev $PHPIZE_DEPS; \
+    pecl install maxminddb; \
+    docker-php-ext-enable maxminddb; \
     docker-php-ext-install mysqli pdo_mysql; \
+    apk del libmaxminddb-dev $PHPIZE_DEPS; \
     sed  -i  '$a listen.owner = nginx' /usr/local/etc/php-fpm.d/zz-docker.conf; \
     sed  -i  '$a listen.group = nginx' /usr/local/etc/php-fpm.d/zz-docker.conf; \
     sed  -i  '$a clear_env = no' /usr/local/etc/php-fpm.d/zz-docker.conf; \

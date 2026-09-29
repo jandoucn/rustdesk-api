@@ -11,11 +11,13 @@ DATA_VOLUME="${RUSTDESK_DATA_VOLUME:-rustdesk-api-data}"
 STATE_VOLUME="${RUSTDESK_PROVISIONER_STATE_VOLUME:-rustdesk-api-provisioner-state}"
 START_PORT="${RUSTDESK_PORT:-7000}"
 OFFLINE_MODE="${RUSTDESK_OFFLINE:-0}"
+TRUSTED_PROXY_IPS="${RUSTDESK_TRUSTED_PROXY_IPS:-}"
+GEOIP_SOURCE="${RUSTDESK_GEOIP_SOURCE:-}"
 
 log() { printf '\n\033[1;34m%s\033[0m\n' "$*"; }
 die() { printf '\n错误: %s\n' "$*" >&2; exit 1; }
 
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+if [[ ${EUID:-$(id -u)} -ne 0 && "${RUSTDESK_INSTALLER_TEST_ALLOW_NON_ROOT:-0}" != "1" ]]; then
   die "请使用 curl ... | sudo bash 运行安装器"
 fi
 
@@ -100,7 +102,22 @@ docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 || docker network create 
 docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1 || docker volume create "$DATA_VOLUME" >/dev/null
 docker volume inspect "$STATE_VOLUME" >/dev/null 2>&1 || docker volume create "$STATE_VOLUME" >/dev/null
 
+geoip_args=()
+if [[ -n "$GEOIP_SOURCE" ]]; then
+  [[ -f "$GEOIP_SOURCE" ]] || die "GeoLite2 数据库不存在: $GEOIP_SOURCE"
+  GEOIP_SOURCE="$(cd "$(dirname "$GEOIP_SOURCE")" && pwd -P)/$(basename "$GEOIP_SOURCE")"
+  geoip_args=(-e "RUSTDESK_GEOIP_DATABASE=/var/www/geoip/GeoLite2-City.mmdb" -v "$GEOIP_SOURCE:/var/www/geoip/GeoLite2-City.mmdb:ro")
+fi
+
 if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+  current_proxy="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_NAME" | sed -n 's/^RUSTDESK_TRUSTED_PROXY_IPS=//p')"
+  current_geo_source="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/www/geoip/GeoLite2-City.mmdb"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME")"
+  if [[ -n "$TRUSTED_PROXY_IPS" && "$current_proxy" != "$TRUSTED_PROXY_IPS" ]]; then
+    die "现有容器的可信代理配置不同。数据卷会保留；请先执行 docker rm -f ${CONTAINER_NAME}，再使用相同安装命令重试"
+  fi
+  if [[ -n "$GEOIP_SOURCE" && "$current_geo_source" != "$GEOIP_SOURCE" ]]; then
+    die "现有容器的 GeoLite2 挂载不同。数据卷会保留；请先执行 docker rm -f ${CONTAINER_NAME}，再使用相同安装命令重试"
+  fi
   running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")"
   [[ "$running" == "true" ]] || docker start "$CONTAINER_NAME" >/dev/null
   log "检测到现有 RustDesk API 容器，保留数据并继续使用"
@@ -126,6 +143,8 @@ else
     -e "RUSTDESK_INSTALL_CONFIG=/var/www/data/install.json" \
     -e "RUSTDESK_PROVISIONER_URL=http://$PROVISIONER_NAME:8080" \
     -e "RUSTDESK_PROVISIONER_SECRET=$secret" \
+    -e "RUSTDESK_TRUSTED_PROXY_IPS=$TRUSTED_PROXY_IPS" \
+    "${geoip_args[@]}" \
     -v "$DATA_VOLUME:/var/www/data" \
     "$API_IMAGE" >/dev/null
 fi
@@ -138,3 +157,9 @@ log "部署已启动"
 printf '初始化地址: %s\n' "$setup_url"
 printf 'SQLite 不会创建数据库容器；网页选择“自动创建 MySQL”时才会创建 MySQL 8.4。\n'
 printf '完成网页初始化后，临时 provisioner 会自动删除。\n'
+if [[ -z "$TRUSTED_PROXY_IPS" ]]; then
+  printf '提示: 经反向代理部署时，请设置 RUSTDESK_TRUSTED_PROXY_IPS 为代理连接到容器时的源 IP。\n'
+fi
+if [[ -z "$GEOIP_SOURCE" ]]; then
+  printf '提示: 如需地区信息，请设置 RUSTDESK_GEOIP_SOURCE=/绝对路径/GeoLite2-City.mmdb 后重新创建容器。\n'
+fi

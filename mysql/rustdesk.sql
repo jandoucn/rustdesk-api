@@ -1,8 +1,6 @@
 -- The MySQL 8.4 schema is created and migrated by sqlite/lib.php at startup.
 -- This file intentionally contains no default administrator or hard-coded password.
--- Start with docker-compose.mysql.yaml, then create the first administrator:
---   docker compose -f docker-compose.mysql.yaml exec -T api \
---     php /var/www/html/manage.php --init-admin=admin --password-stdin
+-- Start the API and complete database and administrator initialization at /setup.
 --
 -- The runtime creates all 18 InnoDB/utf8mb4_unicode_ci tables and adds
 -- compatibility columns to legacy rustdesk_users and rustdesk_token tables.
