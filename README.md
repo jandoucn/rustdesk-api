@@ -4,28 +4,28 @@ PHP 8.3 API and Web management service compatible with the current RustDesk clie
 
 ## Container deployment
 
-### Browser-guided installation from private GHCR
+### Browser-guided installation from private Aliyun ACR
 
-Host the files in `installer/web/` and `installer/install.sh` on any public HTTPS site. The static deployment page asks for the GitHub username, a classic PAT with `read:packages`, the external port (default `7000`) and the `install.sh` URL. It builds the Linux command entirely in the browser; credentials are not submitted to the hosting site.
+Host the files in `installer/web/` and `installer/install.sh` on any public HTTPS site. The static deployment page asks for the Aliyun ACR username, fixed registry password, external port (default `7000`) and the `install.sh` URL. It builds the Linux command entirely in the browser; credentials are not submitted to the hosting site.
 
-For mainland China, the generator defaults to the verified `ghfast.top` prefix for the public installation script. The generated command downloads the script to a temporary file and checks its SHA-256 before running it as root. `ghfast.top` is not a Docker Registry V2 endpoint, so private GHCR images still use authenticated `ghcr.io` pulls.
+The generator defaults to `https://shell.olii.cc/install.sh`. The generated command downloads the script to a temporary file and checks its SHA-256 before running it as root. Container images are pulled from the private Aliyun ACR Hong Kong registry.
 
 The generated command has this shape:
 
 ```sh
 f=$(mktemp) && curl -fsSL \
-  'https://ghfast.top/https://raw.githubusercontent.com/jandoucn/rustdesk-api/main/installer/install.sh' \
+  'https://shell.olii.cc/install.sh' \
   -o "$f" && echo '<sha256>  '$f | sha256sum -c - && \
-  sudo env GHCR_USERNAME='github-user' GHCR_TOKEN='classic-pat' RUSTDESK_PORT=7000 bash "$f"
+  sudo env REGISTRY_USERNAME='yanolly' REGISTRY_PASSWORD='acr-password' RUSTDESK_PORT=7000 bash "$f"
 ```
 
-For better shell-history hygiene, the page can generate a command without the Token. The installer then reads it without echoing through `/dev/tty`.
+For better shell-history hygiene, the page can generate a command without the password. The installer then reads it without echoing through `/dev/tty`.
 
 The script pulls these private images by default:
 
 ```text
-ghcr.io/jandoucn/rustdesk-api:latest
-ghcr.io/jandoucn/rustdesk-api-provisioner:latest
+crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:latest
+crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:provisioner-latest
 ```
 
 It creates the API network and persistent data volume, starts the API, and prints `http://SERVER_IP:PORT/setup`. The setup wizard then configures the management path and initial administrator:
@@ -38,12 +38,12 @@ The production API never mounts the Docker socket. Only the temporary provisione
 
 Managed MySQL defaults to the mainland accelerator image `docker.1ms.run/mysql:8.4`. Override it at install time with `MYSQL_IMAGE=<registry>/<namespace>/mysql:8.4` when needed.
 
-The GitHub Actions workflow `.github/workflows/ghcr.yml` publishes both images. Keep the packages private and give deployment Tokens `read:packages`; organization SSO must also authorize the Token when enabled.
-Every build publishes a `commit-<short-sha>` image tag and OCI revision metadata in addition to `latest` on the default branch, so each image can be traced back to its source commit.
+The GitHub Actions workflow `.github/workflows/acr.yml` publishes both images into one private ACR repository. Configure `ALIYUN_REGISTRY_USERNAME` and `ALIYUN_REGISTRY_PASSWORD` as repository Actions secrets.
+Every build publishes `latest`, `provisioner-latest`, `commit-<short-sha>` and `provisioner-commit-<short-sha>` tags with OCI revision metadata, so each image can be traced back to its source commit.
 
 ### Mainland China offline image transfer
 
-When direct private-GHCR pulls are too slow, build a self-contained transfer bundle on a machine that can access GHCR. The exporter always logs in with a temporary Docker configuration and runs a fresh `docker pull --platform linux/amd64` for both `latest` images before saving them. It does not package an old local image silently.
+When direct private-ACR pulls are unavailable, build a self-contained transfer bundle on a machine that can access ACR. The exporter always logs in with a temporary Docker configuration and runs a fresh `docker pull --platform linux/amd64` for both current images before saving them. It does not package an old local image silently.
 
 ```sh
 ./installer/export-offline-bundle.sh

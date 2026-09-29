@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-API_IMAGE="${RUSTDESK_API_IMAGE:-ghcr.io/jandoucn/rustdesk-api:latest}"
-PROVISIONER_IMAGE="${RUSTDESK_PROVISIONER_IMAGE:-ghcr.io/jandoucn/rustdesk-api-provisioner:latest}"
+API_IMAGE="${RUSTDESK_API_IMAGE:-crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:latest}"
+PROVISIONER_IMAGE="${RUSTDESK_PROVISIONER_IMAGE:-crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:provisioner-latest}"
 MYSQL_IMAGE="${MYSQL_IMAGE:-docker.1ms.run/mysql:8.4}"
 CONTAINER_NAME="${RUSTDESK_CONTAINER_NAME:-rustdesk-api}"
 PROVISIONER_NAME="${RUSTDESK_PROVISIONER_NAME:-rustdesk-api-provisioner}"
@@ -46,28 +46,29 @@ docker info >/dev/null 2>&1 || die "Docker daemon 未运行"
 
 case "$OFFLINE_MODE" in
   0)
-    GHCR_USERNAME="${GHCR_USERNAME:-}"
-    GHCR_TOKEN="${GHCR_TOKEN:-}"
-    if [[ -z "$GHCR_USERNAME" ]]; then
-      [[ -r /dev/tty ]] || die "缺少 GHCR_USERNAME"
-      read -r -p "GitHub 用户名: " GHCR_USERNAME </dev/tty
+    REGISTRY_USERNAME="${REGISTRY_USERNAME:-}"
+    REGISTRY_PASSWORD="${REGISTRY_PASSWORD:-}"
+    REGISTRY_HOST="${API_IMAGE%%/*}"
+    if [[ -z "$REGISTRY_USERNAME" ]]; then
+      [[ -r /dev/tty ]] || die "缺少 REGISTRY_USERNAME"
+      read -r -p "ACR 用户名: " REGISTRY_USERNAME </dev/tty
     fi
-    if [[ -z "$GHCR_TOKEN" ]]; then
-      [[ -r /dev/tty ]] || die "缺少 GHCR_TOKEN"
-      read -r -s -p "GitHub classic PAT (read:packages): " GHCR_TOKEN </dev/tty
+    if [[ -z "$REGISTRY_PASSWORD" ]]; then
+      [[ -r /dev/tty ]] || die "缺少 REGISTRY_PASSWORD"
+      read -r -s -p "ACR 固定密码: " REGISTRY_PASSWORD </dev/tty
       printf '\n' >/dev/tty
     fi
-    [[ "$GHCR_USERNAME" =~ ^[A-Za-z0-9-]{1,39}$ ]] || die "GitHub 用户名格式错误"
-    [[ -n "$GHCR_TOKEN" ]] || die "GitHub Token 不能为空"
+    [[ -n "$REGISTRY_USERNAME" ]] || die "ACR 用户名不能为空"
+    [[ -n "$REGISTRY_PASSWORD" ]] || die "ACR 固定密码不能为空"
 
-    log "登录私有 GHCR 并拉取镜像"
-    printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin >/dev/null
-    unset GHCR_TOKEN
+    log "登录阿里云私有 ACR 并拉取镜像"
+    printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" --username "$REGISTRY_USERNAME" --password-stdin >/dev/null
+    unset REGISTRY_PASSWORD
     docker pull "$API_IMAGE"
     docker pull "$PROVISIONER_IMAGE"
     ;;
   1)
-    log "离线模式：检查已经导入的 GHCR 镜像"
+    log "离线模式：检查已经导入的 ACR 镜像"
     docker image inspect "$API_IMAGE" >/dev/null 2>&1 || die "缺少离线镜像: $API_IMAGE"
     docker image inspect "$PROVISIONER_IMAGE" >/dev/null 2>&1 || die "缺少离线镜像: $PROVISIONER_IMAGE"
     ;;

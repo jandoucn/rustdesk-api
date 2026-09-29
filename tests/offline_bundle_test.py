@@ -26,7 +26,7 @@ case " $* " in
   *" login "*) cat >/dev/null ;;
   *" save "*) printf 'fake-docker-image-archive' ;;
   *" image inspect "*)
-    printf 'image=ghcr.io/jandoucn/test:latest id=sha256:test os=linux architecture=amd64 digests=ghcr.io/jandoucn/test@sha256:test\\n'
+    printf 'image=acr.example/test:latest id=sha256:test os=linux architecture=amd64 digests=acr.example/test@sha256:test\\n'
     ;;
 esac
 """,
@@ -40,7 +40,7 @@ esac
                 {
                     "PATH": f"{bin_dir}:{env['PATH']}",
                     "DOCKER_TEST_LOG": str(docker_log),
-                    "GHCR_TOKEN": "test-token",
+                    "REGISTRY_PASSWORD": "test-password",
                 }
             )
             subprocess.run(
@@ -54,11 +54,11 @@ esac
 
             commands = docker_log.read_text(encoding="utf-8")
             self.assertIn(
-                "pull --platform linux/amd64 ghcr.io/jandoucn/rustdesk-api:latest",
+                "pull --platform linux/amd64 crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:latest",
                 commands,
             )
             self.assertIn(
-                "pull --platform linux/amd64 ghcr.io/jandoucn/rustdesk-api-provisioner:latest",
+                "pull --platform linux/amd64 crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:provisioner-latest",
                 commands,
             )
 

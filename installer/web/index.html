@@ -13,23 +13,23 @@
   </header>
   <main>
     <section class="intro">
-      <p class="eyebrow">Private GHCR deployment</p>
+      <p class="eyebrow">Aliyun ACR deployment</p>
       <h1>生成服务器安装命令</h1>
       <p>凭据只在当前浏览器中处理，不会提交到本站。运行命令后，浏览器继续完成数据库和管理员初始化。</p>
     </section>
     <form id="command-form" novalidate>
       <div class="field-row">
-        <label>GitHub 用户名<input name="username" autocomplete="username" required maxlength="39" placeholder="jandoucn"></label>
-        <label>Classic PAT<input name="token" type="password" autocomplete="off" required placeholder="需要 read:packages"></label>
+        <label>ACR 用户名<input name="username" autocomplete="username" required maxlength="128" value="yanolly"></label>
+        <label>ACR 固定密码<input name="token" type="password" autocomplete="off" required placeholder="访问凭证中设置的密码"></label>
       </div>
       <div class="field-row secondary-fields">
-        <label>install.sh 地址（默认 GitHub 加速）<input name="script_url" type="url" required></label>
+        <label>install.sh 地址<input name="script_url" type="url" required></label>
         <label>外部端口<input name="port" type="number" value="7000" min="1" max="65535" inputmode="numeric" required></label>
       </div>
       <fieldset>
         <legend>凭据传递方式</legend>
-        <label class="option"><input type="radio" name="mode" value="embedded" checked><span><strong>一条命令，无交互</strong><small>Token 会出现在生成命令和服务器 shell history 中</small></span></label>
-        <label class="option"><input type="radio" name="mode" value="prompt"><span><strong>服务器隐藏输入 Token</strong><small>命令只包含用户名，执行时再粘贴 Token</small></span></label>
+        <label class="option"><input type="radio" name="mode" value="embedded" checked><span><strong>一条命令，无交互</strong><small>密码会出现在生成命令和服务器 shell history 中</small></span></label>
+        <label class="option"><input type="radio" name="mode" value="prompt"><span><strong>服务器隐藏输入密码</strong><small>命令只包含用户名，执行时再粘贴密码</small></span></label>
       </fieldset>
       <button type="submit">生成命令</button>
       <p id="form-error" class="error" role="alert"></p>
@@ -39,7 +39,7 @@
       <pre><code id="command"></code></pre>
       <p id="history-warning" class="warning">执行成功后建议从 shell history 删除这一条命令。</p>
       <ol>
-        <li>脚本经 ghfast.top 下载并校验 SHA-256，然后登录私有 GHCR。</li>
+        <li>脚本从 shell.olii.cc 下载并校验 SHA-256，然后登录阿里云私有 ACR。</li>
         <li>打开命令输出的 <code>/setup</code> 地址。</li>
         <li>选择 SQLite、自动创建 MySQL 8.4，或连接已有 MySQL。</li>
       </ol>

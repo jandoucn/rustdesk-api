@@ -6,8 +6,8 @@
   const error = document.getElementById('form-error');
   const warning = document.getElementById('history-warning');
   const scriptInput = form.elements.script_url;
-  const installerSha256 = 'b6edcc481e2aae81de10ea7d84598e7002ea4b09124498389498b6d623333996';
-  scriptInput.value = 'https://ghfast.top/https://raw.githubusercontent.com/jandoucn/rustdesk-api/main/installer/install.sh';
+  const installerSha256 = '686995bf512fb2fdd28e68ad9431627541957f80566c39635102fee529f70e82';
+  scriptInput.value = 'https://shell.olii.cc/install.sh';
 
   function shellQuote(value) {
     return `'${String(value).replaceAll("'", `'"'"'`)}'`;
@@ -21,15 +21,15 @@
     const scriptUrl = scriptInput.value.trim();
     const port = Number(form.elements.port.value);
     const mode = form.elements.mode.value;
-    if (!/^[A-Za-z0-9-]{1,39}$/.test(username)) return void (error.textContent = 'GitHub 用户名格式错误');
-    if (!token) return void (error.textContent = '请输入 classic PAT');
+    if (!/^\S{1,128}$/.test(username)) return void (error.textContent = 'ACR 用户名格式错误');
+    if (!token) return void (error.textContent = '请输入 ACR 固定密码');
     try { const url = new URL(scriptUrl); if (url.protocol !== 'https:') throw Error(); } catch (_) { return void (error.textContent = 'install.sh 必须使用有效的 HTTPS 地址'); }
     if (!Number.isInteger(port) || port < 1 || port > 65535) return void (error.textContent = '外部端口必须是 1-65535 的整数');
 
     const download = `f=$(mktemp) && curl -fsSL ${shellQuote(scriptUrl)} -o "$f" && echo ${shellQuote(`${installerSha256}  $f`)} | sha256sum -c -`;
     const execute = mode === 'embedded'
-      ? `sudo env GHCR_USERNAME=${shellQuote(username)} GHCR_TOKEN=${shellQuote(token)} RUSTDESK_PORT=${port} bash "$f"`
-      : `sudo env GHCR_USERNAME=${shellQuote(username)} RUSTDESK_PORT=${port} bash "$f"`;
+      ? `sudo env REGISTRY_USERNAME=${shellQuote(username)} REGISTRY_PASSWORD=${shellQuote(token)} RUSTDESK_PORT=${port} bash "$f"`
+      : `sudo env REGISTRY_USERNAME=${shellQuote(username)} RUSTDESK_PORT=${port} bash "$f"`;
     command.textContent = `${download} && ${execute}; rc=$?; unlink "$f"; exit $rc`;
     warning.hidden = mode !== 'embedded';
     result.hidden = false;
