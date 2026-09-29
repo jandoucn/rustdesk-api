@@ -6,7 +6,7 @@ async function fillGenerator(page) {
   await page.goto(installerUrl);
   await page.getByLabel('ACR 用户名').fill('yanolly');
   await page.getByLabel('ACR 固定密码').fill('acr_browser_test_password');
-  await page.getByLabel('install.sh 地址').fill('https://shell.olii.cc/install.sh');
+  await page.getByLabel('install.sh 地址').fill('https://shell.olii.cc/rustdesk-install.sh');
   await page.getByLabel('外部端口').fill('8123');
 }
 
@@ -15,7 +15,7 @@ test('desktop generator includes private ACR credentials and selected port', asy
   await fillGenerator(page);
   await page.getByRole('button', { name: '生成命令' }).click();
   const command = await page.locator('#command').textContent();
-  expect(command).toContain("curl -fsSL 'https://shell.olii.cc/install.sh'");
+  expect(command).toContain("curl -fsSL 'https://shell.olii.cc/rustdesk-install.sh'");
   expect(command).toContain("REGISTRY_USERNAME='yanolly' REGISTRY_PASSWORD='acr_browser_test_password' RUSTDESK_PORT=8123 bash \"$f\"");
   expect(command).toContain('sha256sum -c -');
   expect(command).toContain('c0ebd62ca5025dff90f1cf86f3a50c03b1678306d1232d53367be585421d64a2');
