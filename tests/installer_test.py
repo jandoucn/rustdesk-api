@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstallerTest(unittest.TestCase):
-    def run_installer(self, existing: bool, proxy: str, geo_source: Path):
+    def run_installer(self, existing: bool, proxy: str | None, geo_source: Path):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
             bin_dir = temp_path / "bin"
@@ -22,7 +22,8 @@ set -eu
 printf '%s\n' "$*" >> "$DOCKER_TEST_LOG"
 case "${1:-} ${2:-}" in
   "login ") cat >/dev/null; exit 0 ;;
-  "info "|"pull "|"network inspect"|"volume inspect"|"start ") exit 0 ;;
+  "info "|"pull "|"volume inspect"|"start ") exit 0 ;;
+  "network inspect") [[ "$*" == *"--format"* ]] && printf '172.31.0.1\n'; exit 0 ;;
   "inspect -f")
     case "$3" in
       *NetworkSettings.Ports*) [[ "$INSTALLER_EXISTING" == 1 ]] && printf '17991\n' || exit 1 ;;
@@ -50,10 +51,11 @@ exit 0
                     "REGISTRY_USERNAME": "tester",
                     "REGISTRY_PASSWORD": "secret",
                     "RUSTDESK_PORT": "17991",
-                    "RUSTDESK_TRUSTED_PROXY_IPS": proxy,
                     "RUSTDESK_GEOIP_SOURCE": str(geo_source),
                 }
             )
+            if proxy is not None:
+                env["RUSTDESK_TRUSTED_PROXY_IPS"] = proxy
             result = subprocess.run(
                 ["bash", str(ROOT / "installer/install.sh")],
                 cwd=ROOT,
@@ -75,6 +77,22 @@ exit 0
         self.assertIn("RUSTDESK_TRUSTED_PROXY_IPS=172.17.0.1", commands)
         self.assertIn(f"{geo}:/var/www/geoip/GeoLite2-City.mmdb:ro", commands)
 
+    def test_fresh_install_defaults_to_docker_bridge_proxy_range(self):
+        with tempfile.TemporaryDirectory() as temp:
+            geo = Path(temp) / "GeoLite2-City.mmdb"
+            geo.write_bytes(b"test-mmdb")
+            result, commands = self.run_installer(False, None, geo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RUSTDESK_TRUSTED_PROXY_IPS=172.31.0.1", commands)
+
+    def test_fresh_install_explicit_empty_proxy_disables_forwarded_headers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            geo = Path(temp) / "GeoLite2-City.mmdb"
+            geo.write_bytes(b"test-mmdb")
+            result, commands = self.run_installer(False, "", geo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RUSTDESK_TRUSTED_PROXY_IPS= -e RUSTDESK_GEOIP_DATABASE", commands)
+
     def test_existing_container_rejects_silently_ignored_configuration(self):
         with tempfile.TemporaryDirectory() as temp:
             geo = Path(temp) / "GeoLite2-City.mmdb"
@@ -82,6 +100,24 @@ exit 0
             result, commands = self.run_installer(True, "172.17.0.1", geo)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("docker rm -f rustdesk-api", result.stderr)
+        self.assertNotIn("start rustdesk-api", commands)
+
+    def test_existing_container_rejects_explicit_empty_proxy_when_old_proxy_remains(self):
+        with tempfile.TemporaryDirectory() as temp:
+            geo = Path(temp) / "GeoLite2-City.mmdb"
+            geo.write_bytes(b"test-mmdb")
+            result, commands = self.run_installer(True, "", geo)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("可信代理配置不同", result.stderr)
+        self.assertNotIn("start rustdesk-api", commands)
+
+    def test_existing_container_rejects_changed_geolite_mount(self):
+        with tempfile.TemporaryDirectory() as temp:
+            geo = Path(temp) / "GeoLite2-City.mmdb"
+            geo.write_bytes(b"test-mmdb")
+            result, commands = self.run_installer(True, "old-proxy", geo)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GeoLite2 挂载不同", result.stderr)
         self.assertNotIn("start rustdesk-api", commands)
 
 

@@ -139,7 +139,7 @@ class IntegrationTest(unittest.TestCase):
         env["RUSTDESK_INSTALL_CONFIG"] = str(cls.temp / "install.json")
         # Production defaults to a custom path; tests explicitly pin the public path for compatibility cases.
         env["RUSTDESK_ADMIN_PATH"] = "/ops-x9"
-        env["RUSTDESK_TRUSTED_PROXY_IPS"] = "127.0.0.1"
+        env["RUSTDESK_TRUSTED_PROXY_IPS"] = "127.0.0.0/8"
         if os.environ.get("RUSTDESK_GEOIP_DATABASE"):
             env["RUSTDESK_GEOIP_DATABASE"] = os.environ["RUSTDESK_GEOIP_DATABASE"]
         if runtime.name == "frankenphp":
@@ -342,14 +342,14 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(json.loads(empty["data"]), {"tags": [], "peers": []})
 
     def test_05_sysinfo_and_anonymous_heartbeat(self):
-        status, text, ctype = self.client.request("POST", "/?s=/api/sysinfo", {"id": "new-id", "uuid": "new-uuid", "version": "1.5.0", "hostname": "host", "os": "linux", "cpu": "x", "memory": "1G", "platform": "linux", "distribution": "portable", "install_mode": "portable", "network": {"private_ips": ["192.168.1.20"]}}, expected=(200,))
+        status, text, ctype = self.client.request("POST", "/?s=/api/sysinfo", {"id": "new-id", "uuid": "new-uuid", "version": "1.5.0", "hostname": "host", "os": "linux", "cpu": "x", "memory": "1G", "platform": "linux", "distribution": "portable", "install_mode": "portable", "network": {"private_ips": ["192.168.1.20", "fd12:3456:789a::20"]}}, expected=(200,))
         self.assertEqual(status, 200)
         self.assertTrue("text/plain" in ctype)
         self.assertIn("SYSINFO", text)
         db = sqlite3.connect(self.db)
         runtime, network = db.execute("SELECT runtime_payload,network_payload FROM device_reports WHERE id='new-id'").fetchone()
         self.assertEqual(json.loads(runtime)["distribution"], "portable")
-        self.assertEqual(json.loads(network)["private_ips"], ["192.168.1.20"])
+        self.assertEqual(json.loads(network)["private_ips"], ["192.168.1.20", "fd12:3456:789a::20"])
         db.close()
         _, heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {"id": "anonymous", "uuid": str(uuid.uuid4()), "conns": []})
         self.assertIsInstance(heartbeat, dict)
@@ -907,8 +907,67 @@ class IntegrationTest(unittest.TestCase):
         network = json.loads(db.execute("SELECT network_payload FROM device_reports WHERE id=? AND uuid=?", (device_id, "geo-uuid")).fetchone()[0])
         db.close()
         self.assertEqual(network["public_ip"], "81.2.69.160")
+
         self.assertEqual(network["geo"]["country_code"], "GB")
         self.assertEqual(network["geo"]["city"], "London")
+
+    def test_29_private_proxy_address_is_not_persisted_as_public_ip(self):
+        device_id = "proxy-chain-device"
+        self.client.json(
+            "POST",
+            "/?s=/api/heartbeat",
+            {"id": device_id, "uuid": "proxy-chain-uuid", "ver": 11, "conns": []},
+            {"X-Real-IP": "9.9.9.9", "X-Forwarded-For": "8.8.8.8, 81.2.69.160"},
+        )
+        db = sqlite3.connect(self.db)
+        network = json.loads(db.execute(
+            "SELECT network_payload FROM device_reports WHERE id=? AND uuid=?",
+            (device_id, "proxy-chain-uuid"),
+        ).fetchone()[0])
+        db.close()
+        self.assertEqual(network["public_ip"], "81.2.69.160")
+
+        self.client.json(
+            "POST",
+            "/?s=/api/heartbeat",
+            {"id": "broken-proxy-chain", "uuid": "broken-proxy-uuid", "ver": 11, "conns": []},
+            {"X-Real-IP": "81.2.69.160", "X-Forwarded-For": "8.8.8.8, invalid-hop"},
+        )
+        db = sqlite3.connect(self.db)
+        broken = json.loads(db.execute("SELECT network_payload FROM device_reports WHERE id='broken-proxy-chain'").fetchone()[0])
+        db.close()
+        self.assertEqual(broken["public_ip"], "")
+
+    def test_30_special_ranges_and_ipv6_proxy_rules_are_classified_correctly(self):
+        runtime = Path(self.runtime or os.environ.get("FRANKENPHP", DEFAULT_RUNTIME))
+        php = "require %s; echo json_encode([ip_matches_proxy_rule('2001:0db8:0:0:0:0:0:1','2001:db8::1'),is_public_ip('8.8.8.8'),is_public_ip('2606:4700:4700::1111'),is_public_ip('192.0.0.9'),is_public_ip('192.0.0.10'),is_public_ip('100.64.0.1'),is_public_ip('192.0.2.1'),is_public_ip('192.88.99.1'),is_public_ip('198.51.100.1'),is_public_ip('203.0.113.1'),is_public_ip('224.0.0.1'),is_public_ip('100:0:0:1::1'),is_public_ip('2001:5::1'),is_public_ip('2001:100::1'),is_public_ip('2001:2::1'),is_public_ip('2001:db8::1'),is_public_ip('3fff::1'),is_public_ip('5f00::1'),is_public_ip('ff02::1'),forwarded_public_ip('10.0.0.2','9.9.9.9','8.8.8.8',[]),forwarded_public_ip('127.0.0.1','9.9.9.9','8.8.8.8, 81.2.69.160',['127.0.0.0/8'])]);" % json.dumps(str(SQLITE_DIR / "lib.php"))
+        command = [str(runtime), "php-cli", "-r", php] if runtime.name == "frankenphp" else [str(runtime), "-r", php]
+        result = json.loads(subprocess.check_output(command, cwd=ROOT, text=True))
+        self.assertEqual(result, [True, True, True, True, True, False, False, False, False, False, False, False, False, False, False, False, False, False, False, '', '81.2.69.160'])
+
+        special_addresses = ["100.64.0.1", "192.0.2.1", "192.88.99.1", "198.18.0.1", "198.51.100.1", "203.0.113.1", "224.0.0.1", "100:0:0:1::1", "2001:5::1", "2001:100::1", "2001:2::1", "2001:db8::1", "3fff::1", "5f00::1", "ff02::1"]
+        for index, address in enumerate(special_addresses):
+            self.client.json(
+                "POST",
+                "/?s=/api/heartbeat",
+                {"id": f"special-ip-{index:02d}", "uuid": f"special-uuid-{index:02d}", "ver": 11, "conns": []},
+                {"X-Forwarded-For": address},
+            )
+        db = sqlite3.connect(self.db)
+        persisted = [json.loads(row[0]).get("public_ip") for row in db.execute("SELECT network_payload FROM device_reports WHERE id LIKE 'special-ip-%' ORDER BY id")]
+        db.close()
+        self.assertEqual(persisted, [""] * len(special_addresses))
+
+        self.client.json(
+            "POST",
+            "/?s=/api/heartbeat",
+            {"id": "public-ipv6", "uuid": "public-ipv6-uuid", "ver": 11, "conns": []},
+            {"X-Forwarded-For": "2606:4700:4700::1111"},
+        )
+        db = sqlite3.connect(self.db)
+        public_ipv6 = json.loads(db.execute("SELECT network_payload FROM device_reports WHERE id='public-ipv6'").fetchone()[0])["public_ip"]
+        db.close()
+        self.assertEqual(public_ipv6, "2606:4700:4700::1111")
 
 
 def main():

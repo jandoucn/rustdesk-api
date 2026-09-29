@@ -36,7 +36,7 @@ async function reportRichClient(request, id) {
   const response = await request.post('/api/sysinfo', { data: {
     id, uuid, hostname: `${id}-host`, username: 'mobile-user', os: 'windows 11', cpu: 'Test CPU', memory: '16 GB', version: '1.5.0',
     platform: 'windows', distribution: 'sos', install_mode: 'portable', client_arch: 'x64', executable_name: 'RustDesk.exe',
-    network: { private_ips: ['192.168.1.20', '10.0.0.8'] },
+    network: { private_ips: ['192.168.1.20', '10.0.0.8', 'fd12:3456:789a::20'] },
   } });
   expect(response.ok()).toBeTruthy();
 }
@@ -157,24 +157,25 @@ test('client inventory keeps runtime and network details aligned with persisted 
   const row = page.locator(`[data-device-id="${deviceId}"]`);
   await expect(row).toContainText('SOS');
   await expect(row).toContainText('1.5.0');
-  await expect(row).toContainText('2 个内网地址');
+  await expect(row).not.toContainText('个内网地址');
   await row.getByRole('button', { name: '查看客户端详情' }).click();
   await expect(page.locator('#details-dialog')).toContainText('Windows');
   await expect(page.locator('#details-dialog')).toContainText('SOS');
   await expect(page.locator('#details-dialog')).toContainText('Test CPU');
   await expect(page.locator('#details-dialog')).toContainText('16 GB');
   await expect(page.locator('#details-dialog')).toContainText('10.0.0.8');
+  await expect(page.locator('#details-dialog')).toContainText('fd12:3456:789a::20');
   await page.locator('#details-close').click();
   const api = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
   const device = api.data.find(item => item.id === deviceId);
   expect(device.distribution).toBe('sos');
   expect(device.install_mode).toBe('portable');
-  expect(device.private_ips).toEqual(['192.168.1.20', '10.0.0.8']);
+  expect(device.private_ips).toEqual(['192.168.1.20', '10.0.0.8', 'fd12:3456:789a::20']);
   await request.post('/api/sysinfo', { data: { id: deviceId, uuid: `${deviceId}-uuid`, hostname: `${deviceId}-host`, os: 'windows 11', version: '1.5.0' } });
   const legacyReadback = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
   const preserved = legacyReadback.data.find(item => item.id === deviceId);
   expect(preserved.distribution).toBe('sos');
-  expect(preserved.private_ips).toEqual(['192.168.1.20', '10.0.0.8']);
+  expect(preserved.private_ips).toEqual(['192.168.1.20', '10.0.0.8', 'fd12:3456:789a::20']);
 });
 
 test('client inventory formats domestic and foreign IP locations without repeating China', async ({ page, request }) => {
@@ -192,6 +193,7 @@ test('client inventory formats domestic and foreign IP locations without repeati
   await expect(row).toContainText('223.5.5.5');
   await expect(row).toContainText('广东 · 深圳');
   await expect(row).not.toContainText('中国');
+  await expect(row).not.toContainText('个内网地址');
   let api = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
   expect(api.data.find(item => item.id === deviceId).geo).toEqual(guangdong.geo);
 
@@ -306,7 +308,9 @@ test('client inventory loads and manages devices beyond the first 200 rows', asy
 
 for (const width of [320, 390, 768, 1024, 1440]) test(`client management has no horizontal page overflow at ${width}px`, async ({ page, request }) => {
   const suffix = Date.now().toString(36);
-  await reportClient(request, `mobile-client-${suffix}`, `mobile-host-${suffix}`);
+  const deviceId = `mobile-client-${suffix}`;
+  if (width === 390) await reportRichClient(request, deviceId);
+  else await reportClient(request, deviceId, `mobile-host-${suffix}`);
   await page.setViewportSize({ width, height: 844 });
   await loginAdmin(page);
   if (width < 768) await page.getByRole('navigation', { name: '移动端导航' }).getByRole('link', { name: '客户端', exact: true }).click();
@@ -318,8 +322,9 @@ for (const width of [320, 390, 768, 1024, 1440]) test(`client management has no 
   await expect(page.locator('#presence-filter')).toBeVisible();
   await page.locator('#q').fill(`mobile-client-${suffix}`);
   await page.getByRole('button', { name: '搜索' }).click();
-  await page.locator(`[data-device-id="mobile-client-${suffix}"]`).getByRole('button', { name: '查看客户端详情' }).click();
+  await page.locator(`[data-device-id="${deviceId}"]`).getByRole('button', { name: '查看客户端详情' }).click();
   await expect(page.locator('#details-dialog')).toBeVisible();
+  if (width === 390) await expect(page.locator('#details-dialog')).toContainText('fd12:3456:789a::20');
   await expect(page.locator('#details-close')).toBeVisible();
   await page.locator('#details-close').click();
 });

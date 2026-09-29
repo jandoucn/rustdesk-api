@@ -66,14 +66,10 @@ function report_network_payload(array $data): array
 }
 function request_public_ip(): string
 {
-    $remote = (string)($_SERVER['REMOTE_ADDR'] ?? '');
-    $trusted = array_values(array_filter(array_map('trim', explode(',', (string)(getenv('RUSTDESK_TRUSTED_PROXY_IPS') ?: '')))));
-    if ($trusted && in_array($remote, $trusted, true)) {
-        $forwarded = (string)($_SERVER['HTTP_X_REAL_IP'] ?? '');
-        if (!$forwarded) $forwarded = trim(explode(',', (string)($_SERVER['HTTP_X_FORWARDED_FOR'] ?? ''))[0] ?? '');
-        if (filter_var($forwarded, FILTER_VALIDATE_IP)) return $forwarded;
-    }
-    return filter_var($remote, FILTER_VALIDATE_IP) ? $remote : '';
+    $remote = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
+    $rules = (string)(getenv('RUSTDESK_TRUSTED_PROXY_IPS') ?: '');
+    $trusted = array_values(array_filter(array_map('trim', explode(',', $rules))));
+    return forwarded_public_ip($remote, (string)($_SERVER['HTTP_X_REAL_IP'] ?? ''), (string)($_SERVER['HTTP_X_FORWARDED_FOR'] ?? ''), $trusted);
 }
 function public_ip_geo(string $ip): array
 {

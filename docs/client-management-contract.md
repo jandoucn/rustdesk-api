@@ -83,7 +83,9 @@ Unknown fields, tags, peer metadata and other address-book entries must be prese
 - Alias editing has explicit save/cancel/error/success states.
 - Refresh preserves active filters and does not replace the page.
 - The network cell shows GeoLite location below the public IP. Mainland China omits the country name; foreign locations retain it; duplicate region/city names appear once.
-- The Linux installer forwards `RUSTDESK_TRUSTED_PROXY_IPS` and can mount a host MMDB read-only through `RUSTDESK_GEOIP_SOURCE`.
+- The Linux Engine installer forwards `RUSTDESK_TRUSTED_PROXY_IPS`. When the variable is unset, it discovers and uses the current bridge network's exact gateway IP; an explicitly empty value disables forwarded-header trust. Docker Desktop, rootless Docker and direct Compose deployments must set the observed proxy source IP or a deliberately chosen CIDR explicitly.
+- `X-Forwarded-For` is read only when the direct peer matches a trusted proxy rule. The chain is peeled from right to left across trusted hops; `X-Real-IP` is only a fallback when no valid forwarded chain exists. Only globally reachable unicast addresses suitable for GeoIP are stored; private, shared, protocol-assignment, documentation, benchmarking, multicast and reserved ranges remain unknown.
+- The installer can mount a host MMDB read-only through `RUSTDESK_GEOIP_SOURCE`.
 - Layouts at 320, 390, 768, 1024 and 1440 pixels have no page-level horizontal overflow.
 
 ## Required tests

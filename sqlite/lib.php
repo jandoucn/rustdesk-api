@@ -1,6 +1,65 @@
 <?php
 declare(strict_types=1);
 
+function ip_matches_proxy_rule(string $ip, string $rule): bool
+{
+    $addressBytes = @inet_pton(trim($ip));
+    if ($addressBytes === false) return false;
+    if (!str_contains($rule, '/')) {
+        $ruleBytes = @inet_pton(trim($rule));
+        return $ruleBytes !== false && hash_equals($addressBytes, $ruleBytes);
+    }
+    [$network, $prefixText] = array_pad(explode('/', trim($rule), 2), 2, '');
+    if ($prefixText === '' || !ctype_digit($prefixText)) return false;
+    $networkBytes = @inet_pton($network);
+    if ($networkBytes === false || strlen($addressBytes) !== strlen($networkBytes)) return false;
+    $prefix = (int)$prefixText;
+    $maximum = strlen($addressBytes) * 8;
+    if ($prefix > $maximum) return false;
+    $wholeBytes = intdiv($prefix, 8);
+    if ($wholeBytes > 0 && !hash_equals(substr($addressBytes, 0, $wholeBytes), substr($networkBytes, 0, $wholeBytes))) return false;
+    $remainingBits = $prefix % 8;
+    if ($remainingBits === 0) return true;
+    $mask = (0xff << (8 - $remainingBits)) & 0xff;
+    return (ord($addressBytes[$wholeBytes]) & $mask) === (ord($networkBytes[$wholeBytes]) & $mask);
+}
+function is_public_ip(string $ip): bool
+{
+    $ip = trim($ip);
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) return false;
+    if (in_array($ip, ['192.0.0.9', '192.0.0.10'], true)) return true;
+    $special = [
+        '100.64.0.0/10', '192.0.0.0/24', '192.0.2.0/24', '192.88.99.0/24',
+        '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/4',
+        '::ffff:0:0/96', '64:ff9b::/96', '64:ff9b:1::/48', '100::/64',
+        '100:0:0:1::/64', '2001::/23', '2001:db8::/32',
+        '2002::/16', '3fff::/20', '5f00::/16', 'ff00::/8',
+    ];
+    foreach ($special as $range) if (ip_matches_proxy_rule($ip, $range)) return false;
+    return true;
+}
+function forwarded_public_ip(string $remote, string $realIp, string $forwardedFor, array $trustedRules): string
+{
+    $remote = trim($remote);
+    $trusted = static function (string $ip) use ($trustedRules): bool {
+        foreach ($trustedRules as $rule) if (ip_matches_proxy_rule($ip, trim((string)$rule))) return true;
+        return false;
+    };
+    if (!$trusted($remote)) return is_public_ip($remote) ? $remote : '';
+
+    $forwardedFor = trim($forwardedFor);
+    if ($forwardedFor !== '') {
+        $chain = array_map('trim', explode(',', $forwardedFor));
+        foreach ($chain as $hop) if ($hop === '' || filter_var($hop, FILTER_VALIDATE_IP) === false) return '';
+        $chain[] = $remote;
+        while ($chain && $trusted((string)end($chain))) array_pop($chain);
+        $candidate = $chain ? (string)end($chain) : '';
+        return is_public_ip($candidate) ? $candidate : '';
+    }
+    $realIp = trim($realIp);
+    return is_public_ip($realIp) ? $realIp : '';
+}
+
 function installation_config_path(): string {
     return (string)(getenv('RUSTDESK_INSTALL_CONFIG') ?: '/var/www/data/install.json');
 }

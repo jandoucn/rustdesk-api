@@ -159,7 +159,7 @@ class MySQLIntegrationTest(unittest.TestCase):
         auth = self.client_login(device="mysql-device")
         self.client.json("POST", "/api/devices/deploy", {"id": "deploy-mysql", "uuid": "uuid-1", "pk": "pk-1"}, auth)
         self.client.json("POST", "/api/devices/cli", {"id": "deploy-mysql", "uuid": "uuid-1", "device_name": "Managed"}, auth)
-        self.client.request("POST", "/api/sysinfo", {"id": "deploy-mysql", "uuid": "uuid-1", "hostname": "real-host", "os": "linux", "version": "1.5.0", "platform": "windows", "distribution": "sos", "install_mode": "portable", "network": {"private_ips": ["10.0.0.8"]}}, expected=(200,))
+        self.client.request("POST", "/api/sysinfo", {"id": "deploy-mysql", "uuid": "uuid-1", "hostname": "real-host", "os": "linux", "version": "1.5.0", "platform": "windows", "distribution": "sos", "install_mode": "portable", "network": {"private_ips": ["10.0.0.8", "fd12:3456:789a::20"]}}, expected=(200,))
         nonce = "92233720368547758081234567890"
         self.client.json("POST", "/api/audit/conn", {"id": "deploy-mysql", "uuid": "uuid-1", "nonce": nonce})
         self.client.json("POST", "/api/audit/conn", {"id": "deploy-mysql", "uuid": "uuid-1", "nonce": nonce})
@@ -170,7 +170,7 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.client.request("POST", "/api/record?op=part&filename=e2e.webm&id=mysql-session", b"frame-2", expected=(200,))
         self.assertEqual(self.sql("SELECT id,uuid,JSON_UNQUOTE(JSON_EXTRACT(payload,'$.device_name')) FROM device_deployments WHERE id='deploy-mysql'"), ["deploy-mysql\tuuid-1\tManaged"])
         self.assertEqual(self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.hostname')) FROM device_reports WHERE id='deploy-mysql'"), ["real-host"])
-        self.assertEqual(self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(runtime_payload,'$.distribution')),JSON_UNQUOTE(JSON_EXTRACT(network_payload,'$.private_ips[0]')) FROM device_reports WHERE id='deploy-mysql'"), ["sos\t10.0.0.8"])
+        self.assertEqual(self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(runtime_payload,'$.distribution')),JSON_UNQUOTE(JSON_EXTRACT(network_payload,'$.private_ips[0]')),JSON_UNQUOTE(JSON_EXTRACT(network_payload,'$.private_ips[1]')) FROM device_reports WHERE id='deploy-mysql'"), ["sos\t10.0.0.8\tfd12:3456:789a::20"])
         self.assertEqual(self.sql(f"SELECT COUNT(*) FROM audit_events WHERE nonce='{nonce}'"), ["1"])
         self.assertEqual(self.sql("SELECT note FROM audit_notes WHERE guid='mysql-note'"), ["hello"])
         self.assertEqual(self.sql("SELECT signature FROM switch_grants WHERE id='deploy-mysql' AND verifier='v'"), ["sig"])
@@ -496,6 +496,28 @@ class MySQLIntegrationTest(unittest.TestCase):
         })
         self.assertEqual(self.sql("SELECT JSON_EXTRACT(payload,'$.future.nested.keep'),JSON_UNQUOTE(JSON_EXTRACT(payload,'$.future.nested.replace')),JSON_EXTRACT(payload,'$.network.future.keep'),JSON_UNQUOTE(JSON_EXTRACT(payload,'$.network.future.replace')) FROM device_reports WHERE id='mysql-nested-json'"), ["true\tnew\t1\tnew"])
         self.assertEqual(self.sql("SELECT JSON_EXTRACT(network_payload,'$.future.keep'),JSON_UNQUOTE(JSON_EXTRACT(network_payload,'$.private_ips[0]')),JSON_CONTAINS_PATH(network_payload,'one','$.geo') FROM device_reports WHERE id='mysql-nested-json'"), ["1\t10.0.0.9\t0"])
+
+    def test_18_private_proxy_address_is_not_persisted_as_public_ip(self):
+        self.client.request(
+            "POST",
+            "/api/sysinfo",
+            {"id": "mysql-proxy-chain", "uuid": "mysql-proxy-uuid", "hostname": "proxy-host"},
+            {"X-Real-IP": "9.9.9.9", "X-Forwarded-For": "8.8.8.8, 81.2.69.160"},
+        )
+        self.assertEqual(
+            self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(network_payload,'$.public_ip')) FROM device_reports WHERE id='mysql-proxy-chain' AND uuid='mysql-proxy-uuid'"),
+            ["81.2.69.160"],
+        )
+        self.client.request(
+            "POST",
+            "/api/sysinfo",
+            {"id": "mysql-public-ipv6", "uuid": "mysql-public-ipv6-uuid", "hostname": "ipv6-host"},
+            {"X-Forwarded-For": "2606:4700:4700::1111"},
+        )
+        self.assertEqual(
+            self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(network_payload,'$.public_ip')) FROM device_reports WHERE id='mysql-public-ipv6' AND uuid='mysql-public-ipv6-uuid'"),
+            ["2606:4700:4700::1111"],
+        )
 
 
 if __name__ == "__main__":

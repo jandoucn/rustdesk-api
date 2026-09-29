@@ -13,6 +13,7 @@ services:
       RUSTDESK_DB_USER: ${RUSTDESK_DB_USER:-rustdesk}
       RUSTDESK_DB_PASSWORD: ${RUSTDESK_DB_PASSWORD:?set RUSTDESK_DB_PASSWORD}
       RUSTDESK_ADMIN_PATH: ${RUSTDESK_ADMIN_PATH:-/ops-console}
+      RUSTDESK_TRUSTED_PROXY_IPS: ${RUSTDESK_TRUSTED_PROXY_IPS:-}
     depends_on:
       mysql:
         condition: service_healthy
