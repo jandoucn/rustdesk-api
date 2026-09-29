@@ -1,14 +1,39 @@
+name: rustdesk-api
+
 services:
   api:
-    build: .
-    restart: unless-stopped
+    image: crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:latest
+    pull_policy: always
     container_name: rustdesk-api
+    restart: unless-stopped
     ports:
-      - "7000:80"
+      - "127.0.0.1:${RUSTDESK_PORT:-7000}:80"
     environment:
       RUSTDESK_DB_DRIVER: sqlite
       RUSTDESK_DB: /var/www/data/rustdesk.db
-      # 必须以 / 开头；示例：/ops-console-9f31
-      RUSTDESK_ADMIN_PATH: ${RUSTDESK_ADMIN_PATH:-/ops-console}
+      RUSTDESK_INSTALL_CONFIG: /var/www/data/install.json
+      RUSTDESK_PROVISIONER_URL: http://rustdesk-api-provisioner:8080
+      RUSTDESK_PROVISIONER_SECRET: ${RUSTDESK_PROVISIONER_SECRET:?set RUSTDESK_PROVISIONER_SECRET}
     volumes:
       - ./data:/var/www/data
+    networks:
+      - rustdesk-api-net
+
+  provisioner:
+    image: crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api-provisioner:latest
+    pull_policy: always
+    container_name: rustdesk-api-provisioner
+    restart: unless-stopped
+    profiles: [setup]
+    environment:
+      PROVISIONER_SECRET: ${RUSTDESK_PROVISIONER_SECRET:?set RUSTDESK_PROVISIONER_SECRET}
+      MYSQL_IMAGE: ${MYSQL_IMAGE:-docker.1ms.run/mysql:8.4}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./provisioner-state:/state
+    networks:
+      - rustdesk-api-net
+
+networks:
+  rustdesk-api-net:
+    name: rustdesk-api-net
