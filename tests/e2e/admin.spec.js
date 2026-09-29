@@ -176,6 +176,15 @@ test('client inventory keeps runtime and network details aligned with persisted 
   const preserved = legacyReadback.data.find(item => item.id === deviceId);
   expect(preserved.distribution).toBe('sos');
   expect(preserved.private_ips).toEqual(['192.168.1.20', '10.0.0.8', 'fd12:3456:789a::20']);
+
+  persistNetworkPayload(deviceId, `${deviceId}-uuid`, { public_ip: '172.22.0.1', geo: { city: 'stale' }, private_ips: preserved.private_ips });
+  await page.reload();
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const refreshedRow = page.locator(`[data-device-id="${deviceId}"]`);
+  await expect(refreshedRow).toContainText('公网 IP 未上报');
+  await expect(refreshedRow).not.toContainText('172.22.0.1');
+  await expect(refreshedRow).not.toContainText('stale');
 });
 
 test('client inventory formats domestic and foreign IP locations without repeating China', async ({ page, request }) => {

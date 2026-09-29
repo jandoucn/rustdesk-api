@@ -938,6 +938,19 @@ class IntegrationTest(unittest.TestCase):
         db.close()
         self.assertEqual(broken["public_ip"], "")
 
+        db = sqlite3.connect(self.db)
+        db.execute(
+            "UPDATE device_reports SET network_payload=? WHERE id=? AND uuid=?",
+            (json.dumps({"public_ip": "172.22.0.1", "geo": {"city": "stale"}}), device_id, "proxy-chain-uuid"),
+        )
+        db.commit()
+        db.close()
+        self.admin_csrf()
+        _, listing, _ = self.client.json("GET", f"/?s=/ops-x9/api/devices&q={device_id}&page=1&pageSize=20")
+        legacy = next(row for row in listing["data"] if row["id"] == device_id)
+        self.assertEqual(legacy["public_ip"], "")
+        self.assertEqual(legacy["geo"], [])
+
     def test_30_special_ranges_and_ipv6_proxy_rules_are_classified_correctly(self):
         runtime = Path(self.runtime or os.environ.get("FRANKENPHP", DEFAULT_RUNTIME))
         php = "require %s; echo json_encode([ip_matches_proxy_rule('2001:0db8:0:0:0:0:0:1','2001:db8::1'),is_public_ip('8.8.8.8'),is_public_ip('2606:4700:4700::1111'),is_public_ip('192.0.0.9'),is_public_ip('192.0.0.10'),is_public_ip('100.64.0.1'),is_public_ip('192.0.2.1'),is_public_ip('192.88.99.1'),is_public_ip('198.51.100.1'),is_public_ip('203.0.113.1'),is_public_ip('224.0.0.1'),is_public_ip('100:0:0:1::1'),is_public_ip('2001:5::1'),is_public_ip('2001:100::1'),is_public_ip('2001:2::1'),is_public_ip('2001:db8::1'),is_public_ip('3fff::1'),is_public_ip('5f00::1'),is_public_ip('ff02::1'),forwarded_public_ip('10.0.0.2','9.9.9.9','8.8.8.8',[]),forwarded_public_ip('127.0.0.1','9.9.9.9','8.8.8.8, 81.2.69.160',['127.0.0.0/8'])]);" % json.dumps(str(SQLITE_DIR / "lib.php"))

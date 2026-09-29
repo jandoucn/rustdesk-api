@@ -518,6 +518,12 @@ class MySQLIntegrationTest(unittest.TestCase):
             self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(network_payload,'$.public_ip')) FROM device_reports WHERE id='mysql-public-ipv6' AND uuid='mysql-public-ipv6-uuid'"),
             ["2606:4700:4700::1111"],
         )
+        self.sql("UPDATE device_reports SET network_payload=JSON_OBJECT('public_ip','172.22.0.1','geo',JSON_OBJECT('city','stale')) WHERE id='mysql-proxy-chain' AND uuid='mysql-proxy-uuid'")
+        self.admin_login()
+        _, listing, _ = self.client.json("GET", "/ops-x9/api/devices?q=mysql-proxy-chain&page=1&pageSize=20")
+        legacy = next(row for row in listing["data"] if row["id"] == "mysql-proxy-chain")
+        self.assertEqual(legacy["public_ip"], "")
+        self.assertEqual(legacy["geo"], [])
 
 
 if __name__ == "__main__":

@@ -928,12 +928,14 @@ try {
                 $identity=$reportRow['id']."\0".$reportRow['uuid'];$reportedIds[$identity]=true; $deployment=$deployments[$identity]??null;
                 $report=decoded_payload($reportRow['payload']); $deploy=decoded_payload($deployment['payload']??null);
                 $runtime=decoded_payload($reportRow['runtime_payload']??null); $network=decoded_payload($reportRow['network_payload']??null);
+                $publicIp=is_public_ip((string)($network['public_ip']??''))?(string)$network['public_ip']:'';
+                $publicGeo=$publicIp!==''&&is_array($network['geo']??null)?$network['geo']:[];
                 $aliasEntry=$aliases[$reportRow['id']]??null; $lastHeartbeat=(int)$reportRow['last_heartbeat'];
                 $inventory[]=['id'=>$reportRow['id'],'uuid'=>$reportRow['uuid'],'owner_id'=>$deployment&&$deployment['uid']!==null?(int)$deployment['uid']:null,
                     'hostname'=>$report['hostname']??($deploy['device_name']??''),'username'=>$report['username']??($deploy['device_username']??''),
                     'platform'=>$report['platform']??($report['os']??($deploy['platform']??'')),'os'=>$report['os']??'','cpu'=>$report['cpu']??'','memory'=>$report['memory']??'','version'=>$report['version']??'',
                     'distribution'=>$runtime['distribution']??'','install_mode'=>$runtime['install_mode']??'','client_arch'=>$runtime['client_arch']??'','executable_name'=>$runtime['executable_name']??'',
-                    'public_ip'=>$network['public_ip']??'','private_ips'=>$network['private_ips']??[],'geo'=>$network['geo']??[],
+                    'public_ip'=>$publicIp,'private_ips'=>$network['private_ips']??[],'geo'=>$publicGeo,
                     'version_text'=>$report['version']??'','heartbeat_version'=>decoded_payload($reportRow['heartbeat_payload']??null)['ver']??null,
                     'heartbeat_payload'=>decoded_payload($reportRow['heartbeat_payload']??null),
                     'last_seen'=>(int)$reportRow['last_seen'],'last_heartbeat'=>$lastHeartbeat,
