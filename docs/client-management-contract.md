@@ -62,16 +62,17 @@ Unknown fields, tags, peer metadata and other address-book entries must be prese
 - Returns report-backed and deployment-only rows.
 - Returns summary counts for total, online, recent, offline, unreported and labelled devices.
 
-`PATCH ${RUSTDESK_ADMIN_PATH}/api/devices/{id}/alias`
+`PATCH ${RUSTDESK_ADMIN_PATH}/api/devices/{id}/alias?uuid={uuid}`
 
 - Requires an authenticated administrator session and CSRF token.
 - Accepts `{ "alias": "..." }`, including an empty string to clear it.
 - Returns the persisted alias and `sync: "next_address_book_pull"`.
 
-`DELETE ${RUSTDESK_ADMIN_PATH}/api/devices/{id}`
+`DELETE ${RUSTDESK_ADMIN_PATH}/api/devices/{id}?uuid={uuid}`
 
 - Requires confirmation in the UI and CSRF protection.
-- Removes report and deployment records for the selected ID.
+- Removes report and deployment records for the selected `(id, uuid)` only.
+- A legacy request without `uuid` is accepted only when the ID resolves to exactly one UUID; ambiguous IDs return `409`.
 
 ## UI contract
 
@@ -81,7 +82,9 @@ Unknown fields, tags, peer metadata and other address-book entries must be prese
 - Status uses text and an indicator dot; color alone is insufficient.
 - Alias editing has explicit save/cancel/error/success states.
 - Refresh preserves active filters and does not replace the page.
-- Desktop and 320/390px mobile layouts have no page-level horizontal overflow.
+- The network cell shows GeoLite location below the public IP. Mainland China omits the country name; foreign locations retain it; duplicate region/city names appear once.
+- The Linux installer forwards `RUSTDESK_TRUSTED_PROXY_IPS` and can mount a host MMDB read-only through `RUSTDESK_GEOIP_SOURCE`.
+- Layouts at 320, 390, 768, 1024 and 1440 pixels have no page-level horizontal overflow.
 
 ## Required tests
 

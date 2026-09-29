@@ -57,16 +57,6 @@ python3 tools/sqlite_snapshot.py /path/to/source/rustdesk.db /path/outside/repo/
 
 本地使用 FrankenPHP 内置 PHP 8.5.11（有 SQLite3）验证，运行时在仓库外。旧镜像基于 PHP 8.3，遵照本轮不启用 Docker 的要求，容器及真实客户端远控联调留给后续构建后的测试。
 
-## 常用管理命令
+## 网页初始化
 
-```sh
-# 只迁移，不赋予任何用户新权限
-php sqlite/manage.php --db=/absolute/test/rustdesk.db --migrate
-# 显式指定已有用户作为管理员，保留其密码与地址簿，撤销旧会话
-php sqlite/manage.php --db=/absolute/test/rustdesk.db --promote-admin=1
-# 新安装或管理员密码恢复，通过 stdin 输入密码
-php sqlite/manage.php --db=/absolute/test/rustdesk.db --init-admin=admin --password-stdin
-php sqlite/manage.php --db=/absolute/test/rustdesk.db --reset-admin=1 --password-stdin
-```
-
-`--promote-admin=1` 和 `--reset-admin=1` 中的 ID 必须对应实际选定用户，不能只凭账号名称猜测。新服务首次启动不自动提升任何旧用户。
+首次启动后访问 `/setup`，选择数据库、后台路径并设置管理员账号。迁移旧库时，如果输入的管理员用户名已存在，初始化会原位提升该用户、设置新密码并撤销旧会话，保留其用户 ID、通讯录和设备数据。系统不再提供旧管理员命令行入口。

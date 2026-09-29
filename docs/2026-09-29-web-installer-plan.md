@@ -42,7 +42,7 @@
 
 - [ ] Add failing tests for `ready -> validating -> provisioning -> initializing -> verifying -> complete`, single-run locking, failed-state diagnostics and completed-state mutation lockout.
 - [ ] Implement a background installation worker with bounded subprocess timeouts and secret-redacted command results.
-- [ ] Run Docker Compose build/up, wait for container health, pipe the administrator password to `manage.php --init-admin`, verify HTTP routes and query schema/admin state through `docker compose exec`.
+- [ ] Run Docker Compose build/up, wait for container health, complete administrator creation through `/setup/api/install`, verify HTTP routes and query schema/admin state through `docker compose exec`.
 - [ ] Add restart persistence verification and preserve installer-owned volumes on ordinary retries.
 
 ### Task 4: Installer HTTP API
