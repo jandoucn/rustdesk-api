@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 API_IMAGE="${RUSTDESK_API_IMAGE:-crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:latest}"
-PROVISIONER_IMAGE="${RUSTDESK_PROVISIONER_IMAGE:-crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:provisioner-latest}"
+PROVISIONER_IMAGE="${RUSTDESK_PROVISIONER_IMAGE:-crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api-provisioner:latest}"
 MYSQL_IMAGE="${MYSQL_IMAGE:-docker.1ms.run/mysql:8.4}"
 CONTAINER_NAME="${RUSTDESK_CONTAINER_NAME:-rustdesk-api}"
 PROVISIONER_NAME="${RUSTDESK_PROVISIONER_NAME:-rustdesk-api-provisioner}"

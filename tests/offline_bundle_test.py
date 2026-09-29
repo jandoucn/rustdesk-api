@@ -58,7 +58,7 @@ esac
                 commands,
             )
             self.assertIn(
-                "pull --platform linux/amd64 crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:provisioner-latest",
+                "pull --platform linux/amd64 crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api-provisioner:latest",
                 commands,
             )
 

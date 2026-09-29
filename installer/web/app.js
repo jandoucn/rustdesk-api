@@ -6,7 +6,7 @@
   const error = document.getElementById('form-error');
   const warning = document.getElementById('history-warning');
   const scriptInput = form.elements.script_url;
-  const installerSha256 = '686995bf512fb2fdd28e68ad9431627541957f80566c39635102fee529f70e82';
+  const installerSha256 = 'c0ebd62ca5025dff90f1cf86f3a50c03b1678306d1232d53367be585421d64a2';
   scriptInput.value = 'https://shell.olii.cc/install.sh';
 
   function shellQuote(value) {

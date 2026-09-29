@@ -18,7 +18,7 @@ test('desktop generator includes private ACR credentials and selected port', asy
   expect(command).toContain("curl -fsSL 'https://shell.olii.cc/install.sh'");
   expect(command).toContain("REGISTRY_USERNAME='yanolly' REGISTRY_PASSWORD='acr_browser_test_password' RUSTDESK_PORT=8123 bash \"$f\"");
   expect(command).toContain('sha256sum -c -');
-  expect(command).toContain('686995bf512fb2fdd28e68ad9431627541957f80566c39635102fee529f70e82');
+  expect(command).toContain('c0ebd62ca5025dff90f1cf86f3a50c03b1678306d1232d53367be585421d64a2');
   await expect(page.locator('#history-warning')).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBeTruthy();
 });
