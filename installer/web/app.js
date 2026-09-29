@@ -6,7 +6,8 @@
   const error = document.getElementById('form-error');
   const warning = document.getElementById('history-warning');
   const scriptInput = form.elements.script_url;
-  scriptInput.value = new URL('install.sh', window.location.href).href;
+  const installerSha256 = '519b2181c5088b3c732d1acc75859cef141153d2c027a6d6628e7dda4be31bae';
+  scriptInput.value = 'https://ghfast.top/https://raw.githubusercontent.com/jandoucn/rustdesk-api/main/installer/install.sh';
 
   function shellQuote(value) {
     return `'${String(value).replaceAll("'", `'"'"'`)}'`;
@@ -25,9 +26,11 @@
     try { const url = new URL(scriptUrl); if (url.protocol !== 'https:') throw Error(); } catch (_) { return void (error.textContent = 'install.sh 必须使用有效的 HTTPS 地址'); }
     if (!Number.isInteger(port) || port < 1 || port > 65535) return void (error.textContent = '外部端口必须是 1-65535 的整数');
 
-    command.textContent = mode === 'embedded'
-      ? `curl -fsSL ${shellQuote(scriptUrl)} | sudo env GHCR_USERNAME=${shellQuote(username)} GHCR_TOKEN=${shellQuote(token)} RUSTDESK_PORT=${port} bash`
-      : `curl -fsSL ${shellQuote(scriptUrl)} | sudo env GHCR_USERNAME=${shellQuote(username)} RUSTDESK_PORT=${port} bash`;
+    const download = `f=$(mktemp) && curl -fsSL ${shellQuote(scriptUrl)} -o "$f" && echo ${shellQuote(`${installerSha256}  $f`)} | sha256sum -c -`;
+    const execute = mode === 'embedded'
+      ? `sudo env GHCR_USERNAME=${shellQuote(username)} GHCR_TOKEN=${shellQuote(token)} RUSTDESK_PORT=${port} bash "$f"`
+      : `sudo env GHCR_USERNAME=${shellQuote(username)} RUSTDESK_PORT=${port} bash "$f"`;
+    command.textContent = `${download} && ${execute}; rc=$?; unlink "$f"; exit $rc`;
     warning.hidden = mode !== 'embedded';
     result.hidden = false;
     result.scrollIntoView({ behavior: 'smooth', block: 'start' });

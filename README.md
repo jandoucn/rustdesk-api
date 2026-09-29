@@ -8,11 +8,15 @@ PHP 8.3 API and Web management service compatible with the current RustDesk clie
 
 Host the files in `installer/web/` and `installer/install.sh` on any public HTTPS site. The static deployment page asks for the GitHub username, a classic PAT with `read:packages`, the external port (default `7000`) and the `install.sh` URL. It builds the Linux command entirely in the browser; credentials are not submitted to the hosting site.
 
+For mainland China, the generator defaults to the verified `ghfast.top` prefix for the public installation script. The generated command downloads the script to a temporary file and checks its SHA-256 before running it as root. `ghfast.top` is not a Docker Registry V2 endpoint, so private GHCR images still use authenticated `ghcr.io` pulls.
+
 The generated command has this shape:
 
 ```sh
-curl -fsSL https://install.example.com/install.sh | \
-  sudo env GHCR_USERNAME='github-user' GHCR_TOKEN='classic-pat' RUSTDESK_PORT=7000 bash
+f=$(mktemp) && curl -fsSL \
+  'https://ghfast.top/https://raw.githubusercontent.com/jandoucn/rustdesk-api/main/installer/install.sh' \
+  -o "$f" && echo '<sha256>  '$f | sha256sum -c - && \
+  sudo env GHCR_USERNAME='github-user' GHCR_TOKEN='classic-pat' RUSTDESK_PORT=7000 bash "$f"
 ```
 
 For better shell-history hygiene, the page can generate a command without the Token. The installer then reads it without echoing through `/dev/tty`.
@@ -31,6 +35,8 @@ It creates the API network and persistent data volume, starts the API, and print
 - Existing MySQL uses the connection information entered in the wizard.
 
 The production API never mounts the Docker socket. Only the temporary provisioner receives it, and the API asks that provisioner to remove itself after successful initialization.
+
+Managed MySQL defaults to the mainland accelerator image `docker.1ms.run/mysql:8.4`. Override it at install time with `MYSQL_IMAGE=<registry>/<namespace>/mysql:8.4` when needed.
 
 The GitHub Actions workflow `.github/workflows/ghcr.yml` publishes both images. Keep the packages private and give deployment Tokens `read:packages`; organization SSO must also authorize the Token when enabled.
 Every build publishes a `commit-<short-sha>` image tag and OCI revision metadata in addition to `latest` on the default branch, so each image can be traced back to its source commit.

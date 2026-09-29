@@ -16,6 +16,7 @@ from typing import Any
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 CONTAINER_RE = re.compile(r"^[a-f0-9]{12,64}$")
+IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{1,511}$")
 
 
 class ProvisionError(RuntimeError):
@@ -43,10 +44,13 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 
 class DockerProvisioner:
-    def __init__(self, state_dir: Path, runner=subprocess.run):
+    def __init__(self, state_dir: Path, runner=subprocess.run, mysql_image: str = "docker.1ms.run/mysql:8.4"):
+        if not IMAGE_RE.fullmatch(mysql_image):
+            raise ProvisionError("MySQL 镜像地址格式错误")
         self.state_dir = state_dir
         self.runner = runner
         self.lock = threading.Lock()
+        self.mysql_image = mysql_image
 
     def run(self, command: list[str], timeout: int = 60) -> str:
         result = self.runner(command, text=True, capture_output=True, timeout=timeout)
@@ -77,7 +81,7 @@ class DockerProvisioner:
                 "database": "mysql", "mysql_host": container, "mysql_port": 3306,
                 "mysql_database": "rustdesk", "mysql_user": "rustdesk",
                 "mysql_password": secrets.token_urlsafe(32), "mysql_root_password": secrets.token_urlsafe(32),
-                "container": container, "volume": volume, "network": network,
+                "container": container, "volume": volume, "network": network, "mysql_image": self.mysql_image,
             }
             atomic_json(state_path, state)
             self.run(["docker", "volume", "create", volume])
@@ -86,7 +90,7 @@ class DockerProvisioner:
                 "--network", network, "-e", "MYSQL_DATABASE=rustdesk", "-e", "MYSQL_USER=rustdesk",
                 "-e", f"MYSQL_PASSWORD={state['mysql_password']}",
                 "-e", f"MYSQL_ROOT_PASSWORD={state['mysql_root_password']}",
-                "-v", f"{volume}:/var/lib/mysql", "mysql:8.4",
+                "-v", f"{volume}:/var/lib/mysql", self.mysql_image,
             ], timeout=180)
             deadline = time.time() + 180
             while time.time() < deadline:
@@ -139,7 +143,7 @@ class ProvisionerHandler(BaseHTTPRequestHandler):
             if self.path == "/v1/mysql":
                 project, container = validate_request(data)
                 result = self.provisioner.create_mysql(project, container)
-                safe = {key: value for key, value in result.items() if key not in {"mysql_root_password", "container", "volume", "network"}}
+                safe = {key: value for key, value in result.items() if key not in {"mysql_root_password", "container", "volume", "network", "mysql_image"}}
                 return self.respond(safe, 201)
             if self.path == "/v1/complete":
                 project = data.get("project_name", "rustdesk-api") if isinstance(data, dict) else ""
@@ -168,7 +172,10 @@ def main() -> None:
         raise SystemExit("PROVISIONER_SECRET must contain at least 32 characters")
     handler = ProvisionerHandler
     handler.secret = secret
-    handler.provisioner = DockerProvisioner(Path(os.environ.get("PROVISIONER_STATE", "/state")))
+    handler.provisioner = DockerProvisioner(
+        Path(os.environ.get("PROVISIONER_STATE", "/state")),
+        mysql_image=os.environ.get("MYSQL_IMAGE", "docker.1ms.run/mysql:8.4"),
+    )
     ThreadingHTTPServer(("0.0.0.0", 8080), handler).serve_forever()
 
 

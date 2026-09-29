@@ -30,6 +30,24 @@ class ProvisionerTest(unittest.TestCase):
             DockerProvisioner(Path(temp)).complete("rustdesk-api")
             self.assertFalse(path.exists())
 
+    def test_mysql_uses_configured_accelerated_image(self):
+        payload = [{"NetworkSettings": {"Networks": {"rustdesk-net": {}}}}]
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            if command[:2] == ["docker", "inspect"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+            if command[:3] == ["docker", "exec", "rustdesk-api-mysql"]:
+                return subprocess.CompletedProcess(command, 0, "mysqld is alive", "")
+            return subprocess.CompletedProcess(command, 0, "ok", "")
+
+        with tempfile.TemporaryDirectory() as temp:
+            provisioner = DockerProvisioner(Path(temp), runner, "docker.1ms.run/mysql:8.4")
+            provisioner.create_mysql("rustdesk-api", "a" * 12)
+        run = next(command for command in calls if command[:2] == ["docker", "run"])
+        self.assertEqual(run[-1], "docker.1ms.run/mysql:8.4")
+
 
 if __name__ == "__main__":
     unittest.main()

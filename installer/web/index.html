@@ -23,7 +23,7 @@
         <label>Classic PAT<input name="token" type="password" autocomplete="off" required placeholder="需要 read:packages"></label>
       </div>
       <div class="field-row secondary-fields">
-        <label>install.sh 地址<input name="script_url" type="url" required></label>
+        <label>install.sh 地址（默认 GitHub 加速）<input name="script_url" type="url" required></label>
         <label>外部端口<input name="port" type="number" value="7000" min="1" max="65535" inputmode="numeric" required></label>
       </div>
       <fieldset>
@@ -39,7 +39,7 @@
       <pre><code id="command"></code></pre>
       <p id="history-warning" class="warning">执行成功后建议从 shell history 删除这一条命令。</p>
       <ol>
-        <li>命令自动安装或启动 Docker，并登录私有 GHCR。</li>
+        <li>脚本经 ghfast.top 下载并校验 SHA-256，然后登录私有 GHCR。</li>
         <li>打开命令输出的 <code>/setup</code> 地址。</li>
         <li>选择 SQLite、自动创建 MySQL 8.4，或连接已有 MySQL。</li>
       </ol>

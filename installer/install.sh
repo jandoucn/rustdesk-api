@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 API_IMAGE="${RUSTDESK_API_IMAGE:-ghcr.io/jandoucn/rustdesk-api:latest}"
 PROVISIONER_IMAGE="${RUSTDESK_PROVISIONER_IMAGE:-ghcr.io/jandoucn/rustdesk-api-provisioner:latest}"
+MYSQL_IMAGE="${MYSQL_IMAGE:-docker.1ms.run/mysql:8.4}"
 CONTAINER_NAME="${RUSTDESK_CONTAINER_NAME:-rustdesk-api}"
 PROVISIONER_NAME="${RUSTDESK_PROVISIONER_NAME:-rustdesk-api-provisioner}"
 NETWORK_NAME="${RUSTDESK_NETWORK_NAME:-rustdesk-api-net}"
@@ -96,6 +97,7 @@ else
     --restart unless-stopped \
     --network "$NETWORK_NAME" \
     -e "PROVISIONER_SECRET=$secret" \
+    -e "MYSQL_IMAGE=$MYSQL_IMAGE" \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "$STATE_VOLUME:/state" \
     "$PROVISIONER_IMAGE" >/dev/null
