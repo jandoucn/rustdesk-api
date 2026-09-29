@@ -2,6 +2,20 @@
 
 Updated: 2026-09-29
 
+## RustDesk client source of truth
+
+The authoritative RustDesk client implementation for this project is the locally modified repository at `/Users/olly/github/rustdesk`. Do not infer client behavior from the upstream RustDesk repository, release documentation, or an unmodified client when this local source tree is available.
+
+Before changing API routes, request/response fields, heartbeat, sysinfo, address-book synchronization, device identity, client commands or compatibility behavior:
+
+1. inspect the corresponding implementation in `/Users/olly/github/rustdesk`;
+2. treat the local field names, timing, fallback behavior and configuration semantics as the current contract;
+3. identify whether the change belongs in `rustdesk-api`, the local RustDesk client, or both;
+4. test both repositories when the behavior crosses the client/API boundary;
+5. document any intentional divergence from the local client before release.
+
+Current client sysinfo fields must be derived from `src/common.rs::get_sysinfo` and the upload flow in `src/hbbs_http/sync.rs`, rather than assumed from the Web console schema.
+
 ## Product objective
 
 The management console maintains an operational inventory of every RustDesk client that reports to this API through `/api/heartbeat` or `/api/sysinfo`. A deployment record is optional metadata and must not be required for a device to appear.
