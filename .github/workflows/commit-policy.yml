@@ -1,0 +1,38 @@
+name: 检查中文提交说明
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  commit-message:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 检查提交标题和修改清单
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            range="$BASE_SHA..$HEAD_SHA"
+          elif [[ -n "$BEFORE_SHA" && ! "$BEFORE_SHA" =~ ^0+$ ]]; then
+            range="$BEFORE_SHA..$HEAD_SHA"
+          else
+            range="$HEAD_SHA"
+          fi
+
+          while read -r commit; do
+            message_file="$(mktemp)"
+            git show -s --format=%B "$commit" > "$message_file"
+            echo "检查提交 $commit"
+            scripts/check-commit-message.sh "$message_file"
+          done < <(git rev-list --reverse "$range")
