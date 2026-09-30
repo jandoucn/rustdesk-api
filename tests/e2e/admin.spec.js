@@ -152,14 +152,13 @@ test('client inventory assigns one selected client to a chosen address-book user
   await expect(row).toBeVisible();
   await row.getByRole('checkbox', { name: `选择客户端 ${deviceId}` }).check();
   await page.getByRole('button', { name: /加入通讯录（1）/ }).click();
-  const dialog = page.getByRole('dialog', { name: '加入通讯录' });
+  const dialog = page.getByRole('dialog', { name: '分配通讯录' });
   await expect(dialog).toBeVisible();
   const users = dialog.locator('#assignment-users input[type="checkbox"]');
   await expect(users.first()).toBeVisible();
   await users.first().check();
-  await dialog.getByRole('button', { name: '预览变更' }).click();
-  await expect(page.getByRole('dialog', { name: '预览通讯录变更（尚未提交）' })).toBeVisible();
-  await page.getByRole('dialog', { name: '预览通讯录变更（尚未提交）' }).getByRole('button', { name: '确认应用' }).click();
+  await dialog.getByRole('button', { name: '保存分配' }).click();
+  await expect(page.getByText('通讯录分配已保存')).toBeVisible();
   await expect(row).toContainText('通讯录分配：1 个用户');
   const api = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
   expect(api.data.find(item => item.id === deviceId).address_book_user_ids.length).toBe(1);
@@ -176,23 +175,19 @@ test('client inventory removal clears the address-book UI and client payload', a
   await expect(row).toBeVisible();
   await row.locator('input[type="checkbox"]').check();
   await page.getByRole('button', { name: /加入通讯录（1）/ }).click();
-  const assignment = page.getByRole('dialog', { name: '加入通讯录' });
+  const assignment = page.getByRole('dialog', { name: '分配通讯录' });
   const targetUser = assignment.locator('#assignment-users input[type="checkbox"]').first();
   await targetUser.check();
-  await assignment.getByRole('button', { name: '预览变更' }).click();
-  await page.getByRole('dialog', { name: '预览通讯录变更（尚未提交）' }).getByRole('button', { name: '确认应用' }).click();
+  await assignment.getByRole('button', { name: '保存分配' }).click();
+  await expect(page.getByText('通讯录分配已保存')).toBeVisible();
   await expect(row).toContainText('通讯录分配：1 个用户');
 
   await row.locator('input[type="checkbox"]').check();
   await page.getByRole('button', { name: /加入通讯录（1）/ }).click();
-  const removeDialog = page.getByRole('dialog', { name: '加入通讯录' });
-  await removeDialog.locator('#assignment-mode').selectOption('remove');
-  await removeDialog.getByRole('button', { name: '预览变更' }).click();
-  const removePreview = page.getByRole('dialog', { name: '预览通讯录变更（尚未提交）' });
-  await expect(removePreview).toContainText('将移除：1');
-  const beforeConfirm = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
-  expect(beforeConfirm.data.find(item => item.id === deviceId).address_book_user_ids.length).toBe(1);
-  await removePreview.getByRole('button', { name: '确认应用' }).click();
+  const removeDialog = page.getByRole('dialog', { name: '分配通讯录' });
+  await removeDialog.locator('#assignment-users input[type="checkbox"]').first().uncheck();
+  await removeDialog.getByRole('button', { name: '保存分配' }).click();
+  await expect(page.getByText('通讯录分配已保存')).toBeVisible();
   await expect(row).toContainText('通讯录分配：0 个用户');
 
   await page.goto(`${adminPath}/address-book`);
@@ -239,12 +234,9 @@ test('client inventory previews a multi-device assignment before applying it', a
   await page.locator('#rows tr input[type="checkbox"]').check();
   await expect(page.getByRole('button', { name: /加入通讯录（2）/ })).toBeEnabled();
   await page.getByRole('button', { name: /加入通讯录（2）/ }).click();
-  const assignment = page.getByRole('dialog', { name: '加入通讯录' });
+  const assignment = page.getByRole('dialog', { name: '分配通讯录' });
   await assignment.locator('#assignment-users input[type="checkbox"]').first().check();
-  await assignment.getByRole('button', { name: '预览变更' }).click();
-  const preview = page.getByRole('dialog', { name: '预览通讯录变更（尚未提交）' });
-  await expect(preview).toContainText('新增');
-  await preview.getByRole('button', { name: '确认应用' }).click();
+  await assignment.getByRole('button', { name: '保存分配' }).click();
   await expect(page.getByText('通讯录分配已保存')).toBeVisible();
 });
 

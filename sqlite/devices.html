@@ -77,19 +77,16 @@
       <div class="dialog-actions"><button id="alias-cancel" class="button" type="button">取消</button><button id="alias-save" class="button primary" type="submit" aria-label="保存备注">保存备注</button></div>
     </form>
   </dialog>
-  <dialog id="assignment-preview-dialog" aria-labelledby="assignment-preview-title">
-    <div class="dialog-form"><div class="dialog-head"><h3 id="assignment-preview-title">预览通讯录变更（尚未提交）</h3><p>核对新增、已存在和将移除的分配后，再点击“确认应用”才会真正写入。</p></div><div id="assignment-preview" class="details-grid"></div><p id="assignment-preview-error" class="form-error" role="alert"></p><div class="dialog-actions"><button id="assignment-preview-cancel" class="button" type="button">返回修改</button><button id="assignment-preview-submit" class="button primary" type="button">确认应用</button></div></div>
-  </dialog>
   <dialog id="assignment-dialog" aria-labelledby="assignment-title">
     <form id="assignment-form" class="dialog-form">
-      <div class="dialog-head"><h3 id="assignment-title">加入通讯录</h3><p id="assignment-device">选择目标用户和通讯录操作。</p></div>
+      <div class="dialog-head"><h3 id="assignment-title">分配通讯录</h3><p id="assignment-device">勾选的用户会保留客户端，取消勾选的用户会移除客户端。</p></div>
       <div class="dialog-body">
-        <div class="field"><label for="assignment-mode">操作</label><select id="assignment-mode" class="select"><option value="add">加入所选用户</option><option value="remove">从所选用户移除</option><option value="replace">仅分配给所选用户</option></select></div>
+        <div class="field"><label for="assignment-user-search">搜索用户</label><input id="assignment-user-search" class="input" type="search" placeholder="输入用户名筛选" autocomplete="off"></div>
         <fieldset class="tag-picker"><legend>目标用户</legend><div id="assignment-users" class="tag-options"></div></fieldset>
-        <p class="muted">加入后，目标用户在下次通讯录同步时会收到客户端。移除只影响通讯录，不删除客户端上报和部署记录。</p>
+        <p class="muted">保存后立即同步通讯录关系；移除只影响通讯录，不删除客户端上报和部署记录。</p>
       </div>
       <p id="assignment-error" class="form-error" role="alert"></p>
-      <div class="dialog-actions"><button id="assignment-cancel" class="button" type="button">取消</button><button id="assignment-save" class="button primary" type="submit">预览变更</button></div>
+      <div class="dialog-actions"><button id="assignment-cancel" class="button" type="button">取消</button><button id="assignment-save" class="button primary" type="submit">保存分配</button></div>
     </form>
   </dialog>
   <dialog id="details-dialog" aria-labelledby="details-title">
@@ -139,7 +136,7 @@
       });
     }
     const labels = { online: '在线', recent: '最近在线', offline: '离线', unreported: '未上报' };
-    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, aliasDevice: null, policyDevice: null, timer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [], pendingAssignment: null };
+    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, aliasDevice: null, policyDevice: null, timer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [], assignmentDevices: [] };
 
     async function api(url, options = {}) {
       const headers = new Headers(options.headers || {});
@@ -208,32 +205,15 @@
     function updateSelectAll(devices = visibleDevices()) { const control = $('select-all-devices'); const selected = devices.filter(device => state.selected.has(deviceKey(device))).length; control.checked = devices.length > 0 && selected === devices.length; control.indeterminate = selected > 0 && selected < devices.length; }
     function openAssignment(devices = selectedDevices()) {
       if (!devices.length) return;
-      $('assignment-device').textContent = '已选择 ' + devices.length + ' 台客户端。可批量分配给一个或多个用户。';
-      $('assignment-mode').value = 'add'; $('assignment-error').textContent = '';
-      const assigned = new Set(devices.flatMap(device => Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.map(Number) : []));
+      state.assignmentDevices = devices; $('assignment-device').textContent = '已选择 ' + devices.length + ' 台客户端。勾选保留，取消勾选移除。';
+      $('assignment-error').textContent = ''; $('assignment-user-search').value = '';
       const users = $('assignment-users'); users.replaceChildren();
-      state.assignmentUsers.forEach(user => { const label = document.createElement('label'); label.className = 'check'; const input = document.createElement('input'); input.type = 'checkbox'; input.value = String(user.id); input.checked = assigned.has(Number(user.id)); label.append(input, document.createTextNode(' ' + user.username + (user.is_admin ? '（管理员）' : ''))); users.append(label); });
+      state.assignmentUsers.forEach(user => { const label = document.createElement('label'); label.className = 'check'; label.dataset.username = String(user.username || '').toLowerCase(); const input = document.createElement('input'); input.type = 'checkbox'; input.value = String(user.id); input.checked = devices.every(device => Array.isArray(device.address_book_user_ids) && device.address_book_user_ids.map(Number).includes(Number(user.id))); label.append(input, document.createTextNode(' ' + user.username + (user.is_admin ? '（管理员）' : ''))); users.append(label); });
       $('assignment-dialog').showModal();
-    }
-    function renderAssignmentPreview(data) {
-      const plan = data.plan || data;
-      const body = $('assignment-preview'); body.replaceChildren();
-      [['新增', plan.add], ['已存在', plan.already_assigned], ['将移除', plan.remove], ['跳过', plan.skipped], ['无效', plan.invalid]].forEach(([label, values]) => {
-        const section = document.createElement('section'); section.className = 'details-section';
-        const heading = document.createElement('h4'); heading.textContent = label + '：' + (Array.isArray(values) ? values.length : 0); section.append(heading);
-        if (Array.isArray(values) && values.length) section.append(textLine('details-value', values.slice(0, 10).map(item => typeof item === 'string' ? item : (item.id || item.username || JSON.stringify(item))).join('、')));
-        body.append(section);
-      });
-    }
-    async function previewAssignment(payload) {
-      try {
-        const data = await api('__ADMIN_PATH__/api/devices/address-book/preview', { method: 'POST', body: JSON.stringify(payload) });
-        state.pendingAssignment = payload; renderAssignmentPreview(data); $('assignment-preview-error').textContent = ''; $('assignment-dialog').close(); $('assignment-preview-dialog').showModal();
-      } catch (error) { $('assignment-error').textContent = error.message; }
     }
     async function applyAssignment(payload) {
       await api('__ADMIN_PATH__/api/devices/address-book', { method: 'POST', body: JSON.stringify(payload) });
-      state.selected.clear(); state.pendingAssignment = null; $('assignment-preview-dialog').close(); $('assignment-dialog').close(); await load(); setFeedback('通讯录分配已保存，目标用户将在下次同步时收到更新', 'success'); updateAssignmentButton();
+      state.selected.clear(); state.assignmentDevices = []; $('assignment-dialog').close(); await load(); setFeedback('通讯录分配已保存，目标用户将在下次同步时收到更新', 'success'); updateAssignmentButton();
     }
 
     function detailValue(value) { if (value === undefined || value === null || value === '') return '未上报'; if (typeof value === 'object') { try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); } } return String(value); }
@@ -396,12 +376,12 @@
     $('labelled-only').addEventListener('change', render);
     $('address-book-action').addEventListener('click', () => openAssignment());
     $('select-all-devices').addEventListener('change', event => { visibleDevices().forEach(device => { const key = deviceKey(device); if (event.target.checked) state.selected.set(key, device); else state.selected.delete(key); }); updateAssignmentButton(); render(); });
-    $('assignment-cancel').addEventListener('click', () => $('assignment-dialog').close()); $('assignment-preview-cancel').addEventListener('click', () => { $('assignment-preview-dialog').close(); if (state.pendingAssignment) $('assignment-dialog').showModal(); }); $('assignment-preview-submit').addEventListener('click', async () => { const button = $('assignment-preview-submit'); button.disabled = true; try { await applyAssignment(state.pendingAssignment); } catch (error) { $('assignment-preview-error').textContent = error.message; } finally { button.disabled = false; } });
+    $('assignment-cancel').addEventListener('click', () => $('assignment-dialog').close());
+    $('assignment-user-search').addEventListener('input', event => { const query = event.target.value.trim().toLowerCase(); $('assignment-users').querySelectorAll('label').forEach(label => { label.hidden = query !== '' && !label.dataset.username.includes(query); }); });
     $('assignment-form').addEventListener('submit', async event => {
-      event.preventDefault(); const devices = selectedDevices(); const userIds = Array.from($('assignment-users').querySelectorAll('input:checked')).map(input => Number(input.value));
-      if (!userIds.length) { $('assignment-error').textContent = '至少选择一个目标用户'; return; }
+      event.preventDefault(); const devices = state.assignmentDevices.length ? state.assignmentDevices : selectedDevices(); const userIds = Array.from($('assignment-users').querySelectorAll('input:checked')).map(input => Number(input.value));
       $('assignment-save').disabled = true; $('assignment-error').textContent = '';
-      try { await previewAssignment({ devices: devices.map(device => ({ id: device.id, uuid: device.uuid })), user_ids: userIds, mode: $('assignment-mode').value }); } catch (error) { $('assignment-error').textContent = error.message; } finally { $('assignment-save').disabled = false; updateAssignmentButton(); }
+      try { await applyAssignment({ devices: devices.map(device => ({ id: device.id, uuid: device.uuid })), user_ids: userIds, mode: 'replace' }); } catch (error) { $('assignment-error').textContent = error.message; } finally { $('assignment-save').disabled = false; updateAssignmentButton(); }
     });
     $('auto-refresh').addEventListener('change', () => { setFeedback($('auto-refresh').checked ? '自动刷新已开启，每 5 秒更新' : '自动刷新已暂停', 'success'); });
     document.addEventListener('visibilitychange', () => { if (!document.hidden && $('auto-refresh').checked) load({ quiet: true }); });

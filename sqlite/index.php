@@ -674,9 +674,9 @@ function assignment_peer_payload(PDO $db, string $id, string $uuid): array
         'alias'=>'', 'tags'=>[], 'hash'=>(string)($info['hash'] ?? $deploy['hash'] ?? ''),
     ];
 }
-function normalize_assignment_users(PDO $db, mixed $value): array
+function normalize_assignment_users(PDO $db, mixed $value, bool $allowEmpty = false): array
 {
-    if (!is_array($value) || !array_is_list($value) || count($value) < 1 || count($value) > 100) fail(422, '至少选择一个通讯录用户');
+    if (!is_array($value) || !array_is_list($value) || (!$allowEmpty && count($value) < 1) || count($value) > 100) fail(422, '通讯录用户列表格式错误');
     $ids = [];
     foreach ($value as $raw) {
         if ((is_string($raw) && !ctype_digit($raw)) || (!is_int($raw) && !is_string($raw))) fail(422, '用户 ID 格式错误');
@@ -1195,7 +1195,7 @@ try {
             if ($uuid === '') fail(422, '客户端 UUID 不能为空');
             $key = $id . "\0" . $uuid; $devices[$key] = ['id'=>$id,'uuid'=>$uuid];
         }
-        $users = normalize_assignment_users($db, $d['user_ids'] ?? []);
+        $users = normalize_assignment_users($db, $d['user_ids'] ?? [], $mode === 'replace');
         foreach ($users as $target) assert_address_book_scope($actor, (int)$target['id']);
         if ($mode === 'replace' && (string)($actor['address_book_scope'] ?? 'self') !== 'all') fail(403, '替换分配需要跨用户通讯录权限');
         if ($preview) {
