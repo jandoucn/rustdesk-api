@@ -654,6 +654,9 @@ class IntegrationTest(unittest.TestCase):
             "INSERT OR REPLACE INTO rustdesk_peers(uid,id,username,hostname,alias,platform,tags,hash) VALUES (1,'admin-merged','legacy-user','legacy-host','legacy-alias','linux','legacy-tag','legacy-hash')"
         )
         db.execute(
+            "INSERT OR REPLACE INTO rustdesk_peers(uid,id,username,hostname,alias,platform,tags,hash) VALUES (1,'83077683','numeric-user','numeric-host','numeric-id','linux','','numeric-hash')"
+        )
+        db.execute(
             "INSERT OR REPLACE INTO ab_profile_peers(guid,id,payload,updated_at) VALUES (?,?,?,?)",
             (admin_profile, "admin-profile-only", json.dumps({"id": "admin-profile-only", "alias": "profile-only", "tags": ["profile-tag"], "future": {"keep": 1}}), int(time.time())),
         )
@@ -671,6 +674,8 @@ class IntegrationTest(unittest.TestCase):
         _, listing, _ = self.client.json("GET", "/?s=/ops-x9/api/address-book&page=1&pageSize=200")
         indexed = {peer["id"]: peer for peer in listing["data"]}
         self.assertIn("admin-legacy-only", indexed)
+        self.assertIn("83077683", indexed)
+        self.assertIsInstance(indexed["83077683"]["id"], str)
         self.assertIn("admin-profile-only", indexed)
         self.assertEqual(indexed["admin-merged"]["alias"], "profile-wins")
         self.assertEqual(indexed["admin-merged"]["hostname"], "profile-host")

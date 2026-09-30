@@ -635,6 +635,7 @@ function admin_address_book_state(PDO $db, array $actor, array $profile): array
 
     $favorites = array_fill_keys(array_column(db_all($db, 'SELECT id FROM admin_peer_favorites WHERE uid=:uid', ['uid'=>$actor['id']]), 'id'), true);
     foreach ($peers as $id=>&$peer) {
+        $id = (string)$id;
         $peer['id'] = $id;
         $peer['tags'] = address_book_tags($peer['tags'] ?? []);
         $peer['favorite'] = isset($favorites[$id]);
@@ -796,7 +797,7 @@ try {
         $profile = db_one($db, 'SELECT * FROM ab_profiles WHERE uid=:uid AND personal=1', ['uid'=>$actor['id']]);
         $state = admin_address_book_state($db, $actor, $profile ?? ['guid'=>'']);
         $all = array_values($state['peers']);
-        usort($all, fn($a,$b)=>(int)$b['favorite']<=>(int)$a['favorite'] ?: strnatcasecmp((string)($a['alias'] ?? $a['hostname'] ?? $a['id']), (string)($b['alias'] ?? $b['hostname'] ?? $b['id'])) ?: strcmp($a['id'],$b['id']));
+        usort($all, fn($a,$b)=>(int)$b['favorite']<=>(int)$a['favorite'] ?: strnatcasecmp((string)($a['alias'] ?? $a['hostname'] ?? $a['id']), (string)($b['alias'] ?? $b['hostname'] ?? $b['id'])) ?: strcmp((string)$a['id'], (string)$b['id']));
         $summary = ['total'=>count($all),'favorites'=>0,'labelled'=>0,'tags'=>count($state['tags'])];
         foreach ($all as $peer) {
             if ($peer['favorite']) $summary['favorites']++;
