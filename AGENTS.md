@@ -5,6 +5,7 @@
 - 永远不创建或切换功能分支。
 - 所有提交直接在默认主分支 `main` 上完成。
 - 允许推送时只推送 `origin/main`；不得推送其他分支。
+- 版本发布可以正常创建版本 tag；Release 和 ACR workflow 按项目配置通过 tag 触发。
 
 ## Scope
 
@@ -13,7 +14,7 @@ This repository is a dual-backend RustDesk API and operations console. SQLite an
 ## Git publishing contract
 
 - Local inspection, edits, tests, builds and disposable preview environments may proceed automatically.
-- Never create a Git commit, create or move a tag, create a GitHub Release, or run `git push` unless the user explicitly requests that exact publishing action.
+- Never create a Git commit, create or move a tag, create a GitHub Release, or run `git push` unless the user explicitly requests that exact publishing action. Tags and Releases are valid publishing operations when explicitly requested.
 - Requests to fix, modify, test, build, review, or start the project locally do not imply permission to commit, tag, release, or push.
 - AOCI maintenance is separate from Git publishing. AOCI-managed files may be updated when required by its contract, but they must not be committed or pushed without the same explicit user instruction.
 
