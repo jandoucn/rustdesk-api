@@ -580,7 +580,7 @@ function publish_update_manifest(PDO $db, array $manifest): array
 function record_update_event(PDO $db, array $data): void
 {
     $id=text_field($data,'client_id',128,text_field($data,'id',128)); $uuid=text_field($data,'client_uuid',256,text_field($data,'uuid',256)); $status=text_field($data,'status',32);
-    if($id===''||$uuid===''||!in_array($status,['started','downloaded','installed','failed','rolled_back','rollback_failed'],true))fail(422,'升级事件参数错误');
+    if($id===''||$uuid===''||!in_array($status,['started','downloaded','installed','failed','deferred','rolled_back','rollback_failed'],true))fail(422,'升级事件参数错误');
     db_exec($db,'INSERT INTO device_update_events(device_id,uuid,from_version,to_version,from_build_seq,to_build_seq,status,source,error_code,started_at,finished_at) VALUES(:id,:uuid,:fv,:tv,:fb,:tb,:status,:source,:error,:started,:finished)',['id'=>$id,'uuid'=>$uuid,'fv'=>text_field($data,'from_version',32)?:null,'tv'=>text_field($data,'to_version',32)?:null,'fb'=>array_key_exists('from_build_seq',$data)?(int)$data['from_build_seq']:null,'tb'=>array_key_exists('to_build_seq',$data)?(int)$data['to_build_seq']:null,'status'=>$status,'source'=>text_field($data,'source',64)?:null,'error'=>text_field($data,'error_code',128)?:null,'started'=>(int)($data['started_at']??time()),'finished'=>array_key_exists('finished_at',$data)?(int)$data['finished_at']:null]);
 }
 function sync_admin_device_alias(PDO $db, array $actor, string $id, string $uuid, string $alias): void

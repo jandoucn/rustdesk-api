@@ -472,9 +472,10 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(check["target_build_seq"], 2026100101)
         _, event, _ = self.client.json("POST", "/?s=/rd/update/v1/events", {"client_id": "update-device", "client_uuid": "update-uuid", "status": "installed", "from_version": "1.5.0", "to_version": "1.5.0", "from_build_seq": 1, "to_build_seq": 2026100101}, expected=(201,))
         self.assertTrue(event["ok"])
+        self.client.json("POST", "/?s=/rd/update/v1/events", {"client_id": "update-device", "client_uuid": "update-uuid", "status": "deferred", "to_build_seq": 2026100101, "error_code": "user_deferred"}, expected=(201,))
         self.client.json("POST", "/?s=/rd/update/v1/events", {"client_id": "update-device", "client_uuid": "update-uuid", "status": "rollback_failed", "to_build_seq": 2026100101, "error_code": "restore_failed"}, expected=(201,))
         db = sqlite3.connect(self.db)
-        self.assertEqual(db.execute("SELECT status,error_code FROM device_update_events WHERE device_id='update-device' ORDER BY id").fetchall(), [("installed", None), ("rollback_failed", "restore_failed")])
+        self.assertEqual(db.execute("SELECT status,error_code FROM device_update_events WHERE device_id='update-device' ORDER BY id").fetchall(), [("installed", None), ("deferred", "user_deferred"), ("rollback_failed", "restore_failed")])
         self.assertEqual(db.execute("SELECT COUNT(*) FROM update_releases WHERE channel='stable' AND build_seq=2026100101").fetchone()[0], 1)
         db.close()
 
