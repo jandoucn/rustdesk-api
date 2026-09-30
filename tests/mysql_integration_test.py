@@ -562,13 +562,23 @@ class MySQLIntegrationTest(unittest.TestCase):
 
     def test_19_update_manifest_check_and_event_round_trip(self):
         csrf = self.admin_login()
-        manifest = {"product": "rustdesk-yan", "edition": "custom", "targets": {"windows-x64-exe": {"primary": "https://rdapi.yan.life/update/files/stable/1.5.0/rustdesk.exe", "size": 12, "sha256": "abc", "signature": "sig"}}}
-        _, published, _ = self.client.json("POST", "/ops-x9/api/update/releases", {"version": "1.5.0", "build_seq": 2026100101, "channel": "stable", "manifest": manifest}, {"X-CSRF-Token": csrf}, expected=(201,))
+        target = {"primary": "https://download.yan.life/rustdesk/stable/v1.5.0-build-2026.10.01-01/rustdesk-1.5.0-custom-windows-x86_64.exe", "mirrors": [], "size": 12, "sha256": "b" * 64, "signature": base64.b64encode(b"t" * 64).decode(), "signature_key_id": "yan-release-2026"}
+        manifest = {"product": "rustdesk-yan", "edition": "custom", "source_commit": "admin-commit", "targets": {"windows-x86_64-exe-custom": target}}
+        payload = {"version": "1.5.0", "build_seq": 2026100101, "channel": "stable", "manifest": manifest}
+        _, published, _ = self.client.json("POST", "/ops-x9/api/update/releases", payload, {"X-CSRF-Token": csrf}, expected=(201,))
         self.assertEqual(published["build_seq"], 2026100101)
+        self.assertTrue(self.client.json("POST", "/ops-x9/api/update/releases", payload, {"X-CSRF-Token": csrf}, expected=(201,))[1]["idempotent"])
+        conflict = json.loads(json.dumps(payload)); conflict["manifest"]["source_commit"] = "different-admin-commit"
+        self.client.json("POST", "/ops-x9/api/update/releases", conflict, {"X-CSRF-Token": csrf}, expected=(409,))
+        rollback = json.loads(json.dumps(payload)); rollback["version"] = "1.4.9"; rollback["build_seq"] = 2026100100
+        self.client.json("POST", "/ops-x9/api/update/releases", rollback, {"X-CSRF-Token": csrf}, expected=(409,))
+        invalid = json.loads(json.dumps(payload)); invalid["manifest"]["targets"]["windows-x86_64-exe-custom"]["sha256"] = "bad"
+        self.client.json("POST", "/ops-x9/api/update/releases", invalid, {"X-CSRF-Token": csrf}, expected=(422,))
         _, check, _ = self.client.json("POST", "/rd/update/v1/check", {"client_id": "mysql-update-device", "client_uuid": "mysql-update-uuid", "product": "rustdesk-yan", "edition": "custom", "version": "1.5.0", "build_seq": 1, "channel": "stable"})
         self.assertTrue(check["update_available"])
         self.client.json("POST", "/rd/update/v1/events", {"client_id": "mysql-update-device", "client_uuid": "mysql-update-uuid", "status": "installed", "to_build_seq": 2026100101}, expected=(201,))
         self.assertEqual(self.sql("SELECT status,to_build_seq FROM device_update_events WHERE device_id='mysql-update-device'"), ["installed\t2026100101"])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM update_releases WHERE channel='stable' AND build_seq=2026100101"), ["1"])
 
     def test_19b_machine_publish_and_platform_selection(self):
         tag = "v1.5.0-build-2026.09.30-01"

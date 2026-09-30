@@ -1121,8 +1121,8 @@ try {
     if ($adminApi && $path === '/admin/api/update/releases') {
         $actor=admin_user($db);
         if($_SERVER['REQUEST_METHOD']==='GET'){ $rows=db_all($db,'SELECT version,build_seq,channel,published_at,active FROM update_releases ORDER BY published_at DESC'); reply(['data'=>array_map(static fn($row)=>['version'=>$row['version'],'build_seq'=>(int)$row['build_seq'],'channel'=>$row['channel'],'published_at'=>(int)$row['published_at'],'active'=>(bool)$row['active']],$rows)]); }
-        method('POST'); csrf_check(); $d=json_body(); $version=text_field($d,'version',32); $build=(int)($d['build_seq']??0); $channel=text_field($d,'channel',32,'stable'); if(version_tuple($version)===[0,0,0]||$build<1)fail(422,'发布版本参数错误'); if(!isset($d['manifest'])||!is_array($d['manifest']))fail(422,'manifest 必须是 JSON 对象'); $manifest=$d['manifest']; $manifest['version']=$version; $manifest['build_seq']=$build; $manifest['channel']=$channel;
-        db_upsert($db,'update_releases',['version'=>$version,'build_seq'=>$build,'channel'=>$channel,'manifest'=>json_encode($manifest,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR),'published_at'=>time(),'active'=>1],['version','build_seq','channel'],['manifest','published_at','active']); admin_event($db,(int)$actor['id'],'publish_update',0); reply(['ok'=>true,'version'=>$version,'build_seq'=>$build,'channel'=>$channel],201);
+        method('POST'); csrf_check(); $d=json_body(); if(!isset($d['manifest'])||!is_array($d['manifest']))fail(422,'manifest 必须是 JSON 对象'); $manifest=$d['manifest']; $manifest['version']=text_field($d,'version',32); $manifest['build_seq']=$d['build_seq']??0; $manifest['channel']=text_field($d,'channel',32,'stable');
+        $published=publish_update_manifest($db,$manifest); admin_event($db,(int)$actor['id'],'publish_update',0); reply($published,201);
     }
     if ($adminApi && preg_match('#^/admin/api/update/policies(?:/([^/]+))?$#',$path,$match)) {
         $actor=admin_user($db); $id=isset($match[1])?rawurldecode($match[1]):'';
