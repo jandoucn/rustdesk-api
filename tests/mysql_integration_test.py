@@ -577,7 +577,8 @@ class MySQLIntegrationTest(unittest.TestCase):
         _, check, _ = self.client.json("POST", "/rd/update/v1/check", {"client_id": "mysql-update-device", "client_uuid": "mysql-update-uuid", "product": "rustdesk-yan", "edition": "custom", "version": "1.5.0", "build_seq": 1, "channel": "stable"})
         self.assertTrue(check["update_available"])
         self.client.json("POST", "/rd/update/v1/events", {"client_id": "mysql-update-device", "client_uuid": "mysql-update-uuid", "status": "installed", "to_build_seq": 2026100101}, expected=(201,))
-        self.assertEqual(self.sql("SELECT status,to_build_seq FROM device_update_events WHERE device_id='mysql-update-device'"), ["installed\t2026100101"])
+        self.client.json("POST", "/rd/update/v1/events", {"client_id": "mysql-update-device", "client_uuid": "mysql-update-uuid", "status": "rollback_failed", "to_build_seq": 2026100101, "error_code": "restore_failed"}, expected=(201,))
+        self.assertEqual(self.sql("SELECT status,COALESCE(error_code,'') FROM device_update_events WHERE device_id='mysql-update-device' ORDER BY id"), ["installed\t", "rollback_failed\trestore_failed"])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM update_releases WHERE channel='stable' AND build_seq=2026100101"), ["1"])
 
     def test_19b_machine_publish_and_platform_selection(self):
