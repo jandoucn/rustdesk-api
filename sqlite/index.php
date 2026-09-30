@@ -1195,7 +1195,7 @@ try {
         if ($preview) {
             $snapshot=[]; $add=[]; $already=[]; $remove=[]; $skipped=[]; $invalid=[];
             foreach ($devices as $device) foreach ($users as $target) {
-                $exists = db_one($db, 'SELECT p.id FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=:uid AND a.personal=1 AND p.id=:id', ['uid'=>$target['id'],'id'=>$device['id']]);
+                $exists = db_one($db, 'SELECT p.id FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=:uid AND a.personal=1 AND p.id=:id UNION SELECT id FROM rustdesk_peers WHERE uid=:uid AND id=:id', ['uid'=>$target['id'],'id'=>$device['id']]);
                 if (!db_one($db, 'SELECT id FROM device_reports WHERE id=:id AND uuid=:uuid UNION SELECT id FROM device_deployments WHERE id=:id AND uuid=:uuid', ['id'=>$device['id'],'uuid'=>$device['uuid']])) { $invalid[]=['id'=>$device['id'],'uuid'=>$device['uuid'],'user_id'=>(int)$target['id'],'type'=>'device_missing']; continue; }
                 $entry=['id'=>$device['id'],'uuid'=>$device['uuid'],'user_id'=>(int)$target['id'],'assigned'=>(bool)$exists]; $snapshot[]=$entry;
                 if ($mode === 'remove') { if ($exists) $remove[]=$entry; else $skipped[]=$entry; }
@@ -1204,7 +1204,7 @@ try {
             if ($mode === 'replace') {
                 foreach ($devices as $device) foreach (assignment_users($db) as $target) {
                     if (in_array((int)$target['id'], array_map(static fn($u)=>(int)$u['id'],$users), true)) continue;
-                    $exists=db_one($db,'SELECT p.id FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=:uid AND a.personal=1 AND p.id=:id',['uid'=>$target['id'],'id'=>$device['id']]);
+                    $exists=db_one($db,'SELECT p.id FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=:uid AND a.personal=1 AND p.id=:id UNION SELECT id FROM rustdesk_peers WHERE uid=:uid AND id=:id',['uid'=>$target['id'],'id'=>$device['id']]);
                     if ($exists) $remove[]=['id'=>$device['id'],'uuid'=>$device['uuid'],'user_id'=>(int)$target['id'],'assigned'=>true];
                 }
             }
@@ -1305,6 +1305,10 @@ try {
             $addressBookAssignments=[];
             foreach(db_all($db,'SELECT p.id,a.uid FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.personal=1') as $assignment){
                 $addressBookAssignments[(string)$assignment['id']][]=(int)$assignment['uid'];
+            }
+            foreach(db_all($db,'SELECT id,uid FROM rustdesk_peers') as $assignment){
+                $key=(string)$assignment['id']; $uid=(int)$assignment['uid'];
+                if (!isset($addressBookAssignments[$key]) || !in_array($uid,$addressBookAssignments[$key],true)) $addressBookAssignments[$key][]=$uid;
             }
             foreach ($addressBookAssignments as &$assignedUsers) sort($assignedUsers, SORT_NUMERIC);
             unset($assignedUsers);

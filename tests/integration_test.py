@@ -1027,6 +1027,28 @@ class IntegrationTest(unittest.TestCase):
         }, {"X-CSRF-Token": csrf})
         db = sqlite3.connect(self.db)
         self.assertEqual(db.execute("SELECT uid FROM rustdesk_peers WHERE id=?", (device_id,)).fetchall(), [(1,)])
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=2 AND a.personal=1 AND p.id=?", (device_id,)).fetchone()[0], 0)
+        book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=2").fetchone()[0])
+        self.assertNotIn(device_id, {peer.get("id") for peer in book.get("peers", [])})
+        db.close()
+        user_two_auth = self.rust_login("legacy", "legacy123", "assignable-readback-user")
+        _, client_book, _ = self.client.json("GET", "/?s=/api/ab", None, user_two_auth)
+        self.assertNotIn(device_id, {peer.get("id") for peer in json.loads(client_book["data"]).get("peers", [])})
+
+    def test_assignment_remove_preview_and_apply_clears_all_address_book_stores(self):
+        csrf = self.admin_csrf()
+        device_id, uuid_value = "remove-all-stores", "remove-all-stores-uuid"
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": uuid_value, "ver": 11, "conns": []})
+        self.client.json("POST", "/?s=/api/sysinfo", {"id": device_id, "uuid": uuid_value, "hostname": "remove-host"})
+        self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {"devices":[{"id":device_id,"uuid":uuid_value}],"user_ids":[1],"mode":"add"}, {"X-CSRF-Token":csrf})
+        _, preview, _ = self.client.json("POST", "/?s=/ops-x9/api/devices/address-book/preview", {"devices":[{"id":device_id,"uuid":uuid_value}],"user_ids":[1],"mode":"remove"}, {"X-CSRF-Token":csrf})
+        self.assertEqual(len(preview["plan"]["remove"]), 1)
+        self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {"devices":[{"id":device_id,"uuid":uuid_value}],"user_ids":[1],"mode":"remove"}, {"X-CSRF-Token":csrf})
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM rustdesk_peers WHERE uid=1 AND id=?", (device_id,)).fetchone()[0], 0)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=1 AND a.personal=1 AND p.id=?", (device_id,)).fetchone()[0], 0)
+        book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=1").fetchone()[0])
+        self.assertNotIn(device_id, {peer.get("id") for peer in book.get("peers", [])})
         db.close()
 
     def test_27_sysinfo_recursively_preserves_unknown_json_and_refreshes_ip_geo_together(self):

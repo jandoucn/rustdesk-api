@@ -302,7 +302,7 @@
       row.replaceChildren(); row.dataset.deviceId = device.id; row.dataset.deviceKey = deviceKey(device);
       const selectCell = appendCell(row, '选择'); const select = document.createElement('input'); select.type = 'checkbox'; select.checked = state.selected.has(deviceKey(device)); select.setAttribute('aria-label', '选择客户端 ' + device.id); select.addEventListener('change', () => { if (select.checked) state.selected.set(deviceKey(device), device); else state.selected.delete(deviceKey(device)); updateAssignmentButton(); }); selectCell.append(select);
       const primary = appendCell(row, '客户端', 'primary-cell'); primary.append(textLine('cell-title device-name', device.hostname || device.id || '未知客户端')); primary.append(textLine('cell-subtitle device-id', device.id));
-      const aliasCell = appendCell(row, '备注'); const alias = String(device.alias || '').trim(); aliasCell.append(textLine(alias ? 'cell-title' : 'alias-empty', alias || '未备注')); if (device.deployed || device.owner_username || device.deployment_owner) aliasCell.append(textLine('cell-subtitle', '当前归属：' + (device.owner_username || device.deployment_owner || '已登记'))); const assignedCount = Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.length : 0; aliasCell.append(textLine('cell-subtitle', assignedCount ? '通讯录分配：' + assignedCount + ' 个用户' : '通讯录分配：无'));
+      const aliasCell = appendCell(row, '备注'); const alias = String(device.alias || '').trim(); aliasCell.append(textLine(alias ? 'cell-title' : 'alias-empty', alias || '未备注')); if (device.deployed || device.owner_username || device.deployment_owner) aliasCell.append(textLine('cell-subtitle', '当前归属：' + (device.owner_username || device.deployment_owner || '已登记'))); const assignedCount = Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.length : 0; aliasCell.append(textLine('cell-subtitle', '通讯录分配：' + assignedCount + ' 个用户'));
       const platformCell = appendCell(row, '版本 / 发行形态'); platformCell.append(textLine('cell-title release-title', [platformLabel(device.platform), distributionLabel(device.distribution)].join(' · '))); platformCell.append(textLine('cell-subtitle version-text', '客户端：' + (device.version || '未上报') + ' · 运行：' + installModeLabel(device.install_mode)));
       const networkCell = appendCell(row, '网络'); networkCell.append(textLine('cell-title network-ip', device.public_ip || '公网 IP 未上报')); const location = geoLabel(device.geo); if (location) networkCell.append(textLine('cell-subtitle network-location', location));
       const statusCell = appendCell(row, '状态'); const currentPresence = presence(device); const badge = document.createElement('span'); badge.className = 'status-badge ' + currentPresence; badge.append(textLine('status-dot ' + currentPresence, ''), document.createTextNode(labels[currentPresence])); statusCell.append(badge);
@@ -358,7 +358,10 @@
           page += 1;
         } while (devices.length < total);
         state.devices = devices;
-        const available = new Map(devices.map(device => [deviceKey(device), device])); state.selected.forEach((_, key) => { if (!available.has(key)) state.selected.delete(key); });
+        // Keep selections across search/filter refreshes so a batch can be built from multiple result sets.
+        // The apply endpoint remains authoritative for stale or missing device identities.
+        const available = new Map(devices.map(device => [deviceKey(device), device]));
+        state.selected.forEach((device, key) => { if (available.has(key)) state.selected.set(key, available.get(key)); });
         state.total = total || devices.length;
         state.lastUpdated = Date.now();
         render();

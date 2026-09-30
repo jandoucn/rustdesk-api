@@ -165,6 +165,46 @@ test('client inventory assigns one selected client to a chosen address-book user
   expect(api.data.find(item => item.id === deviceId).address_book_user_ids.length).toBe(1);
 });
 
+test('client inventory removal clears the address-book UI and client payload', async ({ page, request }) => {
+  const deviceId = `browser-remove-${Date.now().toString(36)}`;
+  await reportClient(request, deviceId, `${deviceId}-host`);
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  await expect(row).toBeVisible();
+  await row.locator('input[type="checkbox"]').check();
+  await page.getByRole('button', { name: /加入通讯录（1）/ }).click();
+  const assignment = page.getByRole('dialog', { name: '加入通讯录' });
+  const targetUser = assignment.locator('#assignment-users input[type="checkbox"]').first();
+  await targetUser.check();
+  await assignment.getByRole('button', { name: '应用操作' }).click();
+  await page.getByRole('dialog', { name: '确认通讯录变更' }).getByRole('button', { name: '确认应用' }).click();
+  await expect(row).toContainText('通讯录分配：1 个用户');
+
+  await row.locator('input[type="checkbox"]').check();
+  await page.getByRole('button', { name: /加入通讯录（1）/ }).click();
+  const removeDialog = page.getByRole('dialog', { name: '加入通讯录' });
+  await removeDialog.locator('#assignment-mode').selectOption('remove');
+  await removeDialog.getByRole('button', { name: '应用操作' }).click();
+  const removePreview = page.getByRole('dialog', { name: '确认通讯录变更' });
+  await expect(removePreview).toContainText('将移除：1');
+  await removePreview.getByRole('button', { name: '确认应用' }).click();
+  await expect(row).toContainText('通讯录分配：0 个用户');
+
+  await page.goto(`${adminPath}/address-book`);
+  await page.locator('#address-search').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  await expect(page.locator(`[data-peer-id="${deviceId}"]`)).toHaveCount(0);
+  const api = await page.evaluate(async ({ adminPath, deviceId }) => {
+    const response = await fetch(`${adminPath}/api/address-book/peers?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`);
+    return response.json();
+  }, { adminPath, deviceId });
+  const peers = Array.isArray(api.data) ? api.data : (Array.isArray(api.peers) ? api.peers : []);
+  expect(peers.some(item => item.id === deviceId)).toBeFalsy();
+});
+
 test('client inventory exposes advanced filters, ownership split and assignment preview', async ({ page, request }) => {
   const deviceId = `advanced-${Date.now().toString(36)}`;
   await reportRichClient(request, deviceId);
