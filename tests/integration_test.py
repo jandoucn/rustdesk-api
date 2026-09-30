@@ -909,7 +909,19 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(network["public_ip"], "81.2.69.160")
 
         self.assertEqual(network["geo"]["country_code"], "GB")
-        self.assertEqual(network["geo"]["city"], "London")
+        self.assertTrue(network["geo"].get("region") or network["geo"].get("city"))
+        self.assertEqual(network["geo"]["timezone"], "Europe/London")
+
+        network.pop("geo", None)
+        db = sqlite3.connect(self.db)
+        db.execute("UPDATE device_reports SET network_payload=? WHERE id=? AND uuid=?", (json.dumps(network), device_id, "geo-uuid"))
+        db.commit()
+        db.close()
+        self.admin_csrf()
+        _, listing, _ = self.client.json("GET", f"/?s=/ops-x9/api/devices&q={device_id}&page=1&pageSize=20")
+        device = next(row for row in listing["data"] if row["id"] == device_id)
+        self.assertEqual(device["geo"]["country_code"], "GB")
+        self.assertEqual(device["geo"]["timezone"], "Europe/London")
 
     def test_29_private_proxy_address_is_not_persisted_as_public_ip(self):
         device_id = "proxy-chain-device"

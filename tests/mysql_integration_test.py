@@ -525,6 +525,12 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.assertEqual(legacy["public_ip"], "")
         self.assertEqual(legacy["geo"], [])
 
+        self.sql("UPDATE device_reports SET network_payload=JSON_OBJECT('public_ip','81.2.69.160') WHERE id='mysql-proxy-chain' AND uuid='mysql-proxy-uuid'")
+        _, listing, _ = self.client.json("GET", "/ops-x9/api/devices?q=mysql-proxy-chain&page=1&pageSize=20")
+        enriched = next(row for row in listing["data"] if row["id"] == "mysql-proxy-chain")
+        self.assertEqual(enriched["geo"]["country_code"], "GB")
+        self.assertEqual(enriched["geo"]["timezone"], "Europe/London")
+
 
 if __name__ == "__main__":
     unittest.main()

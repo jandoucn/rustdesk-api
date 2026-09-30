@@ -83,9 +83,12 @@ Unknown fields, tags, peer metadata and other address-book entries must be prese
 - Alias editing has explicit save/cancel/error/success states.
 - Refresh preserves active filters and does not replace the page.
 - The network cell shows GeoLite location below the public IP. Mainland China omits the country name; foreign locations retain it; duplicate region/city names appear once.
+- The inventory row shows the RustDesk device ID but not the internal UUID. UUID remains available in the details dialog and API because `(id, uuid)` is the storage identity.
+- `desktop` distribution is presented as `安装版`. Device, release and network typography must preserve a clear primary/secondary hierarchy instead of rendering every value at the same weight.
+- Existing reports that contain a valid public IP but predate GeoLite enrichment receive region and timezone data when the inventory is read; the list and details dialog use the same Geo object.
 - The Linux Engine installer forwards `RUSTDESK_TRUSTED_PROXY_IPS`. When the variable is unset, it discovers and uses the current bridge network's exact gateway IP; an explicitly empty value disables forwarded-header trust. Docker Desktop, rootless Docker and direct Compose deployments must set the observed proxy source IP or a deliberately chosen CIDR explicitly.
 - `X-Forwarded-For` is read only when the direct peer matches a trusted proxy rule. The chain is peeled from right to left across trusted hops; `X-Real-IP` is only a fallback when no valid forwarded chain exists. Only globally reachable unicast addresses suitable for GeoIP are stored; private, shared, protocol-assignment, documentation, benchmarking, multicast and reserved ranges remain unknown.
-- The installer can mount a host MMDB read-only through `RUSTDESK_GEOIP_SOURCE`.
+- The image contains a GeoLite2 seed database. On first start it is copied to `/var/www/data/GeoLite2-City.mmdb` in the persistent data volume; existing volume data is never overwritten by an image upgrade. `RUSTDESK_GEOIP_SOURCE` imports a custom MMDB into that same persistent path.
 - Layouts at 320, 390, 768, 1024 and 1440 pixels have no page-level horizontal overflow.
 
 ## Required tests

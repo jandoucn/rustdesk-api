@@ -3,3 +3,4 @@
 # (the Windows default) that would otherwise mark the whole tree stale.
 # Binaries are auto-detected and left untouched.
 * text=auto eol=lf
+*.mmdb binary

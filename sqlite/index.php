@@ -73,21 +73,24 @@ function request_public_ip(): string
 }
 function public_ip_geo(string $ip): array
 {
+    static $readers = [], $cache = [];
     $database = (string)(getenv('RUSTDESK_GEOIP_DATABASE') ?: '/var/www/data/GeoLite2-City.mmdb');
     if ($ip === '' || !is_file($database) || !class_exists('MaxMind\\Db\\Reader')) return [];
     if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return [];
+    $cacheKey = $database."\0".$ip;
+    if (array_key_exists($cacheKey, $cache)) return $cache[$cacheKey];
     try {
-        $reader = new MaxMind\Db\Reader($database); $record = $reader->get($ip); $reader->close();
-        if (!is_array($record)) return [];
+        $reader = $readers[$database] ??= new MaxMind\Db\Reader($database); $record = $reader->get($ip);
+        if (!is_array($record)) return $cache[$cacheKey] = [];
         $name = static fn($node) => is_array($node) ? (string)($node['names']['zh-CN'] ?? $node['names']['en'] ?? '') : '';
         $location = is_array($record['location'] ?? null) ? $record['location'] : [];
         $subdivision = is_array($record['subdivisions'][0] ?? null) ? $record['subdivisions'][0] : [];
-        return array_filter([
+        return $cache[$cacheKey] = array_filter([
             'country_code'=>(string)($record['country']['iso_code'] ?? ''),'country'=>$name($record['country'] ?? []),
             'region_code'=>(string)($subdivision['iso_code'] ?? ''),'region'=>$name($subdivision),'city'=>$name($record['city'] ?? []),
             'timezone'=>(string)($location['time_zone'] ?? ''),'latitude'=>$location['latitude'] ?? null,'longitude'=>$location['longitude'] ?? null,
         ], static fn($value) => $value !== '' && $value !== null);
-    } catch (Throwable $error) { error_log('GeoLite lookup failed: '.$error->getMessage()); return []; }
+    } catch (Throwable $error) { error_log('GeoLite lookup failed: '.$error->getMessage()); return $cache[$cacheKey] = []; }
 }
 function merge_json_objects(array $existing, array $incoming): array
 {
@@ -929,7 +932,11 @@ try {
                 $report=decoded_payload($reportRow['payload']); $deploy=decoded_payload($deployment['payload']??null);
                 $runtime=decoded_payload($reportRow['runtime_payload']??null); $network=decoded_payload($reportRow['network_payload']??null);
                 $publicIp=is_public_ip((string)($network['public_ip']??''))?(string)$network['public_ip']:'';
-                $publicGeo=$publicIp!==''&&is_array($network['geo']??null)?$network['geo']:[];
+                $publicGeo=[];
+                if($publicIp!==''){
+                    $storedGeo=$network['geo']??null;
+                    $publicGeo=is_array($storedGeo)&&$storedGeo!==[]?$storedGeo:public_ip_geo($publicIp);
+                }
                 $aliasEntry=$aliases[$reportRow['id']]??null; $lastHeartbeat=(int)$reportRow['last_heartbeat'];
                 $inventory[]=['id'=>$reportRow['id'],'uuid'=>$reportRow['uuid'],'owner_id'=>$deployment&&$deployment['uid']!==null?(int)$deployment['uid']:null,
                     'hostname'=>$report['hostname']??($deploy['device_name']??''),'username'=>$report['username']??($deploy['device_username']??''),

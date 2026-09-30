@@ -223,7 +223,7 @@ Windows · SOS · 1.5.0
 data/GeoLite2-City.mmdb
 ```
 
-容器通过只读挂载使用，生产环境不依赖 `/root/next-terminal/data/GeoLite2-City.mmdb`。保存：
+镜像携带一份只读种子，容器首次启动时自动复制到持久卷的 `/var/www/data/GeoLite2-City.mmdb`；镜像升级不覆盖数据卷中已有版本。生产环境不依赖 `/root/next-terminal/data/GeoLite2-City.mmdb`。保存：
 
 - country_code
 - country_name

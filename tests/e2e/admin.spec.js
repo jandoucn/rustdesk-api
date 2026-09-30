@@ -157,6 +157,8 @@ test('client inventory keeps runtime and network details aligned with persisted 
   const row = page.locator(`[data-device-id="${deviceId}"]`);
   await expect(row).toContainText('SOS');
   await expect(row).toContainText('1.5.0');
+  await expect(row).not.toContainText(`${deviceId}-uuid`);
+  await expect(row).not.toContainText('UUID');
   await expect(row).not.toContainText('个内网地址');
   await row.getByRole('button', { name: '查看客户端详情' }).click();
   await expect(page.locator('#details-dialog')).toContainText('Windows');
@@ -212,14 +214,56 @@ test('client inventory formats domestic and foreign IP locations without repeati
   await expect(row.getByText('上海', { exact: true })).toBeVisible();
   await expect(row).not.toContainText('上海 · 上海');
 
-  const london = { public_ip: '81.2.69.160', geo: { country_code: 'GB', country: '英国', region: 'England', city: 'London' } };
+  const london = { public_ip: '81.2.69.160', geo: { country_code: 'GB', country: '英国', region: 'England', city: 'London', timezone: 'Europe/London' } };
   expect(persistNetworkPayload(deviceId, uuid, london)).toEqual(london);
   await page.locator('#refresh').click();
   await expect(row).toContainText('英国 · England · London');
   await row.getByRole('button', { name: '查看客户端详情' }).click();
   await expect(page.locator('#details-dialog')).toContainText('英国 · England · London');
+  await expect(page.locator('#details-dialog')).toContainText('Europe/London');
   api = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
   expect(api.data.find(item => item.id === deviceId).geo).toEqual(london.geo);
+});
+
+test('desktop release renders as installed and keeps UUID out of the inventory row', async ({ page, request }) => {
+  const deviceId = `desktop-release-${Date.now().toString(36)}`;
+  const uuid = `${deviceId}-internal-uuid`;
+  await expect((await request.post('/api/heartbeat', { data: { id: deviceId, uuid, ver: 150, conns: [] } })).ok()).toBeTruthy();
+  await expect((await request.post('/api/sysinfo', { data: {
+    id: deviceId, uuid, hostname: 'desktop-release-host', platform: 'windows', os: 'Windows 11',
+    version: '1.5.0', distribution: 'desktop',
+  } })).ok()).toBeTruthy();
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  await expect(row).toContainText('Windows · 安装版');
+  await expect(row).toContainText(deviceId);
+  await expect(row).not.toContainText(uuid);
+  await expect(row).not.toContainText('UUID');
+});
+
+test('inventory backfills GeoLite region and timezone for a stored public IP', async ({ page, request }) => {
+  test.skip(!process.env.RUSTDESK_API_CONTAINER, 'requires the real MMDB in the API container');
+  const deviceId = `geo-backfill-${Date.now().toString(36)}`;
+  const uuid = `${deviceId}-uuid`;
+  await reportClient(request, deviceId);
+  expect(persistNetworkPayload(deviceId, uuid, { public_ip: '81.2.69.160' })).toEqual({ public_ip: '81.2.69.160' });
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  await expect(row).toContainText('81.2.69.160');
+  await expect(row.locator('.network-location')).not.toBeEmpty();
+  const api = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
+  const device = api.data.find(item => item.id === deviceId);
+  expect(device.geo.country_code).toBe('GB');
+  expect(device.geo.timezone).toBe('Europe/London');
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  await expect(page.locator('#details-dialog')).toContainText('Europe/London');
+  await expect(page.locator('#details-dialog').getByText('地区', { exact: true })).toBeVisible();
 });
 
 test('client inventory keeps delimiter-bearing composite identities distinct across refresh', async ({ page, request }) => {

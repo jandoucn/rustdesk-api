@@ -142,7 +142,7 @@
 
     function detailValue(value) { return value === undefined || value === null || value === '' ? '未上报' : String(value); }
     function platformLabel(value) { const key = String(value || '').toLowerCase(); return key.startsWith('windows') ? 'Windows' : key.startsWith('android') ? 'Android' : key.startsWith('ios') ? 'iOS' : key.startsWith('mac') ? 'macOS' : key.startsWith('linux') ? 'Linux' : detailValue(value); }
-    function distributionLabel(value) { const key = String(value || '').toLowerCase(); return ({ sos: 'SOS', portable: '便携版', installed: '安装版', msi: 'MSI', appimage: 'AppImage', mobile: '移动端' })[key] || (key ? value : '未声明'); }
+    function distributionLabel(value) { const key = String(value || '').toLowerCase(); return ({ desktop: '安装版', sos: 'SOS', portable: '便携版', installed: '安装版', msi: 'MSI', appimage: 'AppImage', mobile: '移动端', linux_package: '软件包', live: '临时运行' })[key] || (key && key !== 'unknown' ? value : '未声明'); }
     function geoLabel(geo = {}) {
       const country = String(geo.country || '').trim();
       const countryCode = String(geo.country_code || '').trim().toUpperCase();
@@ -167,11 +167,10 @@
 
     function renderDevice(device, row) {
       row.replaceChildren(); row.dataset.deviceId = device.id; row.dataset.deviceKey = deviceKey(device);
-      const primary = appendCell(row, '客户端', 'primary-cell'); primary.append(textLine('cell-title', device.hostname || device.id || '未知客户端')); primary.append(textLine('cell-subtitle mono', device.id));
-      if (device.uuid) primary.append(textLine('cell-subtitle mono', 'UUID ' + device.uuid));
+      const primary = appendCell(row, '客户端', 'primary-cell'); primary.append(textLine('cell-title device-name', device.hostname || device.id || '未知客户端')); primary.append(textLine('cell-subtitle device-id', device.id));
       const aliasCell = appendCell(row, '备注'); const alias = String(device.alias || '').trim(); aliasCell.append(textLine(alias ? 'cell-title' : 'alias-empty', alias || '未备注')); if (device.deployed) aliasCell.append(textLine('cell-subtitle', '已部署登记'));
-      const platformCell = appendCell(row, '版本 / 发行形态'); platformCell.append(textLine('cell-title', [platformLabel(device.platform), distributionLabel(device.distribution)].join(' · '))); platformCell.append(textLine('cell-subtitle', device.version || '版本未上报'));
-      const networkCell = appendCell(row, '网络'); networkCell.append(textLine('cell-title mono', device.public_ip || '公网 IP 未上报')); const location = geoLabel(device.geo); if (location) networkCell.append(textLine('cell-subtitle', location));
+      const platformCell = appendCell(row, '版本 / 发行形态'); platformCell.append(textLine('cell-title release-title', [platformLabel(device.platform), distributionLabel(device.distribution)].join(' · '))); platformCell.append(textLine('cell-subtitle version-text', device.version || '版本未上报'));
+      const networkCell = appendCell(row, '网络'); networkCell.append(textLine('cell-title network-ip', device.public_ip || '公网 IP 未上报')); const location = geoLabel(device.geo); if (location) networkCell.append(textLine('cell-subtitle network-location', location));
       const statusCell = appendCell(row, '状态'); const currentPresence = presence(device); const badge = document.createElement('span'); badge.className = 'status-badge ' + currentPresence; badge.append(textLine('status-dot ' + currentPresence, ''), document.createTextNode(labels[currentPresence])); statusCell.append(badge);
       const activity = appendCell(row, '最近活动'); const timestamp = activityAt(device); activity.append(textLine('cell-title', relativeTime(timestamp))); if (timestamp) activity.append(textLine('cell-subtitle', new Date(timestamp * 1000).toLocaleString()));
       const actionCell = appendCell(row, '操作', 'actions-cell'); const actions = document.createElement('div'); actions.className = 'row-actions'; const detailButton = document.createElement('button'); detailButton.className = 'button small'; detailButton.type = 'button'; detailButton.textContent = '详情'; detailButton.setAttribute('aria-label', '查看客户端详情'); detailButton.onclick = () => openDetails(device); const aliasButton = document.createElement('button'); aliasButton.className = 'button small'; aliasButton.type = 'button'; aliasButton.textContent = '编辑备注'; aliasButton.setAttribute('aria-label', '编辑备注'); aliasButton.onclick = () => openAlias(device); const removeButton = document.createElement('button'); removeButton.className = 'button small danger'; removeButton.type = 'button'; removeButton.textContent = '移除'; removeButton.setAttribute('aria-label', '移除'); removeButton.onclick = () => removeDevice(device); actions.append(detailButton, aliasButton, removeButton); actionCell.append(actions);

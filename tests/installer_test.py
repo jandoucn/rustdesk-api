@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstallerTest(unittest.TestCase):
-    def run_installer(self, existing: bool, proxy: str | None, geo_source: Path):
+    def run_installer(self, existing: bool, proxy: str | None, geo_source: Path | None = None):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
             bin_dir = temp_path / "bin"
@@ -51,9 +51,12 @@ exit 0
                     "REGISTRY_USERNAME": "tester",
                     "REGISTRY_PASSWORD": "secret",
                     "RUSTDESK_PORT": "17991",
-                    "RUSTDESK_GEOIP_SOURCE": str(geo_source),
                 }
             )
+            if geo_source is not None:
+                env["RUSTDESK_GEOIP_SOURCE"] = str(geo_source)
+            else:
+                env.pop("RUSTDESK_GEOIP_SOURCE", None)
             if proxy is not None:
                 env["RUSTDESK_TRUSTED_PROXY_IPS"] = proxy
             result = subprocess.run(
@@ -68,14 +71,23 @@ exit 0
             )
             return result, log.read_text(encoding="utf-8")
 
-    def test_fresh_install_passes_proxy_and_read_only_geo_mount(self):
+    def test_fresh_install_copies_custom_geoip_into_persistent_data_volume(self):
         with tempfile.TemporaryDirectory() as temp:
             geo = Path(temp) / "GeoLite2-City.mmdb"
             geo.write_bytes(b"test-mmdb")
             result, commands = self.run_installer(False, "172.17.0.1", geo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("RUSTDESK_TRUSTED_PROXY_IPS=172.17.0.1", commands)
-        self.assertIn(f"{geo}:/var/www/geoip/GeoLite2-City.mmdb:ro", commands)
+        self.assertIn(f"{geo}:/tmp/GeoLite2-City.mmdb:ro", commands)
+        self.assertIn("rustdesk-api-data:/var/www/data", commands)
+        self.assertNotIn("/var/www/geoip/GeoLite2-City.mmdb", commands)
+
+    def test_fresh_install_uses_bundled_geoip_without_host_source(self):
+        result, commands = self.run_installer(False, "172.17.0.1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("RUSTDESK_GEOIP_SOURCE", result.stdout)
+        self.assertNotIn("/var/www/geoip/GeoLite2-City.mmdb", commands)
+        self.assertIn("rustdesk-api-data:/var/www/data", commands)
 
     def test_fresh_install_defaults_to_docker_bridge_proxy_range(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -91,7 +103,7 @@ exit 0
             geo.write_bytes(b"test-mmdb")
             result, commands = self.run_installer(False, "", geo)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("RUSTDESK_TRUSTED_PROXY_IPS= -e RUSTDESK_GEOIP_DATABASE", commands)
+        self.assertIn("RUSTDESK_TRUSTED_PROXY_IPS=", commands)
 
     def test_existing_container_rejects_silently_ignored_configuration(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -101,6 +113,7 @@ exit 0
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("docker rm -f rustdesk-api", result.stderr)
         self.assertNotIn("start rustdesk-api", commands)
+        self.assertNotIn(f"{geo}:/tmp/GeoLite2-City.mmdb:ro", commands)
 
     def test_existing_container_rejects_explicit_empty_proxy_when_old_proxy_remains(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -111,14 +124,14 @@ exit 0
         self.assertIn("可信代理配置不同", result.stderr)
         self.assertNotIn("start rustdesk-api", commands)
 
-    def test_existing_container_rejects_changed_geolite_mount(self):
+    def test_existing_container_updates_custom_geolite_in_persistent_volume(self):
         with tempfile.TemporaryDirectory() as temp:
             geo = Path(temp) / "GeoLite2-City.mmdb"
             geo.write_bytes(b"test-mmdb")
             result, commands = self.run_installer(True, "old-proxy", geo)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("GeoLite2 挂载不同", result.stderr)
-        self.assertNotIn("start rustdesk-api", commands)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"{geo}:/tmp/GeoLite2-City.mmdb:ro", commands)
+        self.assertIn("rustdesk-api-data:/var/www/data", commands)
 
 
 if __name__ == "__main__":

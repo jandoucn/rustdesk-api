@@ -24,10 +24,16 @@ COPY ./config/nginx.conf /etc/nginx/nginx.conf
 COPY ./config/docker-entrypoint.sh /usr/local/bin/rustdesk-entrypoint
 RUN chmod 0755 /usr/local/bin/rustdesk-entrypoint
 
+# GeoLite is an image seed. The entrypoint copies it into the persistent data
+# volume only when the volume does not already contain a database.
+COPY ./geoip/GeoLite2-City.mmdb /usr/share/rustdesk-api/GeoLite2-City.mmdb
+
 # 复制应用代码到容器中
 COPY ./sqlite /var/www/html
 ENV RUSTDESK_DB=/var/www/data/rustdesk.db \
-    RUSTDESK_ADMIN_PATH=/ops-console
+    RUSTDESK_ADMIN_PATH=/ops-console \
+    RUSTDESK_GEOIP_DATABASE=/var/www/data/GeoLite2-City.mmdb \
+    RUSTDESK_GEOIP_SEED=/usr/share/rustdesk-api/GeoLite2-City.mmdb
 
 # 暴露端口
 EXPOSE 80
