@@ -145,6 +145,28 @@ test('heartbeat-only client supports status filtering, alias sync and confirmed 
   expect(errors).toEqual([]);
 });
 
+test('client inventory assigns one selected client to a chosen address-book user', async ({ page, request }) => {
+  const deviceId = `browser-assign-${Date.now().toString(36)}`;
+  await reportClient(request, deviceId, `${deviceId}-host`);
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  await expect(row).toBeVisible();
+  await row.getByRole('checkbox', { name: `选择客户端 ${deviceId}` }).check();
+  await page.getByRole('button', { name: /加入通讯录（1）/ }).click();
+  const dialog = page.getByRole('dialog', { name: '加入通讯录' });
+  await expect(dialog).toBeVisible();
+  const users = dialog.locator('#assignment-users input[type="checkbox"]');
+  await expect(users.first()).toBeVisible();
+  await users.first().check();
+  await dialog.getByRole('button', { name: '应用操作' }).click();
+  await expect(row).toContainText('已分配给 1 个用户');
+  const api = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
+  expect(api.data.find(item => item.id === deviceId).address_book_user_ids.length).toBe(1);
+});
+
 test('client inventory keeps runtime and network details aligned with persisted report data', async ({ page, request }) => {
   const suffix = Date.now().toString(36);
   const deviceId = `rich-${suffix}`;

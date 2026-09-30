@@ -591,6 +591,38 @@ function delete_admin_book_peer(PDO $db, array $actor, array $profile, string $i
     save_exact_address_book($db, (int)$actor['id'], $book, time());
     return true;
 }
+function assignment_users(PDO $db): array
+{
+    return db_all($db, 'SELECT id,username,is_admin,enabled FROM rustdesk_users WHERE delete_time=0 AND enabled=1 ORDER BY username,id');
+}
+function assignment_peer_payload(PDO $db, string $id, string $uuid): array
+{
+    $report = db_one($db, 'SELECT payload FROM device_reports WHERE id=:id AND uuid=:uuid', ['id'=>$id, 'uuid'=>$uuid]);
+    $deployment = db_one($db, 'SELECT payload FROM device_deployments WHERE id=:id AND uuid=:uuid', ['id'=>$id, 'uuid'=>$uuid]);
+    if (!$report && !$deployment) fail(404, '设备不存在');
+    $info = decoded_payload($report['payload'] ?? null);
+    $deploy = decoded_payload($deployment['payload'] ?? null);
+    return [
+        'id'=>$id,
+        'username'=>(string)($info['username'] ?? $deploy['device_username'] ?? ''),
+        'hostname'=>(string)($info['hostname'] ?? $deploy['device_name'] ?? $deploy['hostname'] ?? ''),
+        'platform'=>(string)($info['platform'] ?? $info['os'] ?? $deploy['platform'] ?? $deploy['os'] ?? ''),
+        'alias'=>'', 'tags'=>[], 'hash'=>(string)($info['hash'] ?? $deploy['hash'] ?? ''),
+    ];
+}
+function normalize_assignment_users(PDO $db, mixed $value): array
+{
+    if (!is_array($value) || !array_is_list($value) || count($value) < 1 || count($value) > 100) fail(422, '至少选择一个通讯录用户');
+    $ids = [];
+    foreach ($value as $raw) {
+        if ((is_string($raw) && !ctype_digit($raw)) || (!is_int($raw) && !is_string($raw))) fail(422, '用户 ID 格式错误');
+        $id = (int)$raw; if ($id < 1) fail(422, '用户 ID 格式错误'); $ids[$id] = true;
+    }
+    $users = [];
+    foreach (assignment_users($db) as $user) if (isset($ids[(int)$user['id']])) $users[(int)$user['id']] = $user;
+    if (count($users) !== count($ids)) fail(404, '指定用户不存在或已禁用');
+    return array_values($users);
+}
 function sync_admin_book_tags(PDO $db, array $actor, array $profile, ?string $old, ?string $new, ?int $color, bool $delete): void
 {
     $now = time();
@@ -931,6 +963,57 @@ try {
         });
         reply(['ok'=>true,'id'=>$id,'favorite'=>$d['favorite'],'sync'=>'admin_only']);
     }
+    if ($adminApi && $path === '/admin/api/address-book/assignment-options') {
+        method('GET'); admin_user($db);
+        $users = array_map(static fn($user) => ['id'=>(int)$user['id'],'username'=>(string)$user['username'],'is_admin'=>(bool)$user['is_admin']], assignment_users($db));
+        $assignments = [];
+        foreach (db_all($db, 'SELECT p.id,a.uid FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.personal=1 AND a.uid IN (SELECT id FROM rustdesk_users WHERE delete_time=0 AND enabled=1)') as $row) {
+            $assignments[(string)$row['id']][] = (int)$row['uid'];
+        }
+        reply(['users'=>$users,'assignments'=>$assignments]);
+    }
+    if ($adminApi && $path === '/admin/api/devices/address-book') {
+        method('POST'); $actor = admin_user($db); csrf_check(); $d = json_body();
+        $mode = $d['mode'] ?? 'add';
+        if (!is_string($mode) || !in_array($mode, ['add','remove','replace'], true)) fail(422, '通讯录操作模式错误');
+        if (!isset($d['devices']) || !is_array($d['devices']) || !array_is_list($d['devices']) || count($d['devices']) < 1 || count($d['devices']) > 200) fail(422, '至少选择一个客户端');
+        $devices = [];
+        foreach ($d['devices'] as $item) {
+            if (!is_array($item)) fail(422, '客户端选择格式错误');
+            $id = address_book_peer_id($item['id'] ?? ''); $uuid = text_field($item, 'uuid', 256);
+            if ($uuid === '') fail(422, '客户端 UUID 不能为空');
+            $key = $id . "\0" . $uuid; $devices[$key] = ['id'=>$id,'uuid'=>$uuid];
+        }
+        $users = normalize_assignment_users($db, $d['user_ids'] ?? []);
+        txn($db, function () use ($db, $actor, $devices, $users, $mode) {
+            if ($mode === 'replace') {
+                foreach ($devices as $device) {
+                    foreach (assignment_users($db) as $target) {
+                        $profile = personal_profile($db, $target);
+                        delete_admin_book_peer($db, $target, $profile, $device['id']);
+                    }
+                }
+            }
+            foreach ($devices as $device) {
+                $payload = assignment_peer_payload($db, $device['id'], $device['uuid']);
+                foreach ($users as $target) {
+                    $profile = personal_profile($db, $target);
+                    if ($mode === 'remove') {
+                        delete_admin_book_peer($db, $target, $profile, $device['id']);
+                    } else {
+                        $existing = db_one($db, 'SELECT payload FROM ab_profile_peers WHERE guid=:guid AND id=:id', ['guid'=>$profile['guid'],'id'=>$device['id']]);
+                        $current = decoded_payload($existing['payload'] ?? null);
+                        $payload['alias'] = (string)($current['alias'] ?? '');
+                        $payload['tags'] = address_book_tags($current['tags'] ?? []);
+                        $payload = array_replace($current, $payload);
+                        sync_admin_book_peer($db, $target, $profile, $device['id'], $payload);
+                    }
+                }
+            }
+            admin_event($db, (int)$actor['id'], 'assign_devices_to_address_book', 0);
+        });
+        reply(['ok'=>true,'mode'=>$mode,'devices'=>count($devices),'users'=>array_map(static fn($user)=>(int)$user['id'],$users),'sync'=>'next_address_book_pull']);
+    }
     if ($adminApi && $path === '/admin/api/address-book/tags') {
         method('POST'); $actor = admin_user($db); csrf_check(); $d = json_body();
         $name = address_book_tag_name($d['name'] ?? null); $color = $d['color'] ?? 0;
@@ -992,6 +1075,10 @@ try {
             foreach(db_all($db,'SELECT id,alias FROM rustdesk_peers WHERE uid=:uid ORDER BY deviceid',['uid'=>$actor['id']]) as $peer){
                 if(!array_key_exists($peer['id'],$aliases))$aliases[$peer['id']]=['value'=>$peer['alias']===null?'':(string)$peer['alias'],'owned'=>true];
             }
+            $addressBookAssignments=[];
+            foreach(db_all($db,'SELECT p.id,a.uid FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.personal=1') as $assignment){
+                $addressBookAssignments[(string)$assignment['id']][]=(int)$assignment['uid'];
+            }
             $deployments=[];
             foreach(db_all($db,'SELECT id,uuid,uid,payload,updated_at FROM device_deployments') as $deployment)$deployments[$deployment['id']."\0".$deployment['uuid']]=$deployment;
             $inventory=[]; $reportedIds=[]; $now=time();
@@ -1018,6 +1105,7 @@ try {
                     'last_seen'=>(int)$reportRow['last_seen'],'last_heartbeat'=>$lastHeartbeat,
                     'updated_at'=>$deployment?(int)$deployment['updated_at']:(int)$reportRow['last_seen'],'presence'=>device_presence($lastHeartbeat,$now),
                     'deployed'=>$deployment!==null,'alias'=>$aliasEntry['value']??null,
+                    'address_book_user_ids'=>$addressBookAssignments[$reportRow['id']]??[],
                     'alias_owner_id'=>$aliasEntry?(int)$actor['id']:null,'alias_owner_name'=>$aliasEntry?$actor['username']:null,
                     '_search'=>json_encode([$reportRow['id'],$reportRow['uuid'],$report,$deploy,$aliasEntry['value']??''],JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)];
             }
@@ -1029,7 +1117,8 @@ try {
                     'distribution'=>$deploy['distribution']??'','install_mode'=>$deploy['install_mode']??'','client_arch'=>$deploy['client_arch']??'','executable_name'=>$deploy['executable_name']??'',
                     'public_ip'=>'','private_ips'=>[],'geo'=>[],'version_text'=>$deploy['version']??'','heartbeat_version'=>null,
                     'last_seen'=>null,'last_heartbeat'=>0,'updated_at'=>(int)$deployment['updated_at'],'presence'=>'unreported','deployed'=>true,
-                    'alias'=>$aliasEntry['value']??null,'alias_owner_id'=>$aliasEntry?(int)$actor['id']:null,'alias_owner_name'=>$aliasEntry?$actor['username']:null,
+                    'alias'=>$aliasEntry['value']??null,'address_book_user_ids'=>$addressBookAssignments[$deployment['id']]??[],
+                    'alias_owner_id'=>$aliasEntry?(int)$actor['id']:null,'alias_owner_name'=>$aliasEntry?$actor['username']:null,
                     '_search'=>json_encode([$deployment['id'],$deployment['uuid'],$deploy,$aliasEntry['value']??''],JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)];
             }
             if($q!=='')$inventory=array_values(array_filter($inventory,fn($row)=>stripos($row['_search'],$q)!==false));

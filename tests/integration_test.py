@@ -886,6 +886,32 @@ class IntegrationTest(unittest.TestCase):
         ])
         db.close()
 
+    def test_27_admin_can_assign_one_or_many_devices_to_selected_address_book_users(self):
+        csrf = self.admin_csrf()
+        device_id = "assignable-device"
+        uuid_value = "assignable-uuid"
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": uuid_value, "ver": 11, "conns": []})
+        self.client.json("POST", "/?s=/api/sysinfo", {"id": device_id, "uuid": uuid_value, "hostname": "assign-host", "platform": "windows"})
+        _, options, _ = self.client.json("GET", "/?s=/ops-x9/api/address-book/assignment-options")
+        self.assertEqual({user["id"] for user in options["users"]}, {1, 2})
+        self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {
+            "devices": [{"id": device_id, "uuid": uuid_value}], "user_ids": [1, 2], "mode": "add",
+        }, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        assigned = db.execute("SELECT uid,id FROM rustdesk_peers WHERE id=? ORDER BY uid", (device_id,)).fetchall()
+        profile_count = db.execute("SELECT COUNT(*) FROM ab_profile_peers WHERE id=?", (device_id,)).fetchone()[0]
+        db.close()
+        self.assertEqual(assigned, [(1, device_id), (2, device_id)])
+        self.assertEqual(profile_count, 2)
+        _, listing, _ = self.client.json("GET", "/?s=/ops-x9/api/devices?q=assignable-device&page=1&pageSize=20")
+        self.assertEqual(next(row for row in listing["data"] if row["id"] == device_id)["address_book_user_ids"], [1, 2])
+        self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {
+            "devices": [{"id": device_id, "uuid": uuid_value}], "user_ids": [2], "mode": "remove",
+        }, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT uid FROM rustdesk_peers WHERE id=?", (device_id,)).fetchall(), [(1,)])
+        db.close()
+
     def test_27_sysinfo_recursively_preserves_unknown_json_and_refreshes_ip_geo_together(self):
         device_id = "nested-json-device"
         uuid_value = "nested-json-uuid"
