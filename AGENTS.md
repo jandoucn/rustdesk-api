@@ -4,6 +4,13 @@
 
 This repository is a dual-backend RustDesk API and operations console. SQLite and MySQL must expose the same behavior. The container listens on port 80 and Compose publishes `7000:80`. The management prefix is configured only through `RUSTDESK_ADMIN_PATH` and must never fall back to `/admin`.
 
+## Git publishing contract
+
+- Local inspection, edits, tests, builds and disposable preview environments may proceed automatically.
+- Never create a Git commit, create or move a tag, create a GitHub Release, or run `git push` unless the user explicitly requests that exact publishing action.
+- Requests to fix, modify, test, build, review, or start the project locally do not imply permission to commit, tag, release, or push.
+- AOCI maintenance is separate from Git publishing. AOCI-managed files may be updated when required by its contract, but they must not be committed or pushed without the same explicit user instruction.
+
 ## Required verification for every behavior change
 
 Do not declare a feature complete from HTTP status codes alone. Before completion, run all applicable gates:
