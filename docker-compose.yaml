@@ -16,8 +16,11 @@ services:
       RUSTDESK_PROVISIONER_SECRET: ${RUSTDESK_PROVISIONER_SECRET:?set RUSTDESK_PROVISIONER_SECRET}
       RUSTDESK_TRUSTED_PROXY_IPS: ${RUSTDESK_TRUSTED_PROXY_IPS:-}
       RUSTDESK_GEOIP_DATABASE: ${RUSTDESK_GEOIP_DATABASE:-/var/www/data/GeoLite2-City.mmdb}
+      RUSTDESK_UPDATE_BASE_URL: ${RUSTDESK_UPDATE_BASE_URL:-https://rdapi.yan.life}
+      RUSTDESK_UPDATE_KEYS_JSON: ${RUSTDESK_UPDATE_KEYS_JSON:-{"schema":1,"keys":[]}}
     volumes:
       - ./data:/var/www/data
+      - ${RUSTDESK_RELEASES_PATH:-./releases}:/var/www/releases:ro
     networks:
       - rustdesk-api-net
 

@@ -257,7 +257,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(row, ("legacy", legacy_password("legacy123"), 1700000001, 0))
         self.assertEqual(peer, (2, "legacy-id", "Old alias", "prod,blue", "legacy-hash"))
         self.assertEqual(token, ("a" * 64, 0))
-        self.assertEqual(schema_version, "8")
+        self.assertEqual(schema_version, "9")
         self.assertTrue({"runtime_payload", "network_payload"}.issubset(columns))
         auth = {"Authorization": "Bearer " + ("a" * 64)}
         _, current, _ = self.client.json("POST", "/?s=/api/currentUser", {"id": "legacy-id", "uuid": "legacy-uuid"}, auth)
@@ -353,6 +353,20 @@ class IntegrationTest(unittest.TestCase):
         db.close()
         _, heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {"id": "anonymous", "uuid": str(uuid.uuid4()), "conns": []})
         self.assertIsInstance(heartbeat, dict)
+
+    def test_update_manifest_check_and_event_round_trip(self):
+        csrf = self.admin_csrf()
+        manifest = {"product": "rustdesk-yan", "edition": "custom", "targets": {"windows-x64-exe": {"primary": "https://rdapi.yan.life/update/files/stable/1.5.0/rustdesk.exe", "size": 12, "sha256": "abc", "signature": "sig"}}}
+        _, published, _ = self.client.json("POST", "/?s=/ops-x9/api/update/releases", {"version": "1.5.0", "build_seq": 2026100101, "channel": "stable", "manifest": manifest}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertEqual(published["build_seq"], 2026100101)
+        _, check, _ = self.client.json("POST", "/?s=/rd/update/v1/check", {"client_id": "update-device", "client_uuid": "update-uuid", "product": "rustdesk-yan", "edition": "custom", "version": "1.5.0", "build_seq": 1, "channel": "stable"})
+        self.assertTrue(check["update_available"])
+        self.assertEqual(check["target_build_seq"], 2026100101)
+        _, event, _ = self.client.json("POST", "/?s=/rd/update/v1/events", {"client_id": "update-device", "client_uuid": "update-uuid", "status": "installed", "from_version": "1.5.0", "to_version": "1.5.0", "from_build_seq": 1, "to_build_seq": 2026100101}, expected=(201,))
+        self.assertTrue(event["ok"])
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT status,to_build_seq FROM device_update_events WHERE device_id='update-device'").fetchone(), ("installed", 2026100101))
+        db.close()
 
     def test_06_admin_session_csrf_login_and_user_lifecycle(self):
         status, session, _ = self.client.json("GET", "/?s=/ops-x9/api/session")

@@ -50,7 +50,7 @@ class MySQLIntegrationTest(unittest.TestCase):
         )
         command = ["docker", "exec", self.api_container, "php", "-r", php]
         subprocess.check_call(command, env={**os.environ, "HOME": "/tmp/codex-home", "DOCKER_HOST": "unix:///Users/olly/.docker/run/docker.sock"})
-        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'", database), ["8"])
+        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'", database), ["9"])
         self.assertEqual(self.sql("SELECT id,uuid,pk,JSON_EXTRACT(payload,'$.future.keep') FROM device_deployments", database), ["LegacyID\tLegacyUUID\tlegacy-pk\t1"])
         self.assertEqual(self.sql("SELECT id,uuid,JSON_UNQUOTE(JSON_EXTRACT(payload,'$.hostname')),JSON_UNQUOTE(JSON_EXTRACT(heartbeat_payload,'$.ver')) FROM device_reports", database), ["LegacyID\tLegacyUUID\tlegacy-host\t9"])
         self.assertEqual(self.sql("SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION),GROUP_CONCAT(COLLATION_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_deployments' AND COLUMN_NAME IN ('id','uuid')", database), ["id,uuid\tutf8mb4_bin,utf8mb4_bin"])
@@ -111,11 +111,11 @@ class MySQLIntegrationTest(unittest.TestCase):
         return {"Authorization": "Bearer " + body["access_token"]}
 
     def test_01_public_and_custom_admin_path(self):
-        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'"), ["8"])
+        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'"), ["9"])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_reports' AND COLUMN_NAME IN ('runtime_payload','network_payload')"), ["2"])
         self.assertEqual(
             self.sql("SELECT COUNT(*),COUNT(DISTINCT TABLE_COLLATION),MIN(TABLE_COLLATION) FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()"),
-            ["18\t1\tutf8mb4_unicode_ci"],
+            ["21\t1\tutf8mb4_unicode_ci"],
         )
         for path in ("/", "/admin", "/unknown-page"):
             status, body, ctype = self.client.request("GET", path, expected=(200,))
@@ -530,6 +530,16 @@ class MySQLIntegrationTest(unittest.TestCase):
         enriched = next(row for row in listing["data"] if row["id"] == "mysql-proxy-chain")
         self.assertEqual(enriched["geo"]["country_code"], "GB")
         self.assertEqual(enriched["geo"]["timezone"], "Europe/London")
+
+    def test_19_update_manifest_check_and_event_round_trip(self):
+        csrf = self.admin_login()
+        manifest = {"product": "rustdesk-yan", "edition": "custom", "targets": {"windows-x64-exe": {"primary": "https://rdapi.yan.life/update/files/stable/1.5.0/rustdesk.exe", "size": 12, "sha256": "abc", "signature": "sig"}}}
+        _, published, _ = self.client.json("POST", "/ops-x9/api/update/releases", {"version": "1.5.0", "build_seq": 2026100101, "channel": "stable", "manifest": manifest}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertEqual(published["build_seq"], 2026100101)
+        _, check, _ = self.client.json("POST", "/rd/update/v1/check", {"client_id": "mysql-update-device", "client_uuid": "mysql-update-uuid", "product": "rustdesk-yan", "edition": "custom", "version": "1.5.0", "build_seq": 1, "channel": "stable"})
+        self.assertTrue(check["update_available"])
+        self.client.json("POST", "/rd/update/v1/events", {"client_id": "mysql-update-device", "client_uuid": "mysql-update-uuid", "status": "installed", "to_build_seq": 2026100101}, expected=(201,))
+        self.assertEqual(self.sql("SELECT status,to_build_seq FROM device_update_events WHERE device_id='mysql-update-device'"), ["installed\t2026100101"])
 
 
 if __name__ == "__main__":

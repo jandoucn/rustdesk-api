@@ -1,5 +1,11 @@
 # Repository delivery contract
 
+## Git 主分支约束
+
+- 永远不创建或切换功能分支。
+- 所有提交直接在默认主分支 `main` 上完成。
+- 允许推送时只推送 `origin/main`；不得推送其他分支。
+
 ## Scope
 
 This repository is a dual-backend RustDesk API and operations console. SQLite and MySQL must expose the same behavior. The container listens on port 80 and Compose publishes `7000:80`. The management prefix is configured only through `RUSTDESK_ADMIN_PATH` and must never fall back to `/admin`.
