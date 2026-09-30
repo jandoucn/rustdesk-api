@@ -78,7 +78,7 @@
     </form>
   </dialog>
   <dialog id="assignment-preview-dialog" aria-labelledby="assignment-preview-title">
-    <div class="dialog-form"><div class="dialog-head"><h3 id="assignment-preview-title">确认通讯录变更</h3><p>提交前核对新增、已存在和将移除的分配。</p></div><div id="assignment-preview" class="details-grid"></div><p id="assignment-preview-error" class="form-error" role="alert"></p><div class="dialog-actions"><button id="assignment-preview-cancel" class="button" type="button">返回修改</button><button id="assignment-preview-submit" class="button primary" type="button">确认应用</button></div></div>
+    <div class="dialog-form"><div class="dialog-head"><h3 id="assignment-preview-title">预览通讯录变更（尚未提交）</h3><p>核对新增、已存在和将移除的分配后，再点击“确认应用”才会真正写入。</p></div><div id="assignment-preview" class="details-grid"></div><p id="assignment-preview-error" class="form-error" role="alert"></p><div class="dialog-actions"><button id="assignment-preview-cancel" class="button" type="button">返回修改</button><button id="assignment-preview-submit" class="button primary" type="button">确认应用</button></div></div>
   </dialog>
   <dialog id="assignment-dialog" aria-labelledby="assignment-title">
     <form id="assignment-form" class="dialog-form">
@@ -89,7 +89,7 @@
         <p class="muted">加入后，目标用户在下次通讯录同步时会收到客户端。移除只影响通讯录，不删除客户端上报和部署记录。</p>
       </div>
       <p id="assignment-error" class="form-error" role="alert"></p>
-      <div class="dialog-actions"><button id="assignment-cancel" class="button" type="button">取消</button><button id="assignment-save" class="button primary" type="submit">应用操作</button></div>
+      <div class="dialog-actions"><button id="assignment-cancel" class="button" type="button">取消</button><button id="assignment-save" class="button primary" type="submit">预览变更</button></div>
     </form>
   </dialog>
   <dialog id="details-dialog" aria-labelledby="details-title">
