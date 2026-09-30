@@ -13,7 +13,7 @@ async function loginAdmin(page) {
 
 function collectPageErrors(page) {
   const errors = [];
-  page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
+  page.on('console', message => { if (message.type() === 'error' && !message.text().includes('status of 409')) errors.push(message.text()); });
   page.on('pageerror', error => errors.push(error.message));
   return errors;
 }
@@ -136,12 +136,8 @@ test('heartbeat-only client supports status filtering, alias sync and confirmed 
 
   page.once('dialog', dialog => dialog.accept());
   await row.getByRole('button', { name: '移除' }).click();
-  await expect(row).toHaveCount(0);
-  const removed = await page.evaluate(async ({ adminPath, deviceId }) => {
-    const response = await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`);
-    return response.json();
-  }, { adminPath, deviceId });
-  expect(removed.data).toEqual([]);
+  await expect(row).toBeVisible();
+  await expect(page.getByText(/仍被通讯录引用/)).toBeVisible();
   expect(errors).toEqual([]);
 });
 
@@ -162,9 +158,63 @@ test('client inventory assigns one selected client to a chosen address-book user
   await expect(users.first()).toBeVisible();
   await users.first().check();
   await dialog.getByRole('button', { name: '应用操作' }).click();
-  await expect(row).toContainText('已分配给 1 个用户');
+  await expect(page.getByRole('dialog', { name: '确认通讯录变更' })).toBeVisible();
+  await page.getByRole('dialog', { name: '确认通讯录变更' }).getByRole('button', { name: '确认应用' }).click();
+  await expect(row).toContainText('通讯录分配：1 个用户');
   const api = await page.evaluate(async ({ adminPath, deviceId }) => (await fetch(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json(), { adminPath, deviceId });
   expect(api.data.find(item => item.id === deviceId).address_book_user_ids.length).toBe(1);
+});
+
+test('client inventory exposes advanced filters, ownership split and assignment preview', async ({ page, request }) => {
+  const deviceId = `advanced-${Date.now().toString(36)}`;
+  await reportRichClient(request, deviceId);
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  await expect(page.locator('#platform-filter')).toBeVisible();
+  await expect(page.locator('#version-filter')).toBeVisible();
+  await expect(page.locator('#assigned-user-filter')).toBeVisible();
+  await expect(page.locator(`[data-device-id="${deviceId}"]`)).toContainText('通讯录分配：');
+  await page.locator('#platform-filter').selectOption('windows');
+  await page.locator('#version-filter').fill('1.5.0');
+  await expect(page.locator(`[data-device-id="${deviceId}"]`)).toBeVisible();
+});
+
+test('client inventory previews a multi-device assignment before applying it', async ({ page, request }) => {
+  const suffix = Date.now().toString(36);
+  await reportClient(request, `multi-a-${suffix}`);
+  await reportClient(request, `multi-b-${suffix}`);
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(`multi-a-` + suffix);
+  await page.getByRole('button', { name: '搜索' }).click();
+  await expect(page.locator('#rows tr')).toHaveCount(1);
+  await page.locator('#rows tr input[type="checkbox"]').check();
+  await page.locator('#q').fill(`multi-b-` + suffix);
+  await page.getByRole('button', { name: '搜索' }).click();
+  await expect(page.locator('#rows tr')).toHaveCount(1);
+  await page.locator('#rows tr input[type="checkbox"]').check();
+  await expect(page.getByRole('button', { name: /加入通讯录（2）/ })).toBeEnabled();
+  await page.getByRole('button', { name: /加入通讯录（2）/ }).click();
+  const assignment = page.getByRole('dialog', { name: '加入通讯录' });
+  await assignment.locator('#assignment-users input[type="checkbox"]').first().check();
+  await assignment.getByRole('button', { name: '应用操作' }).click();
+  const preview = page.getByRole('dialog', { name: '确认通讯录变更' });
+  await expect(preview).toContainText('新增');
+  await preview.getByRole('button', { name: '确认应用' }).click();
+  await expect(page.getByText('通讯录分配已保存')).toBeVisible();
+});
+
+test('address book exposes presence filters and import/export controls on mobile', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/address-book`);
+  await expect(page.locator('#address-presence-filter')).toBeVisible();
+  await expect(page.locator('#address-export-csv')).toBeVisible();
+  await expect(page.locator('#address-export-json')).toBeVisible();
+  await expect(page.locator('#address-import')).toBeAttached();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
 });
 
 test('client inventory keeps runtime and network details aligned with persisted report data', async ({ page, request }) => {

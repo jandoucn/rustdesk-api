@@ -127,10 +127,10 @@ function create_initial_administrator(PDO $db,string $name,string $hash,callable
         if(count($matches)>1)throw new InstallationConflict('管理员用户名存在重复记录，请先清理旧数据库中的同名用户');
         if($matches){
             $id=(int)$matches[0]['id'];
-            db_exec($db,'UPDATE rustdesk_users SET password=:password,delete_time=0,is_admin=1,enabled=1,auth_version=auth_version+1 WHERE id=:id',['password'=>$hash,'id'=>$id]);
+            db_exec($db,"UPDATE rustdesk_users SET password=:password,delete_time=0,is_admin=1,enabled=1,address_book_scope='all',auth_version=auth_version+1 WHERE id=:id",['password'=>$hash,'id'=>$id]);
             db_exec($db,'DELETE FROM rustdesk_token WHERE uid=:id',['id'=>$id]);
         }else{
-            db_exec($db,'INSERT INTO rustdesk_users(username,password,create_time,delete_time,is_admin,enabled,auth_version) VALUES(:name,:password,:at,0,1,1,0)',['name'=>$name,'password'=>$hash,'at'=>time()]);
+            db_exec($db,"INSERT INTO rustdesk_users(username,password,create_time,delete_time,is_admin,enabled,address_book_scope,auth_version) VALUES(:name,:password,:at,0,1,1,'all',0)",['name'=>$name,'password'=>$hash,'at'=>time()]);
         }
         $beforeCommit();
     });
@@ -152,7 +152,7 @@ function device_presence(int $lastHeartbeat, int $now): string {
 function ensure_schema(PDO $db): void {
     if(database_driver()==='mysql'){
         $sql=[
-        'CREATE TABLE IF NOT EXISTS rustdesk_users (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,username VARCHAR(128) NOT NULL,password VARCHAR(255) NOT NULL,create_time BIGINT NOT NULL DEFAULT 0,delete_time BIGINT NOT NULL DEFAULT 0,is_admin TINYINT(1) NOT NULL DEFAULT 0,enabled TINYINT(1) NOT NULL DEFAULT 1,auth_version BIGINT NOT NULL DEFAULT 0,UNIQUE KEY users_name(username)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
+        'CREATE TABLE IF NOT EXISTS rustdesk_users (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,username VARCHAR(128) NOT NULL,password VARCHAR(255) NOT NULL,create_time BIGINT NOT NULL DEFAULT 0,delete_time BIGINT NOT NULL DEFAULT 0,is_admin TINYINT(1) NOT NULL DEFAULT 0,enabled TINYINT(1) NOT NULL DEFAULT 1,address_book_scope VARCHAR(16) NOT NULL DEFAULT \'self\',auth_version BIGINT NOT NULL DEFAULT 0,UNIQUE KEY users_name(username)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
         'CREATE TABLE IF NOT EXISTS rustdesk_token (access_token VARCHAR(128) PRIMARY KEY,username VARCHAR(128) NOT NULL,uid BIGINT UNSIGNED NOT NULL,id VARCHAR(128) NOT NULL,uuid VARCHAR(256),login_time BIGINT NOT NULL DEFAULT 0,expire_time BIGINT NOT NULL DEFAULT 0,auth_version BIGINT NOT NULL DEFAULT 0,KEY token_uid(uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
         'CREATE TABLE IF NOT EXISTS rustdesk_peers (deviceid BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,uid BIGINT UNSIGNED NOT NULL,id VARCHAR(128) NOT NULL,username VARCHAR(255),hostname VARCHAR(255),alias VARCHAR(255),platform VARCHAR(128),tags TEXT,hash VARCHAR(255),UNIQUE KEY peer_uid_id(uid,id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
         'CREATE TABLE IF NOT EXISTS rustdesk_tags (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,uid BIGINT UNSIGNED NOT NULL,tag VARCHAR(256) NOT NULL,UNIQUE KEY tag_uid(uid,tag)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
@@ -174,7 +174,8 @@ function ensure_schema(PDO $db): void {
         'CREATE TABLE IF NOT EXISTS device_update_policies (id VARCHAR(128) NOT NULL,uuid VARCHAR(256) NOT NULL,mode VARCHAR(32) NOT NULL DEFAULT \'notify\',channel VARCHAR(32) NOT NULL DEFAULT \'stable\',target_version VARCHAR(32) NULL,target_build_seq BIGINT UNSIGNED NULL,auto_install TINYINT(1) NOT NULL DEFAULT 0,policy_revision BIGINT UNSIGNED NOT NULL DEFAULT 1,updated_by BIGINT UNSIGNED NULL,updated_at BIGINT NOT NULL,PRIMARY KEY(id,uuid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
         'CREATE TABLE IF NOT EXISTS device_update_events (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,device_id VARCHAR(128) NOT NULL,uuid VARCHAR(256) NOT NULL,from_version VARCHAR(32) NULL,to_version VARCHAR(32) NULL,from_build_seq BIGINT UNSIGNED NULL,to_build_seq BIGINT UNSIGNED NULL,status VARCHAR(32) NOT NULL,source VARCHAR(64) NULL,error_code VARCHAR(128) NULL,started_at BIGINT NOT NULL,finished_at BIGINT NULL,KEY update_event_device(device_id,uuid,started_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'];
         foreach($sql as $s)$db->exec($s);
-        foreach(['rustdesk_users'=>['is_admin'=>'TINYINT(1) NOT NULL DEFAULT 0','enabled'=>'TINYINT(1) NOT NULL DEFAULT 1','auth_version'=>'BIGINT NOT NULL DEFAULT 0'],'rustdesk_token'=>['auth_version'=>'BIGINT NOT NULL DEFAULT 0'],'device_reports'=>['last_heartbeat'=>'BIGINT NOT NULL DEFAULT 0','heartbeat_payload'=>"LONGTEXT NOT NULL DEFAULT ('{}')",'runtime_payload'=>'LONGTEXT NULL','network_payload'=>'LONGTEXT NULL']] as $t=>$fs){$existing=table_columns($db,$t);foreach($fs as $f=>$def)if(!in_array($f,$existing,true))$db->exec("ALTER TABLE `$t` ADD COLUMN `$f` $def");}
+        foreach(['rustdesk_users'=>['is_admin'=>'TINYINT(1) NOT NULL DEFAULT 0','enabled'=>'TINYINT(1) NOT NULL DEFAULT 1','address_book_scope'=>"VARCHAR(16) NOT NULL DEFAULT 'self'",'auth_version'=>'BIGINT NOT NULL DEFAULT 0'],'rustdesk_token'=>['auth_version'=>'BIGINT NOT NULL DEFAULT 0'],'device_reports'=>['last_heartbeat'=>'BIGINT NOT NULL DEFAULT 0','heartbeat_payload'=>"LONGTEXT NOT NULL DEFAULT ('{}')",'runtime_payload'=>'LONGTEXT NULL','network_payload'=>'LONGTEXT NULL']] as $t=>$fs){$existing=table_columns($db,$t);foreach($fs as $f=>$def)if(!in_array($f,$existing,true))$db->exec("ALTER TABLE `$t` ADD COLUMN `$f` $def");}
+        $db->exec("UPDATE rustdesk_users SET address_book_scope='all' WHERE is_admin=1 AND (address_book_scope IS NULL OR address_book_scope='self')");
         $tables=['rustdesk_users','rustdesk_token','rustdesk_peers','rustdesk_tags','app_meta','address_books','device_reports','audit_events','admin_events','login_limits','ab_profiles','ab_profile_peers','ab_profile_tags','admin_peer_favorites','device_deployments','switch_grants','audit_notes','record_chunks','update_releases','device_update_policies','device_update_events'];
         $db->exec('SET FOREIGN_KEY_CHECKS=0');
         try { foreach($tables as $table)$db->exec("ALTER TABLE `$table` ENGINE=InnoDB, CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); }
@@ -188,7 +189,7 @@ function ensure_schema(PDO $db): void {
         return;
     }
     $sql=[
-    'CREATE TABLE IF NOT EXISTS rustdesk_users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL,password TEXT NOT NULL,create_time INTEGER NOT NULL DEFAULT 0,delete_time INTEGER NOT NULL DEFAULT 0,is_admin INTEGER NOT NULL DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1,auth_version INTEGER NOT NULL DEFAULT 0)',
+    'CREATE TABLE IF NOT EXISTS rustdesk_users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL,password TEXT NOT NULL,create_time INTEGER NOT NULL DEFAULT 0,delete_time INTEGER NOT NULL DEFAULT 0,is_admin INTEGER NOT NULL DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1,address_book_scope TEXT NOT NULL DEFAULT "self",auth_version INTEGER NOT NULL DEFAULT 0)',
     'CREATE TABLE IF NOT EXISTS rustdesk_token (access_token TEXT NOT NULL,username TEXT NOT NULL,uid INTEGER NOT NULL,id TEXT NOT NULL,uuid TEXT,login_time INTEGER NOT NULL DEFAULT 0,expire_time INTEGER NOT NULL DEFAULT 0,auth_version INTEGER NOT NULL DEFAULT 0)',
     'CREATE TABLE IF NOT EXISTS rustdesk_peers (deviceid INTEGER PRIMARY KEY AUTOINCREMENT,uid INTEGER NOT NULL,id TEXT NOT NULL,username TEXT,hostname TEXT,alias TEXT,platform TEXT,tags TEXT,hash TEXT)',
     'CREATE TABLE IF NOT EXISTS rustdesk_tags (id INTEGER PRIMARY KEY AUTOINCREMENT,uid INTEGER NOT NULL,tag TEXT NOT NULL)',
@@ -202,7 +203,8 @@ function ensure_schema(PDO $db): void {
     'CREATE TABLE IF NOT EXISTS device_update_policies (id TEXT NOT NULL,uuid TEXT NOT NULL,mode TEXT NOT NULL DEFAULT "notify",channel TEXT NOT NULL DEFAULT "stable",target_version TEXT,target_build_seq INTEGER,auto_install INTEGER NOT NULL DEFAULT 0,policy_revision INTEGER NOT NULL DEFAULT 1,updated_by INTEGER,updated_at INTEGER NOT NULL,PRIMARY KEY(id,uuid))',
     'CREATE TABLE IF NOT EXISTS device_update_events (id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT NOT NULL,uuid TEXT NOT NULL,from_version TEXT,to_version TEXT,from_build_seq INTEGER,to_build_seq INTEGER,status TEXT NOT NULL,source TEXT,error_code TEXT,started_at INTEGER NOT NULL,finished_at INTEGER)'];
     foreach($sql as $s)$db->exec($s);
-    foreach(['rustdesk_users'=>['is_admin'=>0,'enabled'=>1,'auth_version'=>0],'rustdesk_token'=>['auth_version'=>0],'device_reports'=>['last_heartbeat'=>0]] as $t=>$fs){$existing=table_columns($db,$t);foreach($fs as $f=>$d)if(!in_array($f,$existing,true))$db->exec("ALTER TABLE `$t` ADD COLUMN `$f` INTEGER NOT NULL DEFAULT $d");}
+    foreach(['rustdesk_users'=>['is_admin'=>0,'enabled'=>1,'address_book_scope'=>"'self'",'auth_version'=>0],'rustdesk_token'=>['auth_version'=>0],'device_reports'=>['last_heartbeat'=>0]] as $t=>$fs){$existing=table_columns($db,$t);foreach($fs as $f=>$d)if(!in_array($f,$existing,true))$db->exec("ALTER TABLE `$t` ADD COLUMN `$f` ".($f==='address_book_scope'?'TEXT NOT NULL DEFAULT "self"':'INTEGER NOT NULL DEFAULT '.$d));}
+    $db->exec("UPDATE rustdesk_users SET address_book_scope='all' WHERE is_admin=1 AND (address_book_scope IS NULL OR address_book_scope='self')");
     $reportColumns=table_columns($db,'device_reports');
     if(!in_array('heartbeat_payload',$reportColumns,true))$db->exec('ALTER TABLE device_reports ADD COLUMN heartbeat_payload TEXT NOT NULL DEFAULT "{}"');
     if(!in_array('runtime_payload',$reportColumns,true))$db->exec('ALTER TABLE device_reports ADD COLUMN runtime_payload TEXT');

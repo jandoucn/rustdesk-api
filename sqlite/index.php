@@ -151,7 +151,7 @@ function password_matches(string $plain, string $stored): bool
 function public_user(array $u): array
 {
     return ['id' => (int)$u['id'], 'username' => $u['username'], 'is_admin' => (bool)$u['is_admin'],
-        'enabled' => (bool)$u['enabled'], 'create_time' => (int)$u['create_time']];
+        'enabled' => (bool)$u['enabled'], 'address_book_scope' => (string)($u['address_book_scope'] ?? 'self'), 'create_time' => (int)$u['create_time']];
 }
 function method(string ...$allowed): void
 {
@@ -623,6 +623,84 @@ function normalize_assignment_users(PDO $db, mixed $value): array
     if (count($users) !== count($ids)) fail(404, '指定用户不存在或已禁用');
     return array_values($users);
 }
+function address_book_user(PDO $db, int $uid): array
+{
+    $user = db_one($db, 'SELECT id,username,is_admin,enabled FROM rustdesk_users WHERE id=:id AND delete_time=0 AND enabled=1', ['id'=>$uid]);
+    if (!$user) fail(404, '通讯录用户不存在');
+    return $user;
+}
+function assert_address_book_scope(array $actor, int $uid): void
+{
+    $scope = (string)($actor['address_book_scope'] ?? ((bool)($actor['is_admin'] ?? false) ? 'all' : 'self'));
+    if ((int)$actor['id'] !== $uid && $scope !== 'all') fail(403, '无权访问该用户通讯录');
+}
+function address_book_export(PDO $db, int $uid): array
+{
+    $user = address_book_user($db, $uid);
+    $profile = db_one($db, 'SELECT * FROM ab_profiles WHERE uid=:uid AND personal=1', ['uid'=>$uid]);
+    $state = admin_address_book_state($db, $user, $profile ?? ['guid'=>'']);
+    return ['user_id'=>$uid, 'username'=>$user['username'], 'tags'=>$state['tags'], 'peers'=>array_values($state['peers'])];
+}
+function address_book_import(PDO $db, int $uid, array $book): int
+{
+    address_book_user($db, $uid);
+    $profile = personal_profile($db, ['id'=>$uid,'username'=>'import']);
+    $count = 0;
+    $tags = address_book_tags($book['tags'] ?? []);
+    db_exec($db, 'DELETE FROM ab_profile_tags WHERE guid=:guid', ['guid'=>$profile['guid']]);
+    foreach ($tags as $tag) db_upsert($db, 'ab_profile_tags', ['guid'=>$profile['guid'], 'name'=>$tag, 'color'=>0], ['guid','name'], ['color']);
+    foreach ($tags as $tag) db_insert_ignore($db, 'rustdesk_tags', ['uid'=>$uid, 'tag'=>$tag]);
+    $existingBook = exact_address_book($db, $uid);
+    $existingBook['tags'] = $tags;
+    foreach (($book['peers'] ?? []) as $peer) {
+        if (!is_array($peer) || !isset($peer['id'])) continue;
+        $id = address_book_peer_id($peer['id']); $peer['id'] = $id;
+        $payload = validate_admin_peer_payload($peer);
+        sync_admin_book_peer($db, ['id'=>$uid], $profile, $id, $payload); $count++;
+        foreach ($existingBook['peers'] as $index=>$existing) if (is_array($existing) && (string)($existing['id'] ?? '') === $id) { $existingBook['peers'][$index] = array_replace($existing, $payload); continue 2; }
+        $existingBook['peers'][] = $payload;
+    }
+    save_exact_address_book($db, $uid, $existingBook, time());
+    return $count;
+}
+function parse_address_book_input(string $raw, string $format): array
+{
+    $format = strtolower($format);
+    if ($format === 'json') {
+        try { $book = json_decode($raw, true, 64, JSON_THROW_ON_ERROR | JSON_BIGINT_AS_STRING); }
+        catch (JsonException) { fail(422, '导入内容必须为有效 JSON'); }
+        if (!is_array($book)) fail(422, '导入内容必须为 JSON 对象');
+        return $book;
+    }
+    if ($format !== 'csv') fail(422, '导入格式必须为 JSON 或 CSV');
+    $stream = fopen('php://temp', 'r+'); fwrite($stream, $raw); rewind($stream); $header = fgetcsv($stream);
+    if (!$header) fail(422, 'CSV 内容为空');
+    $book = ['tags'=>[], 'peers'=>[]];
+    while (($row = fgetcsv($stream)) !== false) {
+        if (count($row) < 1 || trim((string)$row[0]) === '') continue;
+        $item = []; foreach ($header as $i=>$key) $item[(string)$key] = $row[$i] ?? '';
+        $item['tags'] = isset($item['tags']) && trim((string)$item['tags']) !== '' ? array_values(array_filter(array_map('trim', explode(',', (string)$item['tags'])))) : [];
+        $book['peers'][] = $item; foreach ($item['tags'] as $tag) if (!in_array($tag, $book['tags'], true)) $book['tags'][] = $tag;
+    }
+    fclose($stream); return $book;
+}
+function address_book_import_plan(PDO $db, int $uid, array $book): array
+{
+    address_book_user($db, $uid); $current = address_book_export($db, $uid); $existing = [];
+    foreach ($current['peers'] as $peer) if (is_array($peer) && isset($peer['id'])) $existing[(string)$peer['id']] = $peer;
+    $plan = ['add'=>[], 'update'=>[], 'already_present'=>[], 'invalid'=>[], 'tags'=>address_book_tags($book['tags'] ?? [])];
+    foreach (($book['peers'] ?? []) as $peer) {
+        if (!is_array($peer) || !isset($peer['id'])) { $plan['invalid'][] = ['reason'=>'缺少设备 ID']; continue; }
+        try { $id = address_book_peer_id((string)$peer['id']); $payload = validate_admin_peer_payload($peer); $payload['id'] = $id; }
+        catch (Throwable $e) { $plan['invalid'][] = ['id'=>(string)($peer['id'] ?? ''), 'reason'=>$e->getMessage()]; continue; }
+        if (isset($existing[$id])) $plan['update'][] = $payload; else $plan['add'][] = $payload;
+    }
+    $plan['already_present'] = $plan['update'];
+    $canonical = json_encode(['tags'=>$plan['tags'],'peers'=>array_values(array_merge($plan['add'],$plan['update']))], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR);
+    $plan['snapshot'] = hash('sha256', json_encode($current, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR));
+    $plan['input_snapshot'] = hash('sha256', $canonical);
+    return $plan;
+}
 function sync_admin_book_tags(PDO $db, array $actor, array $profile, ?string $old, ?string $new, ?int $color, bool $delete): void
 {
     $now = time();
@@ -859,7 +937,8 @@ try {
             if (isset($d['enabled']) && !is_bool($d['enabled'])) fail(422, 'enabled 必须为布尔值');
             $newId = txn($db, function () use ($db, $name, $hash, $d, $actor) {
                 if (db_one($db, 'SELECT id FROM rustdesk_users WHERE username=:name', ['name' => $name])) fail(409, '用户名已存在，包括已删除账号');
-                db_exec($db, 'INSERT INTO rustdesk_users(username,password,create_time,delete_time,is_admin,enabled,auth_version) VALUES(:name,:password,:at,0,0,:enabled,0)', ['name' => $name, 'password' => $hash, 'at' => time(), 'enabled' => (int)($d['enabled'] ?? true)]);
+                $scope = $d['address_book_scope'] ?? 'self'; if (!is_string($scope) || !in_array($scope, ['self','all'], true)) fail(422, '通讯录权限格式错误');
+                db_exec($db, 'INSERT INTO rustdesk_users(username,password,create_time,delete_time,is_admin,enabled,address_book_scope,auth_version) VALUES(:name,:password,:at,0,0,:enabled,:scope,0)', ['name' => $name, 'password' => $hash, 'at' => time(), 'enabled' => (int)($d['enabled'] ?? true), 'scope'=>$scope]);
                 $id = (int)$db->lastInsertId(); admin_event($db, (int)$actor['id'], 'create_user', $id); return $id;
             }); reply(['ok' => true, 'id' => $newId], 201);
         }
@@ -881,7 +960,9 @@ try {
                 $name = array_key_exists('username', $d) ? username($d) : $target['username'];
                 if ($name !== $target['username'] && db_one($db, 'SELECT id FROM rustdesk_users WHERE username=:name AND id<>:id', ['name' => $name, 'id' => $id])) fail(409, '用户名已存在');
                 $hash = array_key_exists('password', $d) ? new_password($d) : $target['password'];
-                db_exec($db, 'UPDATE rustdesk_users SET username=:name,password=:password,enabled=:enabled,is_admin=:admin WHERE id=:id', ['name' => $name, 'password' => $hash, 'enabled' => (int)$enabled, 'admin' => (int)$isAdmin, 'id' => $id]);
+                $scope = $d['address_book_scope'] ?? ($target['address_book_scope'] ?? 'self'); if (!is_string($scope) || !in_array($scope, ['self','all'], true)) fail(422, '通讯录权限格式错误');
+                if (!$isAdmin) $scope = 'self';
+                db_exec($db, 'UPDATE rustdesk_users SET username=:name,password=:password,enabled=:enabled,is_admin=:admin,address_book_scope=:scope WHERE id=:id', ['name' => $name, 'password' => $hash, 'enabled' => (int)$enabled, 'admin' => (int)$isAdmin, 'scope'=>$scope, 'id' => $id]);
             }
             revoke($db, $id); admin_event($db, (int)$actor['id'], $delete ? 'delete_user' : 'update_user', $id);
         }); reply(['ok' => true, 'reauthenticate' => $id === (int)$actor['id']]);
@@ -895,6 +976,13 @@ try {
         if (!is_string($favoriteFilter) || !in_array($favoriteFilter, ['', '0', '1', 'false', 'true'], true)) fail(422, '收藏筛选错误');
         $profile = db_one($db, 'SELECT * FROM ab_profiles WHERE uid=:uid AND personal=1', ['uid'=>$actor['id']]);
         $state = admin_address_book_state($db, $actor, $profile ?? ['guid'=>'']);
+        foreach ($state['peers'] as $peerId=>&$peer) {
+            $report = db_one($db, 'SELECT last_heartbeat FROM device_reports WHERE id=:id ORDER BY last_heartbeat DESC LIMIT 1', ['id'=>$peerId]);
+            $peer['presence'] = $report ? device_presence((int)$report['last_heartbeat'], time()) : 'unreported';
+        }
+        unset($peer);
+        $presenceFilter = $_GET['presence'] ?? 'all';
+        if (!is_string($presenceFilter) || !in_array($presenceFilter, ['all','online','recent','offline','unreported'], true)) fail(422, '在线状态筛选错误');
         $all = array_values($state['peers']);
         usort($all, fn($a,$b)=>(int)$b['favorite']<=>(int)$a['favorite'] ?: strnatcasecmp((string)($a['alias'] ?? $a['hostname'] ?? $a['id']), (string)($b['alias'] ?? $b['hostname'] ?? $b['id'])) ?: strcmp((string)$a['id'], (string)$b['id']));
         $summary = ['total'=>count($all),'favorites'=>0,'labelled'=>0,'tags'=>count($state['tags'])];
@@ -902,10 +990,11 @@ try {
             if ($peer['favorite']) $summary['favorites']++;
             if (is_string($peer['alias'] ?? null) && $peer['alias'] !== '') $summary['labelled']++;
         }
-        $filtered = array_values(array_filter($all, function($peer) use ($q,$tag,$favoriteFilter) {
+        $filtered = array_values(array_filter($all, function($peer) use ($q,$tag,$favoriteFilter,$presenceFilter) {
             if ($favoriteFilter === '1' || $favoriteFilter === 'true') if (!$peer['favorite']) return false;
             if ($favoriteFilter === '0' || $favoriteFilter === 'false') if ($peer['favorite']) return false;
             if ($tag !== '' && !in_array($tag, $peer['tags'], true)) return false;
+            if ($presenceFilter !== 'all' && ($peer['presence'] ?? 'unreported') !== $presenceFilter) return false;
             if ($q !== '') {
                 $haystack = json_encode($peer, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
                 if (stripos($haystack, $q) === false) return false;
@@ -972,10 +1061,37 @@ try {
         }
         reply(['users'=>$users,'assignments'=>$assignments]);
     }
-    if ($adminApi && $path === '/admin/api/devices/address-book') {
+    if ($adminApi && preg_match('#^/admin/api/address-book/users/([0-9]+)$#', $path, $match)) {
+        method('GET'); $actor = admin_user($db); assert_address_book_scope($actor, (int)$match[1]); $user = address_book_user($db, (int)$match[1]);
+        $book = address_book_export($db, (int)$match[1]);
+        reply(['user'=>['id'=>(int)$user['id'],'username'=>$user['username']], 'tags'=>$book['tags'], 'total'=>count($book['peers']), 'data'=>array_values($book['peers'])]);
+    }
+    if ($adminApi && $path === '/admin/api/address-book/export') {
+        method('GET'); $actor = admin_user($db); $uid = (int)($_GET['user_id'] ?? 0); if ($uid < 1) fail(422, 'user_id 格式错误'); assert_address_book_scope($actor, $uid);
+        $book = address_book_export($db, $uid); $format = $_GET['format'] ?? 'json';
+        if ($format === 'csv') {
+            header('Content-Type: text/csv; charset=utf-8'); header('Content-Disposition: attachment; filename="address-book.csv"');
+            $out = fopen('php://output', 'wb'); fputcsv($out, ['id','alias','hostname','username','platform','tags']);
+            foreach ($book['peers'] as $peer) fputcsv($out, [$peer['id'] ?? '',$peer['alias'] ?? '',$peer['hostname'] ?? '',$peer['username'] ?? '',$peer['platform'] ?? '',implode(',', $peer['tags'] ?? [])]);
+            fclose($out); exit;
+        }
+        reply($book);
+    }
+    if ($adminApi && preg_match('#^/admin/api/address-book/import(?:/(preview|apply))?$#', $path, $match)) {
+        method('POST'); $actor = admin_user($db); csrf_check(); $uid = (int)($_GET['user_id'] ?? $actor['id']); assert_address_book_scope($actor, $uid);
+        $body = json_body(); $format = strtolower((string)($body['format'] ?? $_GET['format'] ?? 'json')); $raw = $body['data'] ?? null;
+        if ($format === 'json' && is_array($raw)) $book = $raw; else { if (!is_string($raw)) fail(422, '导入数据不能为空'); $book = parse_address_book_input($raw, $format); }
+        $plan = address_book_import_plan($db, $uid, $book);
+        if (($match[1] ?? 'preview') !== 'apply') reply(['ok'=>true,'plan'=>$plan,'apply_required'=>true]);
+        $current = address_book_export($db, $uid); $currentSnapshot = hash('sha256', json_encode($current, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR));
+        if ($currentSnapshot !== $plan['snapshot']) fail(409, '导入预览已过期，请重新预览');
+        $count = txn($db, fn() => address_book_import($db, $uid, $book)); reply(['ok'=>true,'imported'=>$count,'plan'=>$plan]);
+    }
+    if ($adminApi && ($path === '/admin/api/devices/address-book' || $path === '/admin/api/devices/address-book/preview')) {
         method('POST'); $actor = admin_user($db); csrf_check(); $d = json_body();
-        $mode = $d['mode'] ?? 'add';
-        if (!is_string($mode) || !in_array($mode, ['add','remove','replace'], true)) fail(422, '通讯录操作模式错误');
+        $mode = $d['mode'] ?? 'add'; $preview = $path === '/admin/api/devices/address-book/preview' || $mode === 'preview'; $requestedPreview = $mode === 'preview';
+        if ($preview && $mode === 'preview') $mode = (string)($d['preview_mode'] ?? 'add');
+        if (!is_string($mode) || !in_array($mode, ['add','remove','replace','preview'], true)) fail(422, '通讯录操作模式错误');
         if (!isset($d['devices']) || !is_array($d['devices']) || !array_is_list($d['devices']) || count($d['devices']) < 1 || count($d['devices']) > 200) fail(422, '至少选择一个客户端');
         $devices = [];
         foreach ($d['devices'] as $item) {
@@ -985,6 +1101,28 @@ try {
             $key = $id . "\0" . $uuid; $devices[$key] = ['id'=>$id,'uuid'=>$uuid];
         }
         $users = normalize_assignment_users($db, $d['user_ids'] ?? []);
+        foreach ($users as $target) assert_address_book_scope($actor, (int)$target['id']);
+        if ($mode === 'replace' && (string)($actor['address_book_scope'] ?? 'self') !== 'all') fail(403, '替换分配需要跨用户通讯录权限');
+        if ($preview) {
+            $snapshot=[]; $add=[]; $already=[]; $remove=[]; $skipped=[]; $invalid=[];
+            foreach ($devices as $device) foreach ($users as $target) {
+                $exists = db_one($db, 'SELECT p.id FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=:uid AND a.personal=1 AND p.id=:id', ['uid'=>$target['id'],'id'=>$device['id']]);
+                if (!db_one($db, 'SELECT id FROM device_reports WHERE id=:id AND uuid=:uuid UNION SELECT id FROM device_deployments WHERE id=:id AND uuid=:uuid', ['id'=>$device['id'],'uuid'=>$device['uuid']])) { $invalid[]=['id'=>$device['id'],'uuid'=>$device['uuid'],'user_id'=>(int)$target['id'],'type'=>'device_missing']; continue; }
+                $entry=['id'=>$device['id'],'uuid'=>$device['uuid'],'user_id'=>(int)$target['id'],'assigned'=>(bool)$exists]; $snapshot[]=$entry;
+                if ($mode === 'remove') { if ($exists) $remove[]=$entry; else $skipped[]=$entry; }
+                else { if ($exists) $already[]=$entry; else $add[]=$entry; }
+            }
+            if ($mode === 'replace') {
+                foreach ($devices as $device) foreach (assignment_users($db) as $target) {
+                    if (in_array((int)$target['id'], array_map(static fn($u)=>(int)$u['id'],$users), true)) continue;
+                    $exists=db_one($db,'SELECT p.id FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=:uid AND a.personal=1 AND p.id=:id',['uid'=>$target['id'],'id'=>$device['id']]);
+                    if ($exists) $remove[]=['id'=>$device['id'],'uuid'=>$device['uuid'],'user_id'=>(int)$target['id'],'assigned'=>true];
+                }
+            }
+            reply(['ok'=>true,'mode'=>$requestedPreview ? 'preview' : $mode,'devices'=>count($devices),'users'=>array_map(static fn($user)=>(int)$user['id'],$users),'snapshot'=>$snapshot,'plan'=>['add'=>$add,'already_assigned'=>$already,'remove'=>$remove,'skipped'=>$skipped,'invalid'=>$invalid],'add'=>$add,'new'=>$add,'already_assigned'=>$already,'remove'=>$remove,'skipped'=>$skipped,'invalid'=>$invalid,'conflicts'=>$remove,'apply_required'=>true]);
+        }
+        // Keep the established add/remove/replace calls backward compatible; clients
+        // using preview can opt into an explicit apply=true acknowledgement.
         txn($db, function () use ($db, $actor, $devices, $users, $mode) {
             if ($mode === 'replace') {
                 foreach ($devices as $device) {
@@ -1079,6 +1217,8 @@ try {
             foreach(db_all($db,'SELECT p.id,a.uid FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.personal=1') as $assignment){
                 $addressBookAssignments[(string)$assignment['id']][]=(int)$assignment['uid'];
             }
+            foreach ($addressBookAssignments as &$assignedUsers) sort($assignedUsers, SORT_NUMERIC);
+            unset($assignedUsers);
             $deployments=[];
             foreach(db_all($db,'SELECT id,uuid,uid,payload,updated_at FROM device_deployments') as $deployment)$deployments[$deployment['id']."\0".$deployment['uuid']]=$deployment;
             $inventory=[]; $reportedIds=[]; $now=time();
@@ -1095,13 +1235,14 @@ try {
                 $aliasEntry=$aliases[$reportRow['id']]??null; $lastHeartbeat=(int)$reportRow['last_heartbeat'];
                 $inventory[]=['id'=>$reportRow['id'],'uuid'=>$reportRow['uuid'],'owner_id'=>$deployment&&$deployment['uid']!==null?(int)$deployment['uid']:null,
                     'hostname'=>$report['hostname']??($deploy['device_name']??''),'username'=>$report['username']??($deploy['device_username']??''),
-                    'platform'=>$report['platform']??($report['os']??($deploy['platform']??'')),'os'=>$report['os']??'','cpu'=>$report['cpu']??'','memory'=>$report['memory']??'','version'=>$report['version']??'',
+                    'platform'=>$report['platform']??($report['os']??($deploy['platform']??'')),'os'=>$report['os']??'','os_version'=>$report['os_version']??($deploy['os_version']??''),'cpu'=>$report['cpu']??'','memory'=>$report['memory']??'','version'=>$report['version']??'',
                     'product'=>$runtime['product']??'','edition'=>$runtime['edition']??'','build_number'=>$runtime['build_number']??'','build_seq'=>$runtime['build_seq']??0,'source_commit'=>$runtime['source_commit']??'','channel'=>$runtime['channel']??'',
                     'last_update_check'=>$runtime['last_update_check']??'','last_update_status'=>$runtime['last_update_status']??'','last_update_error'=>$runtime['last_update_error']??'','last_update_source'=>$runtime['last_update_source']??'',
                     'distribution'=>$runtime['distribution']??'','install_mode'=>$runtime['install_mode']??'','client_arch'=>$runtime['client_arch']??'','executable_name'=>$runtime['executable_name']??'',
                     'public_ip'=>$publicIp,'private_ips'=>$network['private_ips']??[],'geo'=>$publicGeo,
                     'version_text'=>$report['version']??'','heartbeat_version'=>decoded_payload($reportRow['heartbeat_payload']??null)['ver']??null,
                     'heartbeat_payload'=>decoded_payload($reportRow['heartbeat_payload']??null),
+                    'runtime_payload'=>$runtime,'network_payload'=>$network,
                     'last_seen'=>(int)$reportRow['last_seen'],'last_heartbeat'=>$lastHeartbeat,
                     'updated_at'=>$deployment?(int)$deployment['updated_at']:(int)$reportRow['last_seen'],'presence'=>device_presence($lastHeartbeat,$now),
                     'deployed'=>$deployment!==null,'alias'=>$aliasEntry['value']??null,
@@ -1113,15 +1254,25 @@ try {
                 $identity=$deployment['id']."\0".$deployment['uuid'];if(isset($reportedIds[$identity]))continue; $deploy=decoded_payload($deployment['payload']); $aliasEntry=$aliases[$deployment['id']]??null;
                 $inventory[]=['id'=>$deployment['id'],'uuid'=>$deployment['uuid'],'owner_id'=>$deployment['uid']===null?null:(int)$deployment['uid'],
                     'hostname'=>$deploy['device_name']??($deploy['hostname']??''),'username'=>$deploy['device_username']??($deploy['username']??''),
-                    'platform'=>$deploy['platform']??($deploy['os']??''),'os'=>$deploy['os']??'','cpu'=>$deploy['cpu']??'','memory'=>$deploy['memory']??'','version'=>$deploy['version']??'',
+                    'platform'=>$deploy['platform']??($deploy['os']??''),'os'=>$deploy['os']??'','os_version'=>$deploy['os_version']??'','cpu'=>$deploy['cpu']??'','memory'=>$deploy['memory']??'','version'=>$deploy['version']??'',
                     'distribution'=>$deploy['distribution']??'','install_mode'=>$deploy['install_mode']??'','client_arch'=>$deploy['client_arch']??'','executable_name'=>$deploy['executable_name']??'',
                     'public_ip'=>'','private_ips'=>[],'geo'=>[],'version_text'=>$deploy['version']??'','heartbeat_version'=>null,
                     'last_seen'=>null,'last_heartbeat'=>0,'updated_at'=>(int)$deployment['updated_at'],'presence'=>'unreported','deployed'=>true,
+                    'runtime_payload'=>[],'network_payload'=>[],
                     'alias'=>$aliasEntry['value']??null,'address_book_user_ids'=>$addressBookAssignments[$deployment['id']]??[],
                     'alias_owner_id'=>$aliasEntry?(int)$actor['id']:null,'alias_owner_name'=>$aliasEntry?$actor['username']:null,
                     '_search'=>json_encode([$deployment['id'],$deployment['uuid'],$deploy,$aliasEntry['value']??''],JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR)];
             }
             if($q!=='')$inventory=array_values(array_filter($inventory,fn($row)=>stripos($row['_search'],$q)!==false));
+            foreach (['platform','distribution','install_mode','version','network'] as $filter) {
+                $value = $_GET[$filter] ?? ''; if (!is_string($value) || strlen($value) > 128) fail(422, '设备筛选参数错误');
+                if ($value !== '') $inventory = array_values(array_filter($inventory, function($row) use ($filter,$value) {
+                    if ($filter === 'network') return $value === 'public' ? ($row['public_ip'] !== '') : ($value === 'private' ? count($row['private_ips']) > 0 : true);
+                    return stripos((string)($row[$filter] ?? ''), $value) !== false;
+                }));
+            }
+            $userFilter = $_GET['user_id'] ?? ''; if ($userFilter !== '' && (!ctype_digit((string)$userFilter) || (int)$userFilter < 1)) fail(422, '通讯录用户筛选错误');
+            if ($userFilter !== '') $inventory = array_values(array_filter($inventory, fn($row)=>in_array((int)$userFilter, $row['address_book_user_ids'], true)));
             $summary=['total'=>count($inventory),'online'=>0,'recent'=>0,'offline'=>0,'unreported'=>0,'labelled'=>0];
             foreach($inventory as $row){$summary[$row['presence']]++;if(is_string($row['alias'])&&$row['alias']!=='')$summary['labelled']++;}
             if($presenceFilter!==''&&$presenceFilter!=='all')$inventory=array_values(array_filter($inventory,fn($row)=>$row['presence']===$presenceFilter));
@@ -1131,6 +1282,8 @@ try {
             reply(['total'=>$total,'summary'=>$summary,'data'=>$data]);
         }
         method('DELETE'); csrf_check(); if($id==='') fail(404,'设备不存在');$uuid=device_uuid($db,$id,text_field($_GET,'uuid',256));
+        $references = db_all($db, 'SELECT a.uid,u.username FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid JOIN rustdesk_users u ON u.id=a.uid WHERE a.personal=1 AND p.id=:id ORDER BY a.uid', ['id'=>$id]);
+        if ($references) reply(['error'=>'设备仍被通讯录引用，请先移除通讯录分配','references'=>array_map(static fn($row)=>['user_id'=>(int)$row['uid'],'username'=>$row['username']],$references)], 409);
         txn($db,function()use($db,$id,$uuid,$actor){db_exec($db,'DELETE FROM device_deployments WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);db_exec($db,'DELETE FROM device_reports WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);admin_event($db,(int)$actor['id'],'delete_device',0);}); reply(['ok'=>true]);
     }
     if ($path === '/api/login') {

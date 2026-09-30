@@ -11,6 +11,22 @@ from tests.integration_test import HttpClient
 
 
 class MySQLIntegrationTest(unittest.TestCase):
+    def test_20_address_book_management_extensions(self):
+        csrf = self.admin_login()
+        _, options, _ = self.client.json("GET", "/ops-x9/api/address-book/assignment-options")
+        user_id = options["users"][0]["id"]
+        device_id = "mysql-extension-" + str(int(time.time()))
+        self.client.json("POST", "/api/heartbeat", {"id": device_id, "uuid": device_id + "-uuid", "conns": []})
+        _, preview, _ = self.client.json("POST", "/ops-x9/api/devices/address-book", {"mode": "preview", "devices": [{"id": device_id, "uuid": device_id + "-uuid"}], "user_ids": [user_id]}, {"X-CSRF-Token": csrf})
+        self.assertEqual(preview["mode"], "preview")
+        self.assertIn("snapshot", preview); self.assertIn("invalid", preview)
+        self.client.json("POST", "/ops-x9/api/devices/address-book", {"mode": "add", "apply": True, "devices": [{"id": device_id, "uuid": device_id + "-uuid"}], "user_ids": [user_id]}, {"X-CSRF-Token": csrf})
+        _, owned, _ = self.client.json("GET", f"/ops-x9/api/address-book/users/{user_id}")
+        self.assertIn(device_id, {row["id"] for row in owned["data"]})
+        status, csv_body, csv_type = self.client.request("GET", f"/ops-x9/api/address-book/export?user_id={user_id}&format=csv")
+        self.assertEqual(status, 200); self.assertIn("text/csv", csv_type); self.assertIn(device_id, csv_body)
+        _, conflict, _ = self.client.json("DELETE", f"/ops-x9/api/devices/{device_id}?uuid={device_id}-uuid", {}, {"X-CSRF-Token": csrf}, expected=(409,))
+        self.assertTrue(conflict["references"])
     @classmethod
     def setUpClass(cls):
         cls.client = HttpClient(os.environ.get("RUSTDESK_TEST_URL", "http://127.0.0.1:17000"))

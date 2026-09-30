@@ -47,6 +47,9 @@
               <div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m20 20-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><input id="q" class="input" placeholder="搜索 ID、UUID、主机名" autocomplete="off"></div>
             </div>
             <div class="field filter"><label for="presence-filter">在线状态</label><select id="presence-filter" class="select"><option value="all">全部状态</option><option value="online">在线</option><option value="recent">最近在线</option><option value="offline">离线</option><option value="unreported">未上报</option></select></div>
+            <div class="field filter"><label for="platform-filter">平台</label><select id="platform-filter" class="select"><option value="all">全部平台</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option><option value="android">Android</option><option value="ios">iOS</option></select></div>
+            <div class="field filter"><label for="version-filter">版本</label><input id="version-filter" class="input" placeholder="例如 1.5.0" autocomplete="off"></div>
+            <div class="field filter"><label for="assigned-user-filter">通讯录用户</label><select id="assigned-user-filter" class="select"><option value="all">全部分配状态</option><option value="assigned">已分配</option><option value="unassigned">未分配</option></select></div>
             <button id="search" class="button" type="button">搜索</button>
             <div class="toolbar-switches">
               <label class="check" for="labelled-only"><input id="labelled-only" type="checkbox">仅看有备注</label>
@@ -74,6 +77,9 @@
       <div class="dialog-actions"><button id="alias-cancel" class="button" type="button">取消</button><button id="alias-save" class="button primary" type="submit" aria-label="保存备注">保存备注</button></div>
     </form>
   </dialog>
+  <dialog id="assignment-preview-dialog" aria-labelledby="assignment-preview-title">
+    <div class="dialog-form"><div class="dialog-head"><h3 id="assignment-preview-title">确认通讯录变更</h3><p>提交前核对新增、已存在和将移除的分配。</p></div><div id="assignment-preview" class="details-grid"></div><p id="assignment-preview-error" class="form-error" role="alert"></p><div class="dialog-actions"><button id="assignment-preview-cancel" class="button" type="button">返回修改</button><button id="assignment-preview-submit" class="button primary" type="button">确认应用</button></div></div>
+  </dialog>
   <dialog id="assignment-dialog" aria-labelledby="assignment-title">
     <form id="assignment-form" class="dialog-form">
       <div class="dialog-head"><h3 id="assignment-title">加入通讯录</h3><p id="assignment-device">选择目标用户和通讯录操作。</p></div>
@@ -95,7 +101,7 @@
   (() => {
     const $ = id => document.getElementById(id);
     const labels = { online: '在线', recent: '最近在线', offline: '离线', unreported: '未上报' };
-    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, aliasDevice: null, timer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [] };
+    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, aliasDevice: null, timer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [], pendingAssignment: null };
 
     async function api(url, options = {}) {
       const headers = new Headers(options.headers || {});
@@ -104,7 +110,7 @@
       if (state.csrf) headers.set('X-CSRF-Token', state.csrf);
       const response = await fetch(url, { ...options, headers, credentials: 'same-origin' });
       const data = await response.json().catch(() => ({ error: '响应无效' }));
-      if (!response.ok) throw Error(data.error || '请求失败');
+      if (!response.ok) { const error = Error(data.error || '请求失败'); Object.assign(error, data); throw error; }
       return data;
     }
 
@@ -133,8 +139,15 @@
 
     function visibleDevices() {
       const selected = $('presence-filter').value;
+      const platform = $('platform-filter').value;
+      const version = $('version-filter').value.trim().toLowerCase();
+      const assigned = $('assigned-user-filter').value;
       const labelledOnly = $('labelled-only').checked;
-      return state.devices.filter(device => (selected === 'all' || presence(device) === selected) && (!labelledOnly || String(device.alias || '').trim() !== ''));
+      return state.devices.filter(device => {
+        const devicePlatform = String(device.platform || device.os || '').toLowerCase();
+        const assignmentCount = Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.length : 0;
+        return (selected === 'all' || presence(device) === selected) && (platform === 'all' || devicePlatform.startsWith(platform)) && (!version || String(device.version || device.version_text || '').toLowerCase().includes(version)) && (assigned === 'all' || (assigned === 'assigned' ? assignmentCount > 0 : assignmentCount === 0)) && (!labelledOnly || String(device.alias || '').trim() !== '');
+      });
     }
 
     function updateStats() {
@@ -164,8 +177,28 @@
       state.assignmentUsers.forEach(user => { const label = document.createElement('label'); label.className = 'check'; const input = document.createElement('input'); input.type = 'checkbox'; input.value = String(user.id); input.checked = assigned.has(Number(user.id)); label.append(input, document.createTextNode(' ' + user.username + (user.is_admin ? '（管理员）' : ''))); users.append(label); });
       $('assignment-dialog').showModal();
     }
+    function renderAssignmentPreview(data) {
+      const plan = data.plan || data;
+      const body = $('assignment-preview'); body.replaceChildren();
+      [['新增', plan.add], ['已存在', plan.already_assigned], ['将移除', plan.remove], ['跳过', plan.skipped], ['无效', plan.invalid]].forEach(([label, values]) => {
+        const section = document.createElement('section'); section.className = 'details-section';
+        const heading = document.createElement('h4'); heading.textContent = label + '：' + (Array.isArray(values) ? values.length : 0); section.append(heading);
+        if (Array.isArray(values) && values.length) section.append(textLine('details-value', values.slice(0, 10).map(item => typeof item === 'string' ? item : (item.id || item.username || JSON.stringify(item))).join('、')));
+        body.append(section);
+      });
+    }
+    async function previewAssignment(payload) {
+      try {
+        const data = await api('__ADMIN_PATH__/api/devices/address-book/preview', { method: 'POST', body: JSON.stringify(payload) });
+        state.pendingAssignment = payload; renderAssignmentPreview(data); $('assignment-preview-error').textContent = ''; $('assignment-dialog').close(); $('assignment-preview-dialog').showModal();
+      } catch (error) { $('assignment-error').textContent = error.message; }
+    }
+    async function applyAssignment(payload) {
+      await api('__ADMIN_PATH__/api/devices/address-book', { method: 'POST', body: JSON.stringify(payload) });
+      state.selected.clear(); state.pendingAssignment = null; $('assignment-preview-dialog').close(); $('assignment-dialog').close(); await load(); setFeedback('通讯录分配已保存，目标用户将在下次同步时收到更新', 'success'); updateAssignmentButton();
+    }
 
-    function detailValue(value) { return value === undefined || value === null || value === '' ? '未上报' : String(value); }
+    function detailValue(value) { if (value === undefined || value === null || value === '') return '未上报'; if (typeof value === 'object') { try { return JSON.stringify(value, null, 2); } catch (_) { return String(value); } } return String(value); }
     function platformLabel(value) { const key = String(value || '').toLowerCase(); return key.startsWith('windows') ? 'Windows' : key.startsWith('android') ? 'Android' : key.startsWith('ios') ? 'iOS' : key.startsWith('mac') ? 'macOS' : key.startsWith('linux') ? 'Linux' : detailValue(value); }
     function distributionLabel(value) { const key = String(value || '').toLowerCase(); return ({ desktop: '安装版', sos: 'SOS', portable: '便携版', installed: '安装版', msi: 'MSI', appimage: 'AppImage', mobile: '移动端', linux_package: '软件包', live: '临时运行' })[key] || (key && key !== 'unknown' ? value : '未声明'); }
     function geoLabel(geo = {}) {
@@ -176,14 +209,17 @@
       return parts.map(value => String(value || '').trim()).filter((value, index, values) => value && values.indexOf(value) === index).join(' · ');
     }
     function deviceKey(device) { return JSON.stringify([String(device.id || ''), String(device.uuid || '')]); }
+    function installModeLabel(value) { const key = String(value || '').toLowerCase(); return ({ installed: '已安装运行', portable: '便携运行', live: '临时运行', service: '服务模式', sos: 'SOS 运行' })[key] || detailValue(value); }
     function openDetails(device) {
       $('details-device').textContent = (device.alias || device.hostname || device.id) + ' · ' + device.id;
       const groups = [
         ['身份', [['设备 ID', device.id], ['UUID', device.uuid], ['主机名', device.hostname], ['系统用户', device.username]]],
-        ['系统', [['操作系统', device.os || device.platform], ['CPU', device.cpu], ['内存', device.memory]]],
-        ['版本', [['平台', platformLabel(device.platform)], ['客户端版本', device.version_text || device.version], ['心跳协议版本', device.heartbeat_version], ['发行形态', distributionLabel(device.distribution)], ['运行模式', distributionLabel(device.install_mode)], ['架构', device.client_arch], ['可执行文件', device.executable_name]]],
+        ['系统', [['操作系统', device.os || device.platform], ['系统版本', device.os_version], ['CPU', device.cpu], ['内存', device.memory]]],
+        ['版本与运行', [['平台', platformLabel(device.platform)], ['客户端版本', device.version_text || device.version], ['发行形态', distributionLabel(device.distribution)], ['运行模式', installModeLabel(device.install_mode)], ['架构', device.client_arch], ['可执行文件', device.executable_name], ['产品', device.product], ['Edition', device.edition], ['Build number', device.build_number], ['Build sequence', device.build_seq], ['Channel', device.channel], ['Source commit', device.source_commit]]],
         ['网络', [['公网 IP', device.public_ip], ['地区', geoLabel(device.geo)], ['时区', device.geo?.timezone], ['内网 IP', Array.isArray(device.private_ips) ? device.private_ips.join('、') : device.private_ips]]],
-        ['状态', [['当前状态', labels[presence(device)]], ['最后心跳', device.last_heartbeat ? new Date(Number(device.last_heartbeat) * 1000).toLocaleString() : '从未上报'], ['当前连接数', Array.isArray(device.heartbeat_payload?.conns) ? device.heartbeat_payload.conns.length : '未上报']]],
+        ['状态', [['当前状态', labels[presence(device)]], ['最后心跳', device.last_heartbeat ? new Date(Number(device.last_heartbeat) * 1000).toLocaleString() : '从未上报'], ['最近活动', device.last_seen ? new Date(Number(device.last_seen) * 1000).toLocaleString() : '未上报'], ['当前连接数', Array.isArray(device.heartbeat_payload?.conns) ? device.heartbeat_payload.conns.length : '未上报'], ['通讯录用户', Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.join(', ') : '无']]],
+        ['升级遥测', [['最近检查', device.last_update_check], ['检查状态', device.last_update_status], ['错误信息', device.last_update_error], ['更新来源', device.last_update_source]]],
+        ['原始遥测', [['Heartbeat payload', device.heartbeat_payload], ['Runtime payload', device.runtime_payload], ['Network payload', device.network_payload]]],
       ];
       const body = $('details-body'); body.replaceChildren();
       groups.forEach(([title, entries]) => { const section = document.createElement('section'); section.className = 'details-section'; const heading = document.createElement('h4'); heading.textContent = title; section.append(heading); entries.forEach(([label, value]) => { const line = document.createElement('div'); line.className = 'details-line'; line.append(textLine('details-label', label), textLine('details-value', detailValue(value))); section.append(line); }); body.append(section); });
@@ -194,8 +230,8 @@
       row.replaceChildren(); row.dataset.deviceId = device.id; row.dataset.deviceKey = deviceKey(device);
       const selectCell = appendCell(row, '选择'); const select = document.createElement('input'); select.type = 'checkbox'; select.checked = state.selected.has(deviceKey(device)); select.setAttribute('aria-label', '选择客户端 ' + device.id); select.addEventListener('change', () => { if (select.checked) state.selected.set(deviceKey(device), device); else state.selected.delete(deviceKey(device)); updateAssignmentButton(); }); selectCell.append(select);
       const primary = appendCell(row, '客户端', 'primary-cell'); primary.append(textLine('cell-title device-name', device.hostname || device.id || '未知客户端')); primary.append(textLine('cell-subtitle device-id', device.id));
-      const aliasCell = appendCell(row, '备注'); const alias = String(device.alias || '').trim(); aliasCell.append(textLine(alias ? 'cell-title' : 'alias-empty', alias || '未备注')); if (device.deployed) aliasCell.append(textLine('cell-subtitle', '已部署登记')); const assignedCount = Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.length : 0; aliasCell.append(textLine('cell-subtitle', assignedCount ? '已分配给 ' + assignedCount + ' 个用户' : '未加入通讯录'));
-      const platformCell = appendCell(row, '版本 / 发行形态'); platformCell.append(textLine('cell-title release-title', [platformLabel(device.platform), distributionLabel(device.distribution)].join(' · '))); platformCell.append(textLine('cell-subtitle version-text', device.version || '版本未上报'));
+      const aliasCell = appendCell(row, '备注'); const alias = String(device.alias || '').trim(); aliasCell.append(textLine(alias ? 'cell-title' : 'alias-empty', alias || '未备注')); if (device.deployed || device.owner_username || device.deployment_owner) aliasCell.append(textLine('cell-subtitle', '当前归属：' + (device.owner_username || device.deployment_owner || '已登记'))); const assignedCount = Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.length : 0; aliasCell.append(textLine('cell-subtitle', assignedCount ? '通讯录分配：' + assignedCount + ' 个用户' : '通讯录分配：无'));
+      const platformCell = appendCell(row, '版本 / 发行形态'); platformCell.append(textLine('cell-title release-title', [platformLabel(device.platform), distributionLabel(device.distribution)].join(' · '))); platformCell.append(textLine('cell-subtitle version-text', '系统版本：' + (device.os_version || device.os || '未上报'))); platformCell.append(textLine('cell-subtitle version-text', '客户端：' + (device.version || '未上报') + ' · 运行：' + installModeLabel(device.install_mode)));
       const networkCell = appendCell(row, '网络'); networkCell.append(textLine('cell-title network-ip', device.public_ip || '公网 IP 未上报')); const location = geoLabel(device.geo); if (location) networkCell.append(textLine('cell-subtitle network-location', location));
       const statusCell = appendCell(row, '状态'); const currentPresence = presence(device); const badge = document.createElement('span'); badge.className = 'status-badge ' + currentPresence; badge.append(textLine('status-dot ' + currentPresence, ''), document.createTextNode(labels[currentPresence])); statusCell.append(badge);
       const activity = appendCell(row, '最近活动'); const timestamp = activityAt(device); activity.append(textLine('cell-title', relativeTime(timestamp))); if (timestamp) activity.append(textLine('cell-subtitle', new Date(timestamp * 1000).toLocaleString()));
@@ -268,7 +304,7 @@
       try {
         await api('__ADMIN_PATH__/api/devices/' + encodeURIComponent(device.id) + '?uuid=' + encodeURIComponent(device.uuid), { method: 'DELETE', body: '{}' });
         await load();
-      } catch (error) { setFeedback(error.message, 'error'); }
+      } catch (error) { const refs = Array.isArray(error.references) ? error.references : []; setFeedback(refs.length ? error.message + '：' + refs.map(item => item.username || item.user_id).join('、') : error.message, 'error'); }
     }
 
     function scheduleRefresh() {
@@ -281,16 +317,16 @@
     $('search').addEventListener('click', () => { state.q = $('q').value.trim(); load(); });
     $('q').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); $('search').click(); } });
     $('refresh').addEventListener('click', () => load());
-    $('presence-filter').addEventListener('change', render);
+    $('presence-filter').addEventListener('change', render); $('platform-filter').addEventListener('change', render); $('assigned-user-filter').addEventListener('change', render); $('version-filter').addEventListener('input', render);
     $('labelled-only').addEventListener('change', render);
     $('address-book-action').addEventListener('click', () => openAssignment());
     $('select-all-devices').addEventListener('change', event => { visibleDevices().forEach(device => { const key = deviceKey(device); if (event.target.checked) state.selected.set(key, device); else state.selected.delete(key); }); updateAssignmentButton(); render(); });
-    $('assignment-cancel').addEventListener('click', () => $('assignment-dialog').close());
+    $('assignment-cancel').addEventListener('click', () => $('assignment-dialog').close()); $('assignment-preview-cancel').addEventListener('click', () => { $('assignment-preview-dialog').close(); if (state.pendingAssignment) $('assignment-dialog').showModal(); }); $('assignment-preview-submit').addEventListener('click', async () => { const button = $('assignment-preview-submit'); button.disabled = true; try { await applyAssignment(state.pendingAssignment); } catch (error) { $('assignment-preview-error').textContent = error.message; } finally { button.disabled = false; } });
     $('assignment-form').addEventListener('submit', async event => {
       event.preventDefault(); const devices = selectedDevices(); const userIds = Array.from($('assignment-users').querySelectorAll('input:checked')).map(input => Number(input.value));
       if (!userIds.length) { $('assignment-error').textContent = '至少选择一个目标用户'; return; }
       $('assignment-save').disabled = true; $('assignment-error').textContent = '';
-      try { await api('__ADMIN_PATH__/api/devices/address-book', { method: 'POST', body: JSON.stringify({ devices: devices.map(device => ({ id: device.id, uuid: device.uuid })), user_ids: userIds, mode: $('assignment-mode').value }) }); state.selected.clear(); $('assignment-dialog').close(); await load(); setFeedback('通讯录分配已保存，目标用户将在下次同步时收到更新', 'success'); } catch (error) { $('assignment-error').textContent = error.message; } finally { $('assignment-save').disabled = false; updateAssignmentButton(); }
+      try { await previewAssignment({ devices: devices.map(device => ({ id: device.id, uuid: device.uuid })), user_ids: userIds, mode: $('assignment-mode').value }); } catch (error) { $('assignment-error').textContent = error.message; } finally { $('assignment-save').disabled = false; updateAssignmentButton(); }
     });
     $('auto-refresh').addEventListener('change', () => { setFeedback($('auto-refresh').checked ? '自动刷新已开启，每 5 秒更新' : '自动刷新已暂停', 'success'); });
     document.addEventListener('visibilitychange', () => { if (!document.hidden && $('auto-refresh').checked) load({ quiet: true }); });

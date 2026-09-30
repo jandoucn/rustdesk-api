@@ -119,6 +119,27 @@ class HttpClient:
 
 
 class IntegrationTest(unittest.TestCase):
+    def test_20_address_book_management_extensions(self):
+        csrf = self.admin_csrf()
+        _, options, _ = self.client.json("GET", "/?s=/ops-x9/api/address-book/assignment-options")
+        user_id = options["users"][0]["id"]
+        device_id = "extension-device-" + uuid.uuid4().hex[:8]
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_id + "-uuid", "conns": []})
+        preview = self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {"mode": "preview", "devices": [{"id": device_id, "uuid": device_id + "-uuid"}], "user_ids": [user_id]}, {"X-CSRF-Token": csrf})[1]
+        self.assertEqual(preview["mode"], "preview")
+        self.assertIn("snapshot", preview); self.assertIn("invalid", preview); self.assertIn("new", preview); self.assertIn("remove", preview)
+        self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {"mode": "add", "apply": True, "devices": [{"id": device_id, "uuid": device_id + "-uuid"}], "user_ids": [user_id]}, {"X-CSRF-Token": csrf})
+        _, owned, _ = self.client.json("GET", f"/?s=/ops-x9/api/address-book/users/{user_id}")
+        self.assertIn(device_id, {row["id"] for row in owned["data"]})
+        _, exported, ctype = self.client.request("GET", f"/?s=/ops-x9/api/address-book/export?user_id={user_id}&format=json")
+        self.assertIn("application/json", ctype)
+        self.assertIn(device_id, {peer["id"] for peer in exported["peers"]})
+        _, csv_body, csv_type = self.client.request("GET", f"/?s=/ops-x9/api/address-book/export?user_id={user_id}&format=csv")
+        self.assertIn("text/csv", csv_type)
+        self.assertIn(device_id, csv_body)
+        _, conflict, _ = self.client.json("DELETE", f"/?s=/ops-x9/api/devices/{device_id}?uuid={device_id}-uuid", {}, {"X-CSRF-Token": csrf}, expected=(409,))
+        self.assertTrue(conflict["references"])
+        self.client.request("GET", f"/?s=/ops-x9/api/address-book/export?user_id={user_id}&format=csv")
     runtime = None
     proc = None
     temp = None
@@ -904,7 +925,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(assigned, [(1, device_id), (2, device_id)])
         self.assertEqual(profile_count, 2)
         _, listing, _ = self.client.json("GET", "/?s=/ops-x9/api/devices?q=assignable-device&page=1&pageSize=20")
-        self.assertEqual(next(row for row in listing["data"] if row["id"] == device_id)["address_book_user_ids"], [1, 2])
+        self.assertEqual(sorted(next(row for row in listing["data"] if row["id"] == device_id)["address_book_user_ids"]), [1, 2])
         self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {
             "devices": [{"id": device_id, "uuid": uuid_value}], "user_ids": [2], "mode": "remove",
         }, {"X-CSRF-Token": csrf})

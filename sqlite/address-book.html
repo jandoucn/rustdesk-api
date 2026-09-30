@@ -51,8 +51,9 @@
           <div class="toolbar address-toolbar">
             <div class="field grow"><label for="address-search">搜索通讯录</label><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="m20 20-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><input id="address-search" class="input" placeholder="搜索 ID、别名、主机名或说明" autocomplete="off"></div></div>
             <div class="field filter"><label for="tag-filter">标签</label><select id="tag-filter" class="select"><option value="">全部标签</option></select></div>
+            <div class="field filter"><label for="address-presence-filter">在线状态</label><select id="address-presence-filter" class="select"><option value="all">全部状态</option><option value="online">在线</option><option value="recent">最近在线</option><option value="offline">离线</option><option value="unreported">未上报</option></select></div>
             <button id="search-address-book" class="button" type="button">搜索</button>
-            <div class="toolbar-switches"><label class="check" for="favorite-only"><input id="favorite-only" type="checkbox">仅后台收藏</label></div>
+            <div class="toolbar-switches"><label class="check" for="favorite-only"><input id="favorite-only" type="checkbox">仅后台收藏</label><button id="address-export-csv" class="button small" type="button">导出 CSV</button><button id="address-export-json" class="button small" type="button">导出 JSON</button><label class="button small" for="address-import">导入</label><input id="address-import" type="file" accept=".csv,.json,application/json,text/csv" hidden></div>
           </div>
           <p id="address-book-status" class="feedback" aria-live="polite">正在读取个人通讯录...</p>
           <div class="table-wrap">
@@ -110,7 +111,7 @@
   'use strict';
   (() => {
     const $ = id => document.getElementById(id);
-    const state = { csrf: '', user: null, page: 1, size: 50, total: 0, q: '', tag: '', favorite: false, peers: [], tags: [], summary: {}, loading: false, editingPeer: null, editingTag: null, confirmAction: null, returnToTags: false };
+    const state = { csrf: '', user: null, page: 1, size: 50, total: 0, q: '', tag: '', favorite: false, presence: 'all', peers: [], tags: [], summary: {}, loading: false, editingPeer: null, editingTag: null, confirmAction: null, returnToTags: false };
     const starIcon = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9L12 3Z" stroke-width="2" stroke-linejoin="round"/></svg>';
 
     async function api(url, options = {}) {
@@ -201,7 +202,7 @@
 
         const noteCell = appendCell(row, '说明'); noteCell.classList.add('note-cell'); noteCell.textContent = String(peer.note || '') || '-'; if (peer.note) noteCell.title = String(peer.note);
         const infoCell = appendCell(row, '客户端信息');
-        const identity = [peer.username, peer.platform].filter(Boolean).map(String).join(' · '); infoCell.append(textLine(identity ? 'cell-title' : 'muted', identity || '暂无上报信息'));
+        const identity = [peer.username, peer.platform].filter(Boolean).map(String).join(' · '); infoCell.append(textLine(identity ? 'cell-title' : 'muted', identity || '暂无上报信息')); if (peer.presence) infoCell.append(textLine('cell-subtitle', ({ online: '在线', recent: '最近在线', offline: '离线', unreported: '未上报' })[peer.presence] || peer.presence));
 
         const actionsCell = appendCell(row, '操作', 'actions-cell'); const actions = document.createElement('div'); actions.className = 'row-actions';
         const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'button small'; edit.textContent = '编辑客户端'; edit.setAttribute('aria-label', '编辑客户端'); edit.addEventListener('click', () => openPeerDialog(peer));
@@ -218,6 +219,7 @@
       try {
         const params = new URLSearchParams({ q: state.q, tag: state.tag, page: String(state.page), pageSize: String(state.size) });
         if (state.favorite) params.set('favorite', '1');
+        if (state.presence !== 'all') params.set('presence', state.presence);
         const data = await api('__ADMIN_PATH__/api/address-book?' + params);
         state.peers = Array.isArray(data.data) ? data.data : (Array.isArray(data.peers) ? data.peers : []);
         state.tags = (Array.isArray(data.tags) ? data.tags : []).map(normalizedTag).filter(tag => tag.name !== '');
@@ -324,7 +326,10 @@
     $('manage-tags').addEventListener('click', () => { resetTagEditor(); renderTagManagement(); $('tag-dialog').showModal(); }); $('tag-close').addEventListener('click', () => $('tag-dialog').close()); $('tag-form').addEventListener('submit', saveTag); $('tag-edit-cancel').addEventListener('click', resetTagEditor);
     $('confirm-cancel').addEventListener('click', () => { state.confirmAction = null; $('confirm-dialog').close(); if (state.returnToTags) { state.returnToTags = false; renderTagManagement(); $('tag-dialog').showModal(); } }); $('confirm-submit').addEventListener('click', runConfirm);
     $('search-address-book').addEventListener('click', () => { state.q = $('address-search').value.trim(); state.page = 1; load(); }); $('address-search').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); $('search-address-book').click(); } });
-    $('tag-filter').addEventListener('change', () => { state.tag = $('tag-filter').value; state.page = 1; load(); }); $('favorite-only').addEventListener('change', () => { state.favorite = $('favorite-only').checked; state.page = 1; load(); }); $('refresh-address-book').addEventListener('click', () => load());
+    $('tag-filter').addEventListener('change', () => { state.tag = $('tag-filter').value; state.page = 1; load(); }); $('address-presence-filter').addEventListener('change', () => { state.presence = $('address-presence-filter').value; state.page = 1; load(); }); $('favorite-only').addEventListener('change', () => { state.favorite = $('favorite-only').checked; state.page = 1; load(); }); $('refresh-address-book').addEventListener('click', () => load());
+    async function exportAddressBook(format) { const params = new URLSearchParams({ format, q: state.q, tag: state.tag, user_id: String(state.user?.id || '') }); const response = await fetch('__ADMIN_PATH__/api/address-book/export?' + params, { credentials: 'same-origin', headers: { Accept: format === 'json' ? 'application/json' : 'text/csv', 'X-CSRF-Token': state.csrf } }); if (!response.ok) throw Error('导出失败'); const blob = await response.blob(); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = 'rustdesk-address-book.' + (format === 'json' ? 'json' : 'csv'); link.click(); URL.revokeObjectURL(url); }
+    $('address-export-csv').addEventListener('click', () => exportAddressBook('csv').catch(error => setFeedback(error.message, 'error'))); $('address-export-json').addEventListener('click', () => exportAddressBook('json').catch(error => setFeedback(error.message, 'error')));
+    $('address-import').addEventListener('change', async event => { const file = event.target.files?.[0]; if (!file) return; try { const content = await file.text(); const format = file.name.toLowerCase().endsWith('.json') ? 'json' : 'csv'; const parsed = format === 'json' ? JSON.parse(content) : content; const payload = { format, data: parsed }; const data = await api('__ADMIN_PATH__/api/address-book/import/preview', { method: 'POST', body: JSON.stringify(payload) }); const plan = data.plan || {}; setFeedback('导入预览：' + (plan.add || []).length + ' 条新增、' + (plan.already_present || []).length + ' 条已存在、' + (plan.invalid || []).length + ' 条无效', 'success'); if (window.confirm('确认应用这份通讯录导入？')) { await api('__ADMIN_PATH__/api/address-book/import/apply', { method: 'POST', body: JSON.stringify(payload) }); await load({ quiet: true }); setFeedback('通讯录导入已应用', 'success'); } } catch (error) { setFeedback(error.message, 'error'); } finally { event.target.value = ''; } });
     $('address-prev').addEventListener('click', () => { if (state.page > 1) { state.page -= 1; load(); } }); $('address-next').addEventListener('click', () => { state.page += 1; load(); });
 
     api('__ADMIN_PATH__/api/session').then(data => {
