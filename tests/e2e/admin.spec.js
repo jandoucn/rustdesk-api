@@ -261,6 +261,38 @@ test('client inventory keeps runtime and network details aligned with persisted 
   await expect(refreshedRow).not.toContainText('stale');
 });
 
+test('client details edits a per-device update policy and persists after reload', async ({ page, request }) => {
+  const deviceId = `policy-ui-${Date.now().toString(36)}`;
+  const uuid = `${deviceId}-uuid`;
+  await reportClient(request, deviceId, `${deviceId}-host`);
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  const dialog = page.locator('#details-dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('更新策略', { exact: true })).toBeVisible();
+  await dialog.locator('#update-mode').selectOption('disabled');
+  await dialog.locator('#update-channel').selectOption('beta');
+  await dialog.locator('#update-version').fill('1.6.0');
+  await dialog.locator('#update-build').fill('2026100102');
+  await dialog.getByRole('button', { name: '保存更新策略' }).click();
+  await expect(page.getByText('客户端更新策略已保存')).toBeVisible();
+  await dialog.locator('#details-close').click();
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  await expect(dialog.locator('#update-mode')).toHaveValue('disabled');
+  await expect(dialog.locator('#update-channel')).toHaveValue('beta');
+  await expect(dialog.locator('#update-version')).toHaveValue('1.6.0');
+  await expect(dialog.locator('#update-build')).toHaveValue('2026100102');
+  await dialog.locator('#update-build').fill('bad');
+  await dialog.getByRole('button', { name: '保存更新策略' }).click();
+  await expect(dialog.locator('#update-policy-error')).toContainText('build_seq');
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+});
+
 test('client inventory formats domestic and foreign IP locations without repeating China', async ({ page, request }) => {
   test.skip(!process.env.RUSTDESK_API_CONTAINER, 'requires direct SQL assertions in the API container');
   const deviceId = `geo-format-${Date.now().toString(36)}`;

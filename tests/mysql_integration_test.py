@@ -27,6 +27,18 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.assertEqual(status, 200); self.assertIn("text/csv", csv_type); self.assertIn(device_id, csv_body)
         _, conflict, _ = self.client.json("DELETE", f"/ops-x9/api/devices/{device_id}?uuid={device_id}-uuid", {}, {"X-CSRF-Token": csrf}, expected=(409,))
         self.assertTrue(conflict["references"])
+
+    def test_21_device_update_policy_round_trip_and_sql(self):
+        csrf = self.admin_login()
+        device_id, uuid = "mysql-policy-" + str(int(time.time())), "mysql-policy-uuid"
+        self.client.json("POST", "/api/heartbeat", {"id": device_id, "uuid": uuid, "conns": []})
+        _, initial, _ = self.client.json("GET", f"/ops-x9/api/update/policies/{device_id}?uuid={uuid}")
+        self.assertEqual(initial["mode"], "notify")
+        _, saved, _ = self.client.json("PATCH", f"/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "disabled", "channel": "stable", "target_version": None, "target_build_seq": None, "auto_install": False}, {"X-CSRF-Token": csrf})
+        self.assertEqual(saved["mode"], "disabled")
+        _, persisted, _ = self.client.json("GET", f"/ops-x9/api/update/policies/{device_id}?uuid={uuid}")
+        self.assertEqual(persisted["mode"], "disabled")
+        self.assertEqual(self.sql(f"SELECT mode,channel,auto_install FROM device_update_policies WHERE id='{device_id}' AND uuid='{uuid}'"), ["disabled\tstable\t0"])
     @classmethod
     def setUpClass(cls):
         cls.client = HttpClient(os.environ.get("RUSTDESK_TEST_URL", "http://127.0.0.1:17000"))

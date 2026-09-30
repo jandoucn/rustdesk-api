@@ -49,6 +49,9 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .details-line { display: grid; grid-template-columns: minmax(90px, 0.35fr) minmax(0, 1fr); gap: 12px; padding: 5px 0; border-top: 1px solid var(--border); }
 .details-label { color: var(--muted); font-size: 12px; }
 .details-value { min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+.update-policy-section { grid-column: 1 / -1; }
+.policy-controls { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 10px 0; }
+@media (max-width: 760px) { .policy-controls { grid-template-columns: 1fr 1fr; } }
 
 .shell { display: grid; grid-template-columns: var(--sidebar) minmax(0, 1fr); min-height: 100vh; }
 .sidebar {

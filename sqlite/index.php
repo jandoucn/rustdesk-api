@@ -961,7 +961,15 @@ try {
     if ($adminApi && preg_match('#^/admin/api/update/policies(?:/([^/]+))?$#',$path,$match)) {
         $actor=admin_user($db); $id=isset($match[1])?rawurldecode($match[1]):'';
         if($id===''&&$_SERVER['REQUEST_METHOD']==='GET'){ reply(['data'=>db_all($db,'SELECT * FROM device_update_policies ORDER BY updated_at DESC')]); }
+        if($id!==''&&$_SERVER['REQUEST_METHOD']==='GET'){
+            $uuid=text_field($_GET,'uuid',256); if($uuid==='')fail(422,'设备 UUID 不能为空');
+            $channel=text_field($_GET,'channel',32,'stable'); if(!in_array($channel,['stable','beta'],true))fail(422,'更新通道无效');
+            reply(update_policy($db,$id,$uuid,$channel));
+        }
         method('PATCH'); csrf_check(); $d=json_body(); $uuid=text_field($d,'uuid',256); if($id===''||$uuid==='')fail(422,'设备 ID 和 UUID 不能为空'); $mode=update_mode(text_field($d,'mode',32,'notify')); $channel=text_field($d,'channel',32,'stable'); $existing=db_one($db,'SELECT policy_revision FROM device_update_policies WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]); $revision=((int)($existing['policy_revision']??0))+1;
+        if(!in_array($channel,['stable','beta'],true))fail(422,'更新通道无效');
+        if(array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null){ $build=$d['target_build_seq']; $valid=(is_int($build)&&$build>=0)||(is_string($build)&&ctype_digit($build)); if(!$valid)fail(422,'build_seq 必须是非负整数'); }
+        if(array_key_exists('auto_install',$d)&&!is_bool($d['auto_install'])&&!in_array($d['auto_install'],[0,1,'0','1'],true))fail(422,'auto_install 必须是布尔值');
         db_upsert($db,'device_update_policies',['id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'target_version'=>array_key_exists('target_version',$d)?text_field($d,'target_version',32):null,'target_build_seq'=>array_key_exists('target_build_seq',$d)?(int)$d['target_build_seq']:null,'auto_install'=>(int)($d['auto_install']??false),'policy_revision'=>$revision,'updated_by'=>(int)$actor['id'],'updated_at'=>time()],['id','uuid'],['mode','channel','target_version','target_build_seq','auto_install','policy_revision','updated_by','updated_at']); admin_event($db,(int)$actor['id'],'update_device_policy',0); reply(['ok'=>true,'id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'policy_revision'=>$revision]);
     }
     if ($adminApi && preg_match('#^/admin/api/update/events(?:/([^/]+))?$#',$path,$match)) { admin_user($db); $id=isset($match[1])?rawurldecode($match[1]):''; $where=$id?' WHERE device_id=:id':''; reply(['data'=>db_all($db,'SELECT * FROM device_update_events'.$where.' ORDER BY started_at DESC LIMIT 200',$id?['id'=>$id]:[])]); }

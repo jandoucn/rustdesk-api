@@ -96,6 +96,19 @@
     <div class="dialog-form">
       <div class="dialog-head"><h3 id="details-title">客户端详情</h3><p id="details-device"></p></div>
       <div id="details-body" class="details-grid"></div>
+      <section class="details-section update-policy-section" aria-labelledby="update-policy-title">
+        <h4 id="update-policy-title">更新策略</h4>
+        <p class="muted">仅影响当前客户端，不需要重新打包客户端。客户端下次检查更新时生效。</p>
+        <div class="policy-controls">
+          <div class="field"><label for="update-mode">更新方式</label><select id="update-mode" class="select"><option value="notify">仅提示</option><option value="download">自动下载</option><option value="auto_install">自动安装</option><option value="disabled">关闭更新</option></select></div>
+          <div class="field"><label for="update-channel">更新通道</label><select id="update-channel" class="select"><option value="stable">stable</option><option value="beta">beta</option></select></div>
+          <div class="field"><label for="update-version">指定版本（可选）</label><input id="update-version" class="input" maxlength="32" placeholder="例如 1.5.0" autocomplete="off"></div>
+          <div class="field"><label for="update-build">指定 build_seq（可选）</label><input id="update-build" class="input" inputmode="numeric" pattern="[0-9]*" placeholder="例如 2026100101" autocomplete="off"></div>
+        </div>
+        <p id="update-policy-summary" class="muted" aria-live="polite"></p>
+        <p id="update-policy-error" class="form-error" role="alert"></p>
+        <button id="update-policy-save" class="button primary" type="button">保存更新策略</button>
+      </section>
       <div class="dialog-actions"><button id="details-close" class="button" type="button">关闭</button></div>
     </div>
   </dialog>
@@ -126,7 +139,7 @@
       });
     }
     const labels = { online: '在线', recent: '最近在线', offline: '离线', unreported: '未上报' };
-    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, aliasDevice: null, timer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [], pendingAssignment: null };
+    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, aliasDevice: null, policyDevice: null, timer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [], pendingAssignment: null };
 
     async function api(url, options = {}) {
       const headers = new Headers(options.headers || {});
@@ -235,6 +248,30 @@
     }
     function deviceKey(device) { return JSON.stringify([String(device.id || ''), String(device.uuid || '')]); }
     function installModeLabel(value) { const key = String(value || '').toLowerCase(); return ({ installed: '已安装运行', portable: '便携运行', live: '临时运行', service: '服务模式', sos: 'SOS 运行' })[key] || detailValue(value); }
+    const updateModeLabels = { notify: '仅提示', download: '自动下载', auto_install: '自动安装', disabled: '关闭更新' };
+    function updatePolicySummary() {
+      const mode = $('update-mode').value; const channel = $('update-channel').value; const version = $('update-version').value.trim(); const build = $('update-build').value.trim();
+      const target = [version && ('版本 ' + version), build && ('build_seq ' + build)].filter(Boolean).join(' / ');
+      $('update-policy-summary').textContent = '当前设置：' + updateModeLabels[mode] + ' · ' + channel + (target ? ' · 目标 ' + target : ' · 跟随最新版本');
+    }
+    async function loadUpdatePolicy(device) {
+      state.policyDevice = device; $('update-policy-error').textContent = ''; $('update-policy-save').disabled = true;
+      try {
+        const policy = await api('__ADMIN_PATH__/api/update/policies/' + encodeURIComponent(device.id) + '?uuid=' + encodeURIComponent(device.uuid) + '&channel=' + encodeURIComponent(device.channel || 'stable'));
+        $('update-mode').value = policy.mode || 'notify'; $('update-channel').value = policy.channel || 'stable'; $('update-version').value = policy.target_version || ''; $('update-build').value = policy.target_build_seq == null ? '' : String(policy.target_build_seq); updatePolicySummary();
+      } catch (error) { $('update-policy-error').textContent = error.message; }
+      finally { $('update-policy-save').disabled = false; }
+    }
+    async function saveUpdatePolicy() {
+      const device = state.policyDevice; if (!device) return;
+      const build = $('update-build').value.trim(); if (build && !/^\d+$/.test(build)) { $('update-policy-error').textContent = 'build_seq 必须是非负整数'; return; }
+      $('update-policy-save').disabled = true; $('update-policy-error').textContent = '';
+      try {
+        await api('__ADMIN_PATH__/api/update/policies/' + encodeURIComponent(device.id), { method: 'PATCH', body: JSON.stringify({ uuid: device.uuid, mode: $('update-mode').value, channel: $('update-channel').value, target_version: $('update-version').value.trim() || null, target_build_seq: build ? Number(build) : null, auto_install: $('update-mode').value === 'auto_install' }) });
+        await loadUpdatePolicy(device); setFeedback('客户端更新策略已保存', 'success');
+      } catch (error) { $('update-policy-error').textContent = error.message; }
+      finally { $('update-policy-save').disabled = false; }
+    }
     function openDetails(device) {
       $('details-title').textContent = '客户端详情';
       $('details-device').textContent = [device.alias || device.hostname || device.id, device.id].filter(Boolean).join(' · ');
@@ -257,6 +294,7 @@
         });
         body.append(section);
       });
+      loadUpdatePolicy(device);
       $('details-dialog').showModal();
     }
 
@@ -366,6 +404,9 @@
     document.addEventListener('visibilitychange', () => { if (!document.hidden && $('auto-refresh').checked) load({ quiet: true }); });
     $('alias-cancel').addEventListener('click', () => $('alias-dialog').close());
     $('details-close').addEventListener('click', () => $('details-dialog').close());
+    ['update-mode', 'update-channel'].forEach(id => $(id).addEventListener('change', updatePolicySummary));
+    ['update-version', 'update-build'].forEach(id => $(id).addEventListener('input', updatePolicySummary));
+    $('update-policy-save').addEventListener('click', saveUpdatePolicy);
     bindDialogDismiss();
     $('alias-form').addEventListener('submit', async event => {
       event.preventDefault();

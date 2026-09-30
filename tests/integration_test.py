@@ -457,6 +457,26 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(db.execute("SELECT status,to_build_seq FROM device_update_events WHERE device_id='update-device'").fetchone(), ("installed", 2026100101))
         db.close()
 
+    def test_admin_device_update_policy_round_trip_and_validation(self):
+        csrf = self.admin_csrf()
+        device_id, uuid = "policy-device", "policy-device-uuid"
+        self.client.json("POST", "/?s=/rd/update/v1/check", {"client_id": device_id, "client_uuid": uuid, "version": "1.5.0", "build_seq": 1, "channel": "stable"})
+        _, initial, _ = self.client.json("GET", f"/?s=/ops-x9/api/update/policies/{device_id}?uuid={uuid}")
+        self.assertEqual(initial["mode"], "notify")
+        _, saved, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "auto_install", "channel": "beta", "target_version": "1.6.0", "target_build_seq": 2026100102, "auto_install": True}, {"X-CSRF-Token": csrf})
+        self.assertEqual(saved["mode"], "auto_install")
+        _, persisted, _ = self.client.json("GET", f"/?s=/ops-x9/api/update/policies/{device_id}?uuid={uuid}&channel=stable")
+        self.assertEqual((persisted["mode"], persisted["channel"], persisted["target_version"], int(persisted["target_build_seq"])), ("auto_install", "beta", "1.6.0", 2026100102))
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT mode,channel,target_version,target_build_seq,auto_install FROM device_update_policies WHERE id=? AND uuid=?", (device_id, uuid)).fetchone(), ("auto_install", "beta", "1.6.0", 2026100102, 1))
+        db.close()
+        status, error, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "target_build_seq": "not-a-number"}, {"X-CSRF-Token": csrf}, expected=(422,))
+        self.assertEqual(status, 422)
+        self.assertIn("build_seq", error["error"])
+        status, error, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "target_build_seq": -1}, {"X-CSRF-Token": csrf}, expected=(422,))
+        self.assertEqual(status, 422)
+        self.assertIn("build_seq", error["error"])
+
     def test_06_admin_session_csrf_login_and_user_lifecycle(self):
         status, session, _ = self.client.json("GET", "/?s=/ops-x9/api/session")
         self.assertEqual(status, 200)
