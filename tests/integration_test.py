@@ -161,6 +161,12 @@ class IntegrationTest(unittest.TestCase):
         # Production defaults to a custom path; tests explicitly pin the public path for compatibility cases.
         env["RUSTDESK_ADMIN_PATH"] = "/ops-x9"
         env["RUSTDESK_TRUSTED_PROXY_IPS"] = "127.0.0.0/8"
+        env["RUSTDESK_UPDATE_PUBLISH_TOKEN"] = "p" * 48
+        env["RUSTDESK_UPDATE_DOWNLOAD_PREFIX"] = "https://download.yan.life/rustdesk/stable/"
+        env["RUSTDESK_UPDATE_KEYS_JSON"] = json.dumps({
+            "schema": 1,
+            "keys": [{"id": "yan-release-2026", "algorithm": "ed25519", "public_key": "k" * 44}],
+        })
         if os.environ.get("RUSTDESK_GEOIP_DATABASE"):
             env["RUSTDESK_GEOIP_DATABASE"] = os.environ["RUSTDESK_GEOIP_DATABASE"]
         if runtime.name == "frankenphp":
@@ -456,6 +462,86 @@ class IntegrationTest(unittest.TestCase):
         db = sqlite3.connect(self.db)
         self.assertEqual(db.execute("SELECT status,to_build_seq FROM device_update_events WHERE device_id='update-device'").fetchone(), ("installed", 2026100101))
         db.close()
+
+    def test_machine_publish_validates_manifest_and_drives_platform_checks(self):
+        asset = {
+            "primary": "https://download.yan.life/rustdesk/stable/v1.5.0-build-2026.09.30-01/rustdesk-1.5.0-standard-windows-x86_64.exe",
+            "mirrors": [], "size": 12, "sha256": "a" * 64,
+            "signature": __import__("base64").b64encode(b"s" * 64).decode(), "signature_key_id": "yan-release-2026",
+        }
+        msi_asset = dict(asset, primary=asset["primary"].removesuffix(".exe") + ".msi")
+        manifest = {
+            "version": "1.5.0", "build_number": "20260930.5", "build_seq": 2026093005,
+            "product": "rustdesk-yan", "edition": "standard", "channel": "stable",
+            "source_commit": "commit-sha", "targets": {
+                "windows-x86_64-exe-standard": asset,
+                "windows-x86_64-msi-standard": msi_asset,
+            },
+        }
+        auth = {"Authorization": "Bearer " + "p" * 48}
+        status, published, _ = self.client.json(
+            "POST", "/?s=/rd/update/v1/publish", manifest, auth, expected=(201,)
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(published["build_seq"], 2026093005)
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/publish", manifest, auth, expected=(200, 201))[1]["build_seq"], 2026093005)
+        conflict = json.loads(json.dumps(manifest)); conflict["source_commit"] = "different-commit"
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/publish", conflict, auth, expected=(409,))[0], 409)
+        rollback = json.loads(json.dumps(manifest)); rollback["version"] = "1.4.9"; rollback["build_seq"] = 2026093004
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/publish", rollback, auth, expected=(409,))[0], 409)
+
+        request = {
+            "client_id": "update-standard", "client_uuid": "update-standard-uuid",
+            "product": "rustdesk-yan", "edition": "standard", "version": "1.5.0",
+            "build_seq": 2026093004, "channel": "stable", "platform": "windows",
+            "arch": "x86_64", "package_kind": "exe", "distribution": "desktop", "install_mode": "portable",
+        }
+        _, check, _ = self.client.json("POST", "/?s=/rd/update/v1/check", request)
+        self.assertTrue(check["update_available"])
+        self.assertEqual(check["url"], asset["primary"])
+        self.assertEqual(check["manifest"]["targets"]["windows-x86_64-exe-standard"]["sha256"], "a" * 64)
+        request["target_key"] = "windows-x86_64-msi-standard"
+        _, exact, _ = self.client.json("POST", "/?s=/rd/update/v1/check", request)
+        self.assertEqual(exact["url"], msi_asset["primary"])
+        request.pop("target_key"); request["package_kind"] = "msi"
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/check", request)[1]["url"], msi_asset["primary"])
+        request.pop("package_kind")
+        self.assertFalse(self.client.json("POST", "/?s=/rd/update/v1/check", request)[1]["update_available"])
+        request["package_kind"] = "exe"; request["build_seq"] = 2026093005
+        self.assertFalse(self.client.json("POST", "/?s=/rd/update/v1/check", request)[1]["update_available"])
+        request["build_seq"] = 2026093004
+        _, public_manifest, _ = self.client.json("GET", "/?s=/rd/update/v1/manifest/stable.json")
+        self.assertEqual(public_manifest, manifest)
+        _, keys, _ = self.client.json("GET", "/?s=/rd/update/v1/keys.json")
+        self.assertEqual(keys["keys"][0]["id"], "yan-release-2026")
+        request["edition"] = "sos"
+        self.assertFalse(self.client.json("POST", "/?s=/rd/update/v1/check", request)[1]["update_available"])
+        request["edition"] = "standard"; request["platform"] = "macos"; request["arch"] = "aarch64"
+        self.assertFalse(self.client.json("POST", "/?s=/rd/update/v1/check", request)[1]["update_available"])
+
+        db = sqlite3.connect(self.db)
+        stored = db.execute(
+            "SELECT manifest FROM update_releases WHERE version='1.5.0' AND build_seq=2026093005 AND channel='stable'"
+        ).fetchone()
+        release_count = db.execute("SELECT COUNT(*) FROM update_releases WHERE channel='stable'").fetchone()[0]
+        db.close()
+        self.assertEqual(json.loads(stored[0])["edition"], "standard")
+        self.assertEqual(release_count, 1)
+
+        bad = json.loads(json.dumps(manifest)); bad["targets"]["windows-x86_64-exe-standard"]["sha256"] = "bad"
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/publish", bad, auth, expected=(422,))[0], 422)
+        bad = json.loads(json.dumps(manifest)); bad["targets"]["windows-x86_64-exe-standard"]["size"] = 0
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/publish", bad, auth, expected=(422,))[0], 422)
+        bad = json.loads(json.dumps(manifest)); bad["targets"]["windows-x86_64-exe-standard"]["signature"] = "invalid"
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/publish", bad, auth, expected=(422,))[0], 422)
+        bad = json.loads(json.dumps(manifest)); bad["targets"]["windows-x86_64-exe-standard"]["primary"] = "https://evil.example/rustdesk.exe"
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/publish", bad, auth, expected=(422,))[0], 422)
+        bad = json.loads(json.dumps(manifest)); bad["targets"]["windows-x86_64-exe-standard"]["signature_key_id"] = "unknown-key"
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/publish", bad, auth, expected=(422,))[0], 422)
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/publish", manifest, expected=(401,))[0], 401)
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/events", {
+            "client_id": "update-standard", "client_uuid": "update-standard-uuid", "status": "unknown",
+        }, expected=(422,))[0], 422)
 
     def test_admin_device_update_policy_round_trip_and_validation(self):
         csrf = self.admin_csrf()

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """HTTP CRUD plus direct SQL assertions against the MySQL container stack."""
 
+import base64
 import json
 import os
 import subprocess
@@ -568,6 +569,43 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.assertTrue(check["update_available"])
         self.client.json("POST", "/rd/update/v1/events", {"client_id": "mysql-update-device", "client_uuid": "mysql-update-uuid", "status": "installed", "to_build_seq": 2026100101}, expected=(201,))
         self.assertEqual(self.sql("SELECT status,to_build_seq FROM device_update_events WHERE device_id='mysql-update-device'"), ["installed\t2026100101"])
+
+    def test_19b_machine_publish_and_platform_selection(self):
+        tag = "v1.5.0-build-2026.09.30-01"
+        target = {"primary": f"https://download.yan.life/rustdesk/stable/{tag}/rustdesk-1.5.0-standard-windows-x86_64.exe", "mirrors": [], "size": 12, "sha256": "a" * 64, "signature": base64.b64encode(b"s" * 64).decode(), "signature_key_id": "yan-release-2026"}
+        msi_target = dict(target, primary=target["primary"].removesuffix(".exe") + ".msi")
+        manifest = {"version": "1.5.0", "build_number": "20261002.1", "build_seq": 2026100201, "product": "rustdesk-yan", "edition": "standard", "channel": "stable", "source_commit": "commit-sha", "targets": {"windows-x86_64-exe-standard": target, "windows-x86_64-msi-standard": msi_target}}
+        auth = {"Authorization": "Bearer " + os.environ["RUSTDESK_UPDATE_PUBLISH_TOKEN"]}
+        self.client.json("POST", "/rd/update/v1/publish", manifest, auth, expected=(201,))
+        self.assertEqual(self.client.json("POST", "/rd/update/v1/publish", manifest, auth, expected=(200, 201))[1]["build_seq"], 2026100201)
+        conflict = json.loads(json.dumps(manifest)); conflict["source_commit"] = "different-commit"
+        self.assertEqual(self.client.json("POST", "/rd/update/v1/publish", conflict, auth, expected=(409,))[0], 409)
+        rollback = json.loads(json.dumps(manifest)); rollback["version"] = "1.4.9"; rollback["build_seq"] = 2026100100
+        self.assertEqual(self.client.json("POST", "/rd/update/v1/publish", rollback, auth, expected=(409,))[0], 409)
+        request = {"client_id": "mysql-machine-update", "client_uuid": "mysql-machine-update-uuid", "product": "rustdesk-yan", "edition": "standard", "version": "1.5.0", "build_seq": 1, "channel": "stable", "platform": "windows", "arch": "x86_64", "package_kind": "exe", "distribution": "desktop", "install_mode": "portable"}
+        _, check, _ = self.client.json("POST", "/rd/update/v1/check", request)
+        self.assertTrue(check["update_available"])
+        self.assertEqual(check["url"], target["primary"])
+        request["target_key"] = "windows-x86_64-msi-standard"
+        self.assertEqual(self.client.json("POST", "/rd/update/v1/check", request)[1]["url"], msi_target["primary"])
+        request.pop("target_key"); request.pop("package_kind")
+        self.assertFalse(self.client.json("POST", "/rd/update/v1/check", request)[1]["update_available"])
+        request["package_kind"] = "exe"; request["build_seq"] = 2026100201
+        self.assertFalse(self.client.json("POST", "/rd/update/v1/check", request)[1]["update_available"])
+        self.assertEqual(self.client.json("GET", "/rd/update/v1/manifest/stable.json")[1], manifest)
+        self.assertEqual(self.client.json("GET", "/rd/update/v1/keys.json")[1]["keys"][0]["id"], "yan-release-2026")
+        self.assertEqual(self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(manifest,'$.edition')) FROM update_releases WHERE version='1.5.0' AND build_seq=2026100201 AND channel='stable'"), ["standard"])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM update_releases WHERE channel='stable' AND build_seq>=2026100100"), ["2"])
+        self.assertEqual(self.client.json("POST", "/rd/update/v1/publish", manifest, expected=(401,))[0], 401)
+        bad = json.loads(json.dumps(manifest)); bad["targets"]["windows-x86_64-exe-standard"]["sha256"] = "bad"
+        self.assertEqual(self.client.json("POST", "/rd/update/v1/publish", bad, auth, expected=(422,))[0], 422)
+        bad = json.loads(json.dumps(manifest)); bad["targets"]["windows-x86_64-exe-standard"]["size"] = 0
+        self.assertEqual(self.client.json("POST", "/rd/update/v1/publish", bad, auth, expected=(422,))[0], 422)
+        bad = json.loads(json.dumps(manifest)); bad["targets"]["windows-x86_64-exe-standard"]["signature"] = "invalid"
+        self.assertEqual(self.client.json("POST", "/rd/update/v1/publish", bad, auth, expected=(422,))[0], 422)
+        bad = json.loads(json.dumps(manifest)); bad["targets"]["windows-x86_64-exe-standard"]["signature_key_id"] = "unknown-key"
+        self.assertEqual(self.client.json("POST", "/rd/update/v1/publish", bad, auth, expected=(422,))[0], 422)
+        self.assertEqual(self.client.json("POST", "/rd/update/v1/events", {"client_id": "mysql-machine-update", "client_uuid": "mysql-machine-update-uuid", "status": "unknown"}, expected=(422,))[0], 422)
 
     def test_20_release_identity_round_trip(self):
         device_id = "mysql-release"

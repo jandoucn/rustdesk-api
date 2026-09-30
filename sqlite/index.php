@@ -426,12 +426,49 @@ function compare_release(array $a, array $b): int
     return $av <=> $bv ?: ((int)($a['build_seq'] ?? 0) <=> (int)($b['build_seq'] ?? 0));
 }
 function update_mode(string $mode): string { return in_array($mode, ['disabled','notify','download','auto_install'], true) ? $mode : 'notify'; }
-function public_update_manifest(PDO $db, string $channel, ?string $targetVersion = null, ?int $targetBuild = null): ?array
+function update_target_candidates(array $client): array
+{
+    $targetKey = text_field($client, 'target_key', 128);
+    if ($targetKey !== '') return [$targetKey];
+    $platform = strtolower(text_field($client, 'platform', 32));
+    $arch = strtolower(text_field($client, 'arch', 32));
+    $edition = strtolower(text_field($client, 'edition', 32));
+    $packageKind = strtolower(text_field($client, 'package_kind', 16));
+    if ($platform === '' || $arch === '') return [];
+    $allowedKinds = match ($platform) {
+        'windows' => ['exe', 'msi'],
+        'macos' => ['dmg'],
+        'linux' => ['appimage'],
+        'android' => ['apk'],
+        default => [],
+    };
+    if ($packageKind === '' || !in_array($packageKind, $allowedKinds, true)) return [];
+    $keys = [];
+    if ($edition !== '') $keys[] = "$platform-$arch-$packageKind-$edition";
+    $keys[] = "$platform-$arch-$packageKind";
+    return $keys;
+}
+function manifest_supports_client(array $manifest, array $client): bool
+{
+    foreach (['product', 'edition'] as $field) {
+        $wanted = text_field($client, $field, 64);
+        if ($wanted !== '' && isset($manifest[$field]) && (string)$manifest[$field] !== $wanted
+            && !($field === 'edition' && (string)$manifest[$field] === 'multi')) return false;
+    }
+    $candidates = update_target_candidates($client);
+    if (!$candidates) return text_field($client, 'target_key', 128) === ''
+        && text_field($client, 'platform', 32) === '' && text_field($client, 'arch', 32) === '';
+    $targets = is_array($manifest['targets'] ?? null) ? $manifest['targets'] : [];
+    foreach ($candidates as $key) if (isset($targets[$key]) && is_array($targets[$key])) return true;
+    return false;
+}
+function public_update_manifest(PDO $db, string $channel, ?string $targetVersion = null, ?int $targetBuild = null, array $client = []): ?array
 {
     $best = null;
     foreach (db_all($db, 'SELECT version,build_seq,channel,manifest FROM update_releases WHERE channel=:channel AND active=1', ['channel'=>$channel]) as $row) {
         $manifest = decoded_payload($row['manifest']); $manifest['version'] ??= $row['version']; $manifest['build_seq'] ??= (int)$row['build_seq']; $manifest['channel'] ??= $row['channel'];
         if ($targetVersion !== null && $targetVersion !== '' && compare_release($manifest, ['version'=>$targetVersion,'build_seq'=>$targetBuild ?? PHP_INT_MAX]) > 0) continue;
+        if ($client && !manifest_supports_client($manifest, $client)) continue;
         if ($best === null || compare_release($manifest, $best) > 0) $best = $manifest;
     }
     return $best;
@@ -446,12 +483,99 @@ function update_check_response(PDO $db, array $data): array
     if ($id === '' || $uuid === '') fail(422, '缺少客户端 ID 或 UUID');
     remember_release_identity($db, $data);
     $version = text_field($data, 'version', 32, '0.0.0'); $build = (int)($data['build_seq'] ?? 0); $channel = text_field($data, 'channel', 32, 'stable'); $policy = update_policy($db, $id, $uuid, $channel); $channel = (string)($policy['channel'] ?: $channel);
-    $manifest = public_update_manifest($db, $channel, $policy['target_version'] ?? null, isset($policy['target_build_seq']) ? (int)$policy['target_build_seq'] : null); $mode = update_mode((string)$policy['mode']);
+    $manifest = public_update_manifest($db, $channel, $policy['target_version'] ?? null, isset($policy['target_build_seq']) ? (int)$policy['target_build_seq'] : null, $data); $mode = update_mode((string)$policy['mode']);
     $base = rtrim((string)(getenv('RUSTDESK_UPDATE_BASE_URL') ?: ''), '/'); $empty = ['update_available'=>false,'mode'=>$mode,'auto_install'=>(bool)$policy['auto_install'],'channel'=>$channel,'current_version'=>$version,'current_build_seq'=>$build,'policy_revision'=>(int)$policy['policy_revision']];
     if (!$manifest) return $empty;
-    foreach (['product','edition','platform','arch'] as $field) if (isset($manifest[$field]) && text_field($data, $field, 64) !== (string)$manifest[$field]) return $empty;
+    foreach (['product','edition'] as $field) if (isset($manifest[$field]) && text_field($data, $field, 64) !== (string)$manifest[$field]
+        && !($field === 'edition' && (string)$manifest[$field] === 'multi')) return $empty;
     $targetVersion=(string)($manifest['version']??'0.0.0'); $targetBuild=(int)($manifest['build_seq']??0); if (compare_release(['version'=>$targetVersion,'build_seq'=>$targetBuild],['version'=>$version,'build_seq'=>$build]) <= 0) return $empty;
-    return array_merge($empty, ['update_available'=>true,'target_version'=>$targetVersion,'target_build_seq'=>$targetBuild,'manifest_url'=>$base.'/rd/update/v1/manifest/'.rawurlencode($channel).'.json','manifest'=>$manifest]);
+    $url = '';
+    foreach (update_target_candidates($data) as $key) if (isset($manifest['targets'][$key]['primary'])) { $url=(string)$manifest['targets'][$key]['primary']; break; }
+    return array_merge($empty, ['update_available'=>true,'target_version'=>$targetVersion,'target_build_seq'=>$targetBuild,'url'=>$url,'manifest_url'=>$base.'/rd/update/v1/manifest/'.rawurlencode($channel).'.json','manifest'=>$manifest]);
+}
+function publish_token_auth(): void
+{
+    $expected = (string)(getenv('RUSTDESK_UPDATE_PUBLISH_TOKEN') ?: '');
+    if ($expected === '' || !preg_match('/^Bearer\s+([^\s]{32,256})$/', trim((string)($_SERVER['HTTP_AUTHORIZATION'] ?? '')), $match)
+        || !hash_equals($expected, $match[1])) fail(401, '缺少有效发布凭据');
+}
+function configured_update_keys(): array
+{
+    $raw = (string)(getenv('RUSTDESK_UPDATE_KEYS_JSON') ?: '{"schema":1,"keys":[]}');
+    try { $keys = json_decode($raw, true, 16, JSON_THROW_ON_ERROR); }
+    catch (Throwable) { fail(503, '更新公钥配置无效'); }
+    return is_array($keys) ? $keys : ['schema'=>1,'keys'=>[]];
+}
+function validate_update_manifest(array $manifest): array
+{
+    $version = text_field($manifest, 'version', 32);
+    $build = $manifest['build_seq'] ?? null;
+    $channel = text_field($manifest, 'channel', 32);
+    $product = text_field($manifest, 'product', 64);
+    $edition = text_field($manifest, 'edition', 32);
+    if (version_tuple($version) === [0,0,0] || !is_numeric($build) || (int)$build < 1
+        || !in_array($channel, ['stable','beta'], true) || $product === '' || $edition === '') fail(422, '更新清单版本身份无效');
+    $targets = $manifest['targets'] ?? null;
+    if (!is_array($targets) || !$targets) fail(422, '更新清单 targets 不能为空');
+    $configuredKeyIds = [];
+    foreach (configured_update_keys()['keys'] ?? [] as $key) {
+        if (is_array($key) && is_string($key['id'] ?? null) && $key['id'] !== '') $configuredKeyIds[$key['id']] = true;
+    }
+    $prefix = rtrim((string)(getenv('RUSTDESK_UPDATE_DOWNLOAD_PREFIX') ?: 'https://download.yan.life/rustdesk/'), '/') . '/';
+    foreach ($targets as $key => $target) {
+        if (!is_string($key) || !preg_match('/^(windows|macos|linux|android)-[a-z0-9_]+-(exe|msi|dmg|appimage|apk)(?:-[a-z0-9_-]+)?$/', $key) || !is_array($target)) fail(422, '更新 target key 无效');
+        $primary = $target['primary'] ?? ''; $mirrors = $target['mirrors'] ?? [];
+        if (!is_string($primary) || !str_starts_with($primary, $prefix) || !filter_var($primary, FILTER_VALIDATE_URL)) fail(422, '更新下载地址无效');
+        if (!is_array($mirrors) || count($mirrors) > 4) fail(422, '更新镜像列表无效');
+        foreach ($mirrors as $mirror) if (!is_string($mirror) || !str_starts_with($mirror, 'https://') || !filter_var($mirror, FILTER_VALIDATE_URL)) fail(422, '更新镜像地址无效');
+        if (!isset($target['size']) || !is_numeric($target['size']) || (int)$target['size'] < 1) fail(422, '更新文件大小无效');
+        if (!is_string($target['sha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/i', $target['sha256'])) fail(422, '更新 SHA-256 无效');
+        $signatureKeyId = text_field($target, 'signature_key_id', 128);
+        if ($signatureKeyId === '') fail(422, '更新签名 key id 缺失');
+        if (!isset($configuredKeyIds[$signatureKeyId])) fail(422, '更新签名 key id 未配置');
+        $signature = base64_decode((string)($target['signature'] ?? ''), true);
+        if ($signature === false || strlen($signature) !== 64) fail(422, '更新签名无效');
+    }
+    $manifest['build_seq'] = (int)$build;
+    return $manifest;
+}
+function canonical_update_manifest_json(array $manifest): string
+{
+    $normalize = static function (mixed $value) use (&$normalize): mixed {
+        if (!is_array($value)) return $value;
+        if (array_is_list($value)) return array_map($normalize, $value);
+        ksort($value, SORT_STRING);
+        foreach ($value as $key => $item) $value[$key] = $normalize($item);
+        return $value;
+    };
+    return json_encode($normalize($manifest), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+}
+function publish_update_manifest(PDO $db, array $manifest): array
+{
+    $manifest = validate_update_manifest($manifest);
+    $version=(string)$manifest['version']; $build=(int)$manifest['build_seq']; $channel=(string)$manifest['channel'];
+    $encoded = canonical_update_manifest_json($manifest);
+    $driver = database_driver();
+    if ($driver === 'sqlite') $db->exec('BEGIN IMMEDIATE'); else $db->beginTransaction();
+    try {
+        $lock = $driver === 'mysql' ? ' FOR UPDATE' : '';
+        $sameBuild = db_all($db, 'SELECT manifest FROM update_releases WHERE channel=:channel AND build_seq=:build'.$lock, ['channel'=>$channel,'build'=>$build]);
+        if ($sameBuild) {
+            foreach ($sameBuild as $row) {
+                if (canonical_update_manifest_json(decoded_payload($row['manifest'])) !== $encoded) fail(409, '相同 build_seq 已发布不同清单');
+            }
+            $db->commit();
+            return ['ok'=>true,'version'=>$version,'build_seq'=>$build,'channel'=>$channel,'idempotent'=>true];
+        }
+        $latest = db_one($db, 'SELECT build_seq FROM update_releases WHERE channel=:channel ORDER BY build_seq DESC LIMIT 1'.$lock, ['channel'=>$channel]);
+        if ($latest && (int)$latest['build_seq'] > $build) fail(409, 'build_seq 低于已发布清单');
+        db_exec($db, 'INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(:version,:build,:channel,:manifest,:published_at,1)', ['version'=>$version,'build'=>$build,'channel'=>$channel,'manifest'=>$encoded,'published_at'=>time()]);
+        $db->commit();
+        return ['ok'=>true,'version'=>$version,'build_seq'=>$build,'channel'=>$channel];
+    } catch (Throwable $error) {
+        if ($db->inTransaction()) $db->rollBack();
+        throw $error;
+    }
 }
 function record_update_event(PDO $db, array $data): void
 {
@@ -958,14 +1082,13 @@ try {
     if ($path === $admin . '/devices') { method('GET'); render_page(__DIR__ . '/devices.html'); }
     if ($path === $admin . '/address-book') { method('GET'); render_page(__DIR__ . '/address-book.html'); }
     if ($path === '/rd/update/v1/keys.json') {
-        method('GET'); $raw=(string)(getenv('RUSTDESK_UPDATE_KEYS_JSON') ?: '{"schema":1,"keys":[]}');
-        try { $keys=json_decode($raw,true,16,JSON_THROW_ON_ERROR); } catch (Throwable) { fail(503,'更新公钥配置无效'); }
-        reply(is_array($keys)?$keys:['schema'=>1,'keys'=>[]]);
+        method('GET'); reply(configured_update_keys());
     }
     if (preg_match('#^/rd/update/v1/manifest/([A-Za-z0-9._~-]+)\.json$#', $path, $match)) {
         method('GET'); $manifest=public_update_manifest($db,$match[1]); if(!$manifest)fail(404,'更新清单不存在'); header('Cache-Control: public, max-age=60'); reply($manifest);
     }
     if ($path === '/rd/update/v1/check') { method('POST'); reply(update_check_response($db,json_body())); }
+    if ($path === '/rd/update/v1/publish') { method('POST'); publish_token_auth(); reply(publish_update_manifest($db,json_body()),201); }
     if ($path === '/rd/update/v1/events') { method('POST'); record_update_event($db,json_body()); reply(['ok'=>true],201); }
     if (str_starts_with($path, $admin . '/api/')) {
         $adminApi = true;
