@@ -579,7 +579,11 @@ function publish_update_manifest(PDO $db, array $manifest): array
         $commit();
         return ['ok'=>true,'version'=>$version,'build_seq'=>$build,'channel'=>$channel];
     } catch (Throwable $error) {
-        $rollback();
+        try {
+            $rollback();
+        } catch (Throwable $rollbackError) {
+            error_log('Update manifest rollback failed: '.$rollbackError->getMessage());
+        }
         throw $error;
     }
 }

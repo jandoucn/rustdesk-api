@@ -19,6 +19,8 @@ class OfflineBundleTest(unittest.TestCase):
         self.assertIn("$db->exec('BEGIN IMMEDIATE')", function)
         self.assertIn("$db->exec('COMMIT')", function)
         self.assertIn("$db->exec('ROLLBACK')", function)
+        self.assertIn("catch (Throwable $rollbackError)", function)
+        self.assertLess(function.index("catch (Throwable $rollbackError)"), function.index("throw $error"))
 
     def test_export_pulls_latest_images_and_builds_verified_bundle(self):
         with tempfile.TemporaryDirectory() as temp:
