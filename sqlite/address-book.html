@@ -58,7 +58,7 @@
           <p id="address-book-status" class="feedback" aria-live="polite">正在读取个人通讯录...</p>
           <div class="table-wrap">
             <table>
-              <thead><tr><th><span class="sr-only">后台收藏</span></th><th>客户端</th><th>标签</th><th>说明</th><th>客户端信息</th><th>操作</th></tr></thead>
+              <thead><tr><th><span class="sr-only">后台收藏</span></th><th>客户端</th><th>标签</th><th>备注</th><th>版本 / 发行形态</th><th>网络</th><th>状态</th><th>最近活动</th><th>操作</th></tr></thead>
               <tbody id="address-book-rows"></tbody>
             </table>
           </div>
@@ -128,6 +128,11 @@
     function setFeedback(message, kind = '') { $('address-book-status').textContent = message; $('address-book-status').className = 'feedback' + (kind ? ' ' + kind : ''); }
     function appendCell(row, label, className = '') { const cell = document.createElement('td'); cell.dataset.label = label; if (className) cell.className = className; row.append(cell); return cell; }
     function textLine(className, value) { const span = document.createElement('span'); span.className = className; span.textContent = value; return span; }
+    function detailValue(value) { return value === undefined || value === null || value === '' ? '未上报' : String(value); }
+    function platformLabel(value) { const key = String(value || '').toLowerCase(); return key.startsWith('windows') ? 'Windows' : key.startsWith('android') ? 'Android' : key.startsWith('ios') ? 'iOS' : key.startsWith('mac') ? 'macOS' : key.startsWith('linux') ? 'Linux' : detailValue(value); }
+    function distributionLabel(value) { const key = String(value || '').toLowerCase(); return ({ desktop: '安装版', sos: 'SOS', portable: '便携版', installed: '安装版', msi: 'MSI', appimage: 'AppImage', mobile: '移动端', linux_package: '软件包', live: '临时运行' })[key] || (key && key !== 'unknown' ? value : '未声明'); }
+    function geoLabel(geo = {}) { const domestic = ['CN', 'CHN', '中国', 'China'].includes(String(geo.country_code || geo.country || '').toUpperCase()); const parts = domestic ? [geo.region, geo.city] : [geo.country, geo.region, geo.city]; return parts.map(value => String(value || '').trim()).filter((value, index, values) => value && values.indexOf(value) === index).join(' · '); }
+    function relativeTime(timestamp) { if (!timestamp) return '从未上报'; const seconds = Math.max(0, Math.floor(Date.now() / 1000 - timestamp)); if (seconds < 60) return seconds + ' 秒前'; if (seconds < 3600) return Math.floor(seconds / 60) + ' 分钟前'; if (seconds < 86400) return Math.floor(seconds / 3600) + ' 小时前'; return Math.floor(seconds / 86400) + ' 天前'; }
     function normalizedTag(tag) { return typeof tag === 'string' ? { name: tag, color: 0, count: 0 } : { name: String(tag.name || tag.tag || ''), color: Number(tag.color || 0), count: Number(tag.count || tag.peer_count || 0) }; }
     function peerTags(peer) { return Array.isArray(peer.tags) ? peer.tags.map(String) : []; }
     function isFavorite(peer) { return peer.favorite === true || peer.favorite === 1 || peer.is_favorite === true || peer.is_favorite === 1; }
@@ -200,9 +205,11 @@
         else tagList.append(textLine('alias-empty', '无标签'));
         tagsCell.append(tagList);
 
-        const noteCell = appendCell(row, '说明'); noteCell.classList.add('note-cell'); noteCell.textContent = String(peer.note || '') || '-'; if (peer.note) noteCell.title = String(peer.note);
-        const infoCell = appendCell(row, '客户端信息');
-        const identity = [peer.username, peer.platform].filter(Boolean).map(String).join(' · '); infoCell.append(textLine(identity ? 'cell-title' : 'muted', identity || '暂无上报信息')); if (peer.presence) infoCell.append(textLine('cell-subtitle', ({ online: '在线', recent: '最近在线', offline: '离线', unreported: '未上报' })[peer.presence] || peer.presence));
+        const noteCell = appendCell(row, '备注'); noteCell.classList.add('note-cell'); noteCell.textContent = String(peer.note || peer.alias || '') || '未备注';
+        const releaseCell = appendCell(row, '版本 / 发行形态'); releaseCell.append(textLine('cell-title release-title', [platformLabel(peer.platform), distributionLabel(peer.distribution)].join(' · '))); releaseCell.append(textLine('cell-subtitle version-text', '客户端：' + (peer.version || '未上报')));
+        const networkCell = appendCell(row, '网络'); networkCell.append(textLine('cell-title network-ip', peer.public_ip || '公网 IP 未上报')); const location = geoLabel(peer.geo); if (location) networkCell.append(textLine('cell-subtitle network-location', location));
+        const statusCell = appendCell(row, '状态'); const presenceLabels = { online: '在线', recent: '最近在线', offline: '离线', unreported: '未上报' }; const badge = document.createElement('span'); badge.className = 'status-badge ' + (peer.presence || 'unreported'); badge.append(textLine('status-dot ' + (peer.presence || 'unreported'), ''), document.createTextNode(presenceLabels[peer.presence] || '未上报')); statusCell.append(badge);
+        const activityCell = appendCell(row, '最近活动'); const activity = Number(peer.last_heartbeat || peer.last_seen || 0); activityCell.append(textLine('cell-title', relativeTime(activity))); if (activity) activityCell.append(textLine('cell-subtitle', new Date(activity * 1000).toLocaleString()));
 
         const actionsCell = appendCell(row, '操作', 'actions-cell'); const actions = document.createElement('div'); actions.className = 'row-actions';
         const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'button small'; edit.textContent = '编辑客户端'; edit.setAttribute('aria-label', '编辑客户端'); edit.addEventListener('click', () => openPeerDialog(peer));

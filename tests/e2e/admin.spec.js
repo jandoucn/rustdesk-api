@@ -217,6 +217,28 @@ test('address book exposes presence filters and import/export controls on mobile
   expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
 });
 
+test('address book uses inventory columns, telemetry and an explicit refresh', async ({ page, request }) => {
+  const deviceId = `address-columns-${Date.now().toString(36)}`;
+  await reportRichClient(request, deviceId);
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/address-book`);
+  await page.getByRole('button', { name: '新增客户端' }).click();
+  await page.locator('#peer-id').fill(deviceId);
+  await page.locator('#peer-alias').fill('带标签客户端');
+  await page.getByRole('button', { name: '新增客户端' }).last().click();
+  const row = page.locator(`[data-peer-id="${deviceId}"]`);
+  await expect(row).toBeVisible();
+  await expect(page.locator('thead')).toContainText('版本 / 发行形态');
+  await expect(page.locator('thead')).toContainText('网络');
+  await expect(page.locator('thead')).toContainText('最近活动');
+  await expect(row).toContainText('Windows');
+  await expect(row).toContainText('1.5.0');
+  await page.locator('#refresh-address-book').click();
+  await expect(row).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+});
+
 test('client inventory keeps runtime and network details aligned with persisted report data', async ({ page, request }) => {
   const suffix = Date.now().toString(36);
   const deviceId = `rich-${suffix}`;

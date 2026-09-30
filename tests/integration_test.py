@@ -807,6 +807,14 @@ class IntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(listing["summary"]["total"], 3)
         self.assertEqual(listing["summary"]["favorites"], 0)
         self.assertIn("profile-tag", {tag["name"] for tag in listing["tags"]})
+        _, client_book, _ = self.client.json("GET", "/?s=/api/ab", None, admin_auth)
+        client_peers = {peer["id"] for peer in json.loads(client_book["data"])["peers"]}
+        self.assertIn("admin-profile-only", client_peers)
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT OR REPLACE INTO device_reports(id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload,runtime_payload,network_payload) VALUES (?,?,?,?,?,?,?,?)", ("admin-merged", "merge-uuid", json.dumps({"hostname":"live-host","platform":"windows","version":"1.5.0","distribution":"desktop"}), int(time.time()), int(time.time()), json.dumps({"ver":10}), "{}", json.dumps({"public_ip":"8.8.8.8"})))
+        db.commit(); db.close()
+        _, enriched, _ = self.client.json("GET", "/?s=/ops-x9/api/address-book?q=admin-merged&page=1&pageSize=20")
+        self.assertEqual((enriched["data"][0]["version"], enriched["data"][0]["distribution"], enriched["data"][0]["public_ip"]), ("1.5.0", "desktop", "8.8.8.8"))
 
     def test_21_admin_address_book_peer_crud_syncs_three_stores_and_client_apis(self):
         csrf = self.admin_csrf()

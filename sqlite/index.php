@@ -337,7 +337,20 @@ function pagination(): array
 function read_book(PDO $db, int $uid): array
 {
     $book = db_one($db, 'SELECT payload,updated_at FROM address_books WHERE uid=:uid', ['uid' => $uid]);
-    if ($book) return ['updated_at' => date('Y-m-d H:i:s', (int)$book['updated_at']), 'data' => $book['payload']];
+    if ($book) {
+        $payload = decoded_payload($book['payload']);
+        $profile = db_one($db, 'SELECT guid FROM ab_profiles WHERE uid=:uid AND personal=1', ['uid'=>$uid]);
+        if ($profile) {
+            $peers = []; foreach (($payload['peers'] ?? []) as $peer) if (is_array($peer) && isset($peer['id'])) $peers[(string)$peer['id']] = $peer;
+            foreach (db_all($db, 'SELECT id,payload FROM ab_profile_peers WHERE guid=:guid ORDER BY id', ['guid'=>$profile['guid']]) as $row) { $peer=decoded_payload($row['payload']); $peer['id']=$row['id']; $peers[(string)$row['id']]=array_replace($peers[(string)$row['id']]??[], $peer); }
+            $payload['peers'] = array_values($peers);
+            $tags = array_values(array_unique(array_merge(is_array($payload['tags']??null)?$payload['tags']:[], array_column(db_all($db, 'SELECT name FROM ab_profile_tags WHERE guid=:guid ORDER BY name', ['guid'=>$profile['guid']]), 'name'))));
+            $payload['tags'] = $tags;
+            $encoded = json_encode($payload, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR);
+            if ($encoded !== (string)$book['payload']) { save_exact_address_book($db, $uid, $payload, time()); $book['payload']=$encoded; }
+        }
+        return ['updated_at' => date('Y-m-d H:i:s', (int)$book['updated_at']), 'data' => $book['payload']];
+    }
     $tags = array_column(db_all($db, 'SELECT tag FROM rustdesk_tags WHERE uid=:uid ORDER BY id', ['uid' => $uid]), 'tag');
     $peers = db_all($db, 'SELECT id,username,hostname,alias,platform,tags,hash FROM rustdesk_peers WHERE uid=:uid ORDER BY deviceid', ['uid' => $uid]);
     foreach ($peers as &$peer) $peer['tags'] = $peer['tags'] === '' || $peer['tags'] === null ? [] : explode(',', $peer['tags']);
@@ -855,6 +868,30 @@ function admin_address_book_state(PDO $db, array $actor, array $profile): array
     ksort($tags, SORT_NATURAL | SORT_FLAG_CASE);
     return ['book'=>$book,'peers'=>$peers,'tags'=>array_values($tags)];
 }
+function enrich_admin_address_book_peer(PDO $db, array $peer): array
+{
+    $id = (string)($peer['id'] ?? '');
+    $reportRow = db_one($db, 'SELECT uuid,payload,runtime_payload,network_payload,last_seen,last_heartbeat FROM device_reports WHERE id=:id ORDER BY last_heartbeat DESC,last_seen DESC LIMIT 1', ['id'=>$id]);
+    $deploymentRow = db_one($db, 'SELECT uuid,payload,uid,updated_at FROM device_deployments WHERE id=:id ORDER BY updated_at DESC LIMIT 1', ['id'=>$id]);
+    $report = decoded_payload($reportRow['payload'] ?? null); $runtime = decoded_payload($reportRow['runtime_payload'] ?? null); $network = decoded_payload($reportRow['network_payload'] ?? null); $deploy = decoded_payload($deploymentRow['payload'] ?? null);
+    $release = release_identity($report, $runtime); $publicIp = is_public_ip((string)($network['public_ip'] ?? '')) ? (string)$network['public_ip'] : '';
+    $geo = $publicIp !== '' ? (is_array($network['geo'] ?? null) && $network['geo'] !== [] ? $network['geo'] : public_ip_geo($publicIp)) : [];
+    $lastHeartbeat = (int)($reportRow['last_heartbeat'] ?? 0);
+    return array_merge($peer, [
+        'uuid'=>(string)($reportRow['uuid'] ?? $deploymentRow['uuid'] ?? ''),
+        'hostname'=>(string)($report['hostname'] ?? $deploy['device_name'] ?? $peer['hostname'] ?? ''),
+        'username'=>(string)($report['username'] ?? $deploy['device_username'] ?? $peer['username'] ?? ''),
+        'platform'=>$release['platform'] !== '' ? $release['platform'] : (string)($report['platform'] ?? $report['os'] ?? $peer['platform'] ?? ''),
+        'os'=>(string)($report['os'] ?? ''), 'os_version'=>(string)($release['os_version'] ?? $report['os_version'] ?? ''),
+        'version'=>$release['version'] !== '' ? $release['version'] : (string)($report['version'] ?? ''), 'version_text'=>(string)($report['version'] ?? ''),
+        'distribution'=>$release['distribution'] !== '' ? $release['distribution'] : (string)($deploy['distribution'] ?? ''),
+        'install_mode'=>$release['install_mode'] !== '' ? $release['install_mode'] : (string)($deploy['install_mode'] ?? ''),
+        'build_number'=>(string)($release['build_number'] ?? ''), 'build_seq'=>(int)($release['build_seq'] ?? 0), 'channel'=>(string)($release['channel'] ?? ''), 'arch'=>(string)($release['arch'] ?? ''),
+        'public_ip'=>$publicIp, 'private_ips'=>is_array($network['private_ips'] ?? null) ? $network['private_ips'] : [], 'geo'=>$geo,
+        'last_seen'=>(int)($reportRow['last_seen'] ?? 0), 'last_heartbeat'=>$lastHeartbeat, 'presence'=>device_presence($lastHeartbeat, time()),
+        'deployed'=>$deploymentRow !== null, 'address_book_user_ids'=>[],
+    ]);
+}
 function action_ok(): never { http_response_code(200); header('Content-Length: 0'); exit; }
 
 try {
@@ -1030,8 +1067,7 @@ try {
         $profile = db_one($db, 'SELECT * FROM ab_profiles WHERE uid=:uid AND personal=1', ['uid'=>$actor['id']]);
         $state = admin_address_book_state($db, $actor, $profile ?? ['guid'=>'']);
         foreach ($state['peers'] as $peerId=>&$peer) {
-            $report = db_one($db, 'SELECT last_heartbeat FROM device_reports WHERE id=:id ORDER BY last_heartbeat DESC LIMIT 1', ['id'=>$peerId]);
-            $peer['presence'] = $report ? device_presence((int)$report['last_heartbeat'], time()) : 'unreported';
+            $peer = enrich_admin_address_book_peer($db, $peer);
         }
         unset($peer);
         $presenceFilter = $_GET['presence'] ?? 'all';
