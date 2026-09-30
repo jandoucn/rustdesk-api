@@ -93,7 +93,21 @@
     </form>
   </dialog>
   <dialog id="details-dialog" aria-labelledby="details-title">
-    <div class="dialog-form"><div class="dialog-head"><h3 id="details-title">客户端详情</h3><p id="details-device"></p></div><div id="details-body" class="details-grid"></div><div class="dialog-actions"><button id="details-close" class="button" type="button">关闭</button></div></div>
+    <div class="details-shell">
+      <header class="details-hero">
+        <div class="details-identity">
+          <p class="details-kicker">客户端详情</p>
+          <h3 id="details-title">客户端详情</h3>
+          <p id="details-device" class="mono"></p>
+        </div>
+        <div class="details-hero-side">
+          <span id="details-presence" class="status-badge"></span>
+          <button id="details-close" class="button" type="button">关闭</button>
+        </div>
+      </header>
+      <div id="details-summary" class="details-summary"></div>
+      <div id="details-body" class="details-board"></div>
+    </div>
   </dialog>
 
   <script>
@@ -210,19 +224,56 @@
     }
     function deviceKey(device) { return JSON.stringify([String(device.id || ''), String(device.uuid || '')]); }
     function installModeLabel(value) { const key = String(value || '').toLowerCase(); return ({ installed: '已安装运行', portable: '便携运行', live: '临时运行', service: '服务模式', sos: 'SOS 运行' })[key] || detailValue(value); }
+    function appendFact(grid, label, value, extraClass) {
+      const item = document.createElement('div'); item.className = 'fact';
+      const term = document.createElement('span'); term.className = 'fact-label'; term.textContent = label;
+      const data = document.createElement('span'); data.className = 'fact-value';
+      const text = detailValue(value); data.textContent = text;
+      if (text === '未上报' || text === '未声明') data.classList.add('is-empty');
+      if (extraClass) data.classList.add(extraClass);
+      item.append(term, data); grid.append(item);
+    }
+    function factGrid(rows) {
+      const grid = document.createElement('div'); grid.className = 'fact-grid';
+      rows.forEach(([label, value, extraClass]) => appendFact(grid, label, value, extraClass));
+      return grid;
+    }
+    function detailSection(title, rows, className) {
+      const section = document.createElement('section'); section.className = className || 'details-panel';
+      const heading = document.createElement('h4'); heading.textContent = title; section.append(heading, factGrid(rows));
+      return section;
+    }
     function openDetails(device) {
-      $('details-device').textContent = (device.alias || device.hostname || device.id) + ' · ' + device.id;
-      const groups = [
-        ['身份', [['设备 ID', device.id], ['UUID', device.uuid], ['主机名', device.hostname], ['系统用户', device.username]]],
-        ['系统', [['操作系统', device.os || device.platform], ['系统版本', device.os_version], ['CPU', device.cpu], ['内存', device.memory]]],
-        ['发行身份', [['客户端身份', device.client_id], ['客户端 UUID', device.client_uuid || device.uuid], ['产品', device.product], ['版本类型', device.edition], ['版本', device.version_text || device.version], ['构建号', device.build_number], ['构建序号', device.build_seq], ['渠道', device.channel], ['平台', platformLabel(device.platform)], ['架构', device.arch || device.client_arch], ['发行形态', distributionLabel(device.distribution)], ['安装模式', installModeLabel(device.install_mode)], ['源码提交', device.source_commit], ['操作系统', device.os], ['系统版本', device.os_version]]],
-        ['网络', [['公网 IP', device.public_ip], ['地区', geoLabel(device.geo)], ['时区', device.geo?.timezone], ['内网 IP', Array.isArray(device.private_ips) ? device.private_ips.join('、') : device.private_ips]]],
-        ['状态', [['当前状态', labels[presence(device)]], ['最后心跳', device.last_heartbeat ? new Date(Number(device.last_heartbeat) * 1000).toLocaleString() : '从未上报'], ['最近活动', device.last_seen ? new Date(Number(device.last_seen) * 1000).toLocaleString() : '未上报'], ['当前连接数', Array.isArray(device.heartbeat_payload?.conns) ? device.heartbeat_payload.conns.length : '未上报'], ['通讯录用户', Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.join(', ') : '无']]],
-        ['升级遥测', [['最近检查', device.last_update_check], ['检查状态', device.last_update_status], ['错误信息', device.last_update_error], ['更新来源', device.last_update_source]]],
-        ['原始遥测', [['Heartbeat payload', device.heartbeat_payload], ['Runtime payload', device.runtime_payload], ['Network payload', device.network_payload]]],
-      ];
+      const currentPresence = presence(device);
+      $('details-title').textContent = device.alias || device.hostname || device.id || '客户端详情';
+      $('details-device').textContent = device.id || '';
+      const badge = $('details-presence'); badge.className = 'status-badge ' + currentPresence; badge.textContent = labels[currentPresence];
+      const summary = $('details-summary'); summary.replaceChildren();
+      [['平台', [platformLabel(device.platform), distributionLabel(device.distribution)].filter(value => value && value !== '未上报' && value !== '未声明').join(' · ')], ['版本', device.version_text || device.version], ['构建号', device.build_number], ['渠道', device.channel]].forEach(([label, value]) => {
+        const cell = document.createElement('div'); const term = document.createElement('span'); term.textContent = label; const strong = document.createElement('strong'); const text = detailValue(value); strong.textContent = text; if (text === '未上报' || text === '未声明') strong.className = 'is-empty'; cell.append(term, strong); summary.append(cell);
+      });
+      const privateIps = Array.isArray(device.private_ips) ? device.private_ips.join('、') : device.private_ips;
       const body = $('details-body'); body.replaceChildren();
-      groups.forEach(([title, entries]) => { const section = document.createElement('section'); section.className = 'details-section' + (title === '发行身份' ? ' release-grid' : ''); const heading = document.createElement('h4'); heading.textContent = title; section.append(heading); entries.forEach(([label, value]) => { const line = document.createElement('div'); line.className = 'details-line'; line.append(textLine('details-label', label), textLine('details-value', detailValue(value))); section.append(line); }); body.append(section); });
+      body.append(detailSection('发行身份', [
+        ['客户端身份', device.client_id], ['客户端 UUID', device.client_uuid || device.uuid, 'mono'], ['产品', device.product], ['版本类型', device.edition],
+        ['版本', device.version_text || device.version], ['构建号', device.build_number, 'mono'], ['构建序号', device.build_seq, 'mono'], ['渠道', device.channel],
+        ['平台', platformLabel(device.platform)], ['架构', device.arch || device.client_arch], ['发行形态', distributionLabel(device.distribution)], ['安装模式', installModeLabel(device.install_mode)],
+        ['源码提交', device.source_commit, 'mono'],
+      ], 'details-panel span-wide'));
+      body.append(detailSection('机器', [
+        ['主机名', device.hostname], ['系统用户', device.username], ['设备 ID', device.id, 'mono'], ['UUID', device.uuid, 'mono'],
+        ['操作系统', device.os], ['系统版本', device.os_version], ['CPU', device.cpu], ['内存', device.memory],
+      ]));
+      body.append(detailSection('网络', [
+        ['公网 IP', device.public_ip, 'mono'], ['地区', geoLabel(device.geo)], ['时区', device.geo?.timezone], ['内网 IP', privateIps, 'mono'],
+      ]));
+      body.append(detailSection('运行与升级', [
+        ['最后心跳', device.last_heartbeat ? new Date(Number(device.last_heartbeat) * 1000).toLocaleString() : ''],
+        ['最近活动', device.last_seen ? new Date(Number(device.last_seen) * 1000).toLocaleString() : ''],
+        ['当前连接数', Array.isArray(device.heartbeat_payload?.conns) ? device.heartbeat_payload.conns.length : ''],
+        ['通讯录用户', Array.isArray(device.address_book_user_ids) && device.address_book_user_ids.length ? device.address_book_user_ids.join(', ') : '无'],
+        ['最近检查', device.last_update_check], ['检查状态', device.last_update_status], ['错误信息', device.last_update_error], ['更新来源', device.last_update_source],
+      ]));
       $('details-dialog').showModal();
     }
 

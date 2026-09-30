@@ -330,6 +330,9 @@ test('client list omits the operating-system line and details close on outside f
   await expect(dialog).toContainText('2026093002');
   await expect(dialog).toContainText('源码提交');
   await expect(dialog).toContainText('commit-sha');
+  await expect(dialog).not.toContainText('原始遥测');
+  await expect(dialog).not.toContainText('Heartbeat payload');
+  await expect(dialog).not.toContainText('Runtime payload');
   await expect(dialog.locator('#details-close')).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
   expect(await dialog.evaluate(node => {
