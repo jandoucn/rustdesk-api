@@ -1136,6 +1136,13 @@ class IntegrationTest(unittest.TestCase):
         user_two_auth = self.rust_login("legacy", "legacy123", "assignable-readback-user")
         _, client_book, _ = self.client.json("GET", "/?s=/api/ab", None, user_two_auth)
         self.assertNotIn(device_id, {peer.get("id") for peer in json.loads(client_book["data"]).get("peers", [])})
+        self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {
+            "devices": [{"id": device_id, "uuid": uuid_value}], "user_ids": [], "mode": "replace",
+        }, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM rustdesk_peers WHERE id=?", (device_id,)).fetchone()[0], 0)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM ab_profile_peers WHERE id=?", (device_id,)).fetchone()[0], 0)
+        db.close()
 
     def test_assignment_remove_preview_and_apply_clears_all_address_book_stores(self):
         csrf = self.admin_csrf()
@@ -1181,13 +1188,6 @@ class IntegrationTest(unittest.TestCase):
         network = json.loads(network_text)
         self.assertEqual(payload["future"]["nested"], {"keep": True, "replace": "new"})
         self.assertEqual(payload["network"]["future"], {"keep": 1, "replace": "new"})
-        self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {
-            "devices": [{"id": device_id, "uuid": uuid_value}], "user_ids": [], "mode": "replace",
-        }, {"X-CSRF-Token": csrf})
-        db = sqlite3.connect(self.db)
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM rustdesk_peers WHERE id=?", (device_id,)).fetchone()[0], 0)
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM ab_profile_peers WHERE id=?", (device_id,)).fetchone()[0], 0)
-        db.close()
         self.assertEqual(network["future"], {"keep": 1})
         self.assertEqual(network["private_ips"], ["10.0.0.9"])
         self.assertEqual(network["public_ip"], "8.8.8.8")
