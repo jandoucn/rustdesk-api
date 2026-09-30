@@ -226,42 +226,8 @@ dialog::backdrop { background: rgba(27, 35, 35, .48); backdrop-filter: blur(2px)
 .tag-choice input { width: 15px; height: 15px; margin: 0; accent-color: var(--primary); }
 .tag-picker-empty { color: var(--muted); font-size: 12px; }
 #tag-dialog { width: min(640px, calc(100vw - 28px)); }
-#details-dialog[open] {
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  display: flex;
-  flex-direction: column;
-  width: min(980px, calc(100vw - 32px));
-  height: fit-content;
-  max-height: calc(100dvh - 24px);
-  margin: 0;
-  overflow: hidden;
-  transform: translate(-50%, -50%);
-}
-.details-shell { display: flex; min-height: 0; max-height: calc(100dvh - 24px); flex: 1 1 auto; flex-direction: column; overflow: hidden; background: var(--surface); }
-.details-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 16px 18px 14px; border-bottom: 1px solid var(--border); background: #f3f8f9; }
-.details-kicker { margin: 0; color: var(--primary); font-size: 11px; font-weight: 750; }
-#details-dialog h3 { margin: 2px 0 0; font-size: 20px; line-height: 1.25; }
-#details-device { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
-.details-hero-side { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
-.details-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid var(--border); }
-.details-summary div { min-width: 0; padding: 10px 16px; border-right: 1px solid var(--border); }
-.details-summary div:last-child { border-right: 0; }
-.details-summary span { display: block; color: var(--muted); font-size: 11px; }
-.details-summary strong { display: block; margin-top: 2px; overflow-wrap: anywhere; font-size: 14px; font-weight: 700; }
-.details-summary strong.is-empty { color: #7d8886; font-weight: 600; }
-.details-board { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, .8fr); min-height: 0; flex: 1 1 auto; overflow: auto; align-content: start; }
-.details-panel { min-width: 0; padding: 14px 16px 16px; }
-.details-panel.span-wide { grid-column: 1; grid-row: 1 / span 3; border-right: 1px solid var(--border); }
-.details-panel h4 { margin: 0 0 12px; color: var(--primary); font-size: 12px; font-weight: 750; }
-.fact-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 18px; }
-.span-wide .fact-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.fact { min-width: 0; }
-.fact-label { display: block; color: #5c6765; font-size: 11px; }
-.fact-value { display: block; margin-top: 2px; overflow-wrap: anywhere; font-size: 13px; font-weight: 650; line-height: 1.4; }
-.fact-value.is-empty { color: #7d8886; font-weight: 600; }
-.fact-value.mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 12px; font-weight: 600; }
+#details-dialog { width: min(860px, calc(100vw - 28px)); }
+#details-dialog .details-value.is-empty { color: var(--muted); }
 .tag-editor { display: grid; grid-template-columns: minmax(190px, 1fr) 64px auto auto; align-items: end; gap: 9px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
 .color-field input[type="color"] { width: 100%; height: 40px; padding: 4px; border: 1px solid var(--border-strong); border-radius: var(--radius); background: #fff; cursor: pointer; }
 .tag-management-list { display: grid; max-height: min(380px, 46vh); overflow: auto; }
@@ -389,14 +355,6 @@ dialog::backdrop { background: rgba(27, 35, 35, .48); backdrop-filter: blur(2px)
   .tag-management-row .row-actions { width: 100%; }
   .tag-editor { grid-template-columns: minmax(0, 1fr); }
   .details-grid { grid-template-columns: 1fr; }
-  #details-dialog .details-hero { flex-wrap: wrap; }
-  #details-dialog .details-summary { grid-template-columns: 1fr 1fr; }
-  #details-dialog .details-summary div:nth-child(odd) { border-right: 1px solid var(--border); }
-  #details-dialog .details-summary div:nth-child(n + 3) { border-top: 1px solid var(--border); }
-  #details-dialog .details-board,
-  #details-dialog .span-wide .fact-grid,
-  #details-dialog .fact-grid { grid-template-columns: 1fr; }
-  #details-dialog .details-panel.span-wide { grid-row: auto; border-right: 0; border-bottom: 1px solid var(--border); }
   .color-field input[type="color"] { width: 64px; }
 }
 

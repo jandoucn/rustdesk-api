@@ -113,6 +113,25 @@
     $('ec').addEventListener('click', () => $('ed').close()); $('ef').addEventListener('submit', async event => { event.preventDefault(); setBusy(true); text($('eee'), ''); try { const payload = { username: $('eu').value.trim(), enabled: $('ee').checked, address_book_scope: $('es').value }; if ($('ep').value) payload.password = $('ep').value; await api('__ADMIN_PATH__/api/users/' + state.id, { method: 'PATCH', body: JSON.stringify(payload) }); const data = await session(); if (!data.user) { state.user = null; $('ed').close(); updateView(); text($('le'), '账号已修改，请重新登录'); return; } state.user = data.user; updateView(); $('ed').close(); await load(); } catch (error) { text($('eee'), error.message); } finally { setBusy(false); } });
     $('mp').addEventListener('click', () => { $('pf').reset(); text($('pe'), ''); $('pd').showModal(); }); $('pc').addEventListener('click', () => $('pd').close()); $('pf').addEventListener('submit', async event => { event.preventDefault(); setBusy(true); text($('pe'), ''); try { await api('__ADMIN_PATH__/api/me/password', { method: 'PATCH', body: JSON.stringify({ old_password: $('op').value, password: $('mnp').value }) }); const data = await session(); if (!data.user) { state.user = null; $('pd').close(); $('pf').reset(); updateView(); text($('le'), '密码已修改，请重新登录'); return; } state.user = data.user; $('pd').close(); setFeedback('密码已修改', 'success'); } catch (error) { text($('pe'), error.message); } finally { setBusy(false); } });
     session().then(() => { updateView(); if (state.user) load(); }).catch(error => text($('le'), error.message));
+    document.querySelectorAll('dialog').forEach(dialog => {
+      dialog.addEventListener('pointerdown', event => {
+        if (!dialog.open) return;
+        if (event.target === dialog) { dialog.close(); return; }
+        const rect = dialog.getBoundingClientRect();
+        if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close();
+      });
+      dialog.addEventListener('focusout', event => {
+        if (!dialog.open) return;
+        const next = event.relatedTarget;
+        if (next && (next === dialog || dialog.contains(next))) return;
+        window.setTimeout(() => {
+          if (!dialog.open) return;
+          const active = document.activeElement;
+          if (active && (active === dialog || dialog.contains(active))) return;
+          dialog.close();
+        }, 0);
+      });
+    });
   })();
   </script>
 </body>

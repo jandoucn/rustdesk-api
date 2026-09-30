@@ -352,6 +352,17 @@ test('client list omits the operating-system line and details close on outside f
   expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
   await page.mouse.click(4, 4);
   await expect(dialog).toBeHidden();
+  await row.getByRole('button', { name: '编辑备注' }).click();
+  const aliasDialog = page.locator('#alias-dialog');
+  await expect(aliasDialog).toBeVisible();
+  await page.mouse.click(6, 6);
+  await expect(aliasDialog).toBeHidden();
+  await page.goto(adminPath);
+  await page.locator('#cu').click();
+  const createDialog = page.locator('#cd');
+  await expect(createDialog).toBeVisible();
+  await page.mouse.click(6, 6);
+  await expect(createDialog).toBeHidden();
 });
 
 test('desktop release renders as installed and keeps UUID out of the inventory row', async ({ page, request }) => {

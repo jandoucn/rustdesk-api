@@ -325,6 +325,25 @@
     $('create-peer').addEventListener('click', () => openPeerDialog()); $('peer-cancel').addEventListener('click', () => $('peer-dialog').close()); $('peer-form').addEventListener('submit', savePeer);
     $('manage-tags').addEventListener('click', () => { resetTagEditor(); renderTagManagement(); $('tag-dialog').showModal(); }); $('tag-close').addEventListener('click', () => $('tag-dialog').close()); $('tag-form').addEventListener('submit', saveTag); $('tag-edit-cancel').addEventListener('click', resetTagEditor);
     $('confirm-cancel').addEventListener('click', () => { state.confirmAction = null; $('confirm-dialog').close(); if (state.returnToTags) { state.returnToTags = false; renderTagManagement(); $('tag-dialog').showModal(); } }); $('confirm-submit').addEventListener('click', runConfirm);
+    document.querySelectorAll('dialog').forEach(dialog => {
+      dialog.addEventListener('pointerdown', event => {
+        if (!dialog.open) return;
+        if (event.target === dialog) { dialog.close(); return; }
+        const rect = dialog.getBoundingClientRect();
+        if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close();
+      });
+      dialog.addEventListener('focusout', event => {
+        if (!dialog.open) return;
+        const next = event.relatedTarget;
+        if (next && (next === dialog || dialog.contains(next))) return;
+        window.setTimeout(() => {
+          if (!dialog.open) return;
+          const active = document.activeElement;
+          if (active && (active === dialog || dialog.contains(active))) return;
+          dialog.close();
+        }, 0);
+      });
+    });
     $('search-address-book').addEventListener('click', () => { state.q = $('address-search').value.trim(); state.page = 1; load(); }); $('address-search').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); $('search-address-book').click(); } });
     $('tag-filter').addEventListener('change', () => { state.tag = $('tag-filter').value; state.page = 1; load(); }); $('address-presence-filter').addEventListener('change', () => { state.presence = $('address-presence-filter').value; state.page = 1; load(); }); $('favorite-only').addEventListener('change', () => { state.favorite = $('favorite-only').checked; state.page = 1; load(); }); $('refresh-address-book').addEventListener('click', () => load());
     async function exportAddressBook(format) { const params = new URLSearchParams({ format, q: state.q, tag: state.tag, user_id: String(state.user?.id || '') }); const response = await fetch('__ADMIN_PATH__/api/address-book/export?' + params, { credentials: 'same-origin', headers: { Accept: format === 'json' ? 'application/json' : 'text/csv', 'X-CSRF-Token': state.csrf } }); if (!response.ok) throw Error('导出失败'); const blob = await response.blob(); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = 'rustdesk-address-book.' + (format === 'json' ? 'json' : 'csv'); link.click(); URL.revokeObjectURL(url); }
