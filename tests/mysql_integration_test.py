@@ -557,6 +557,51 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.client.json("POST", "/rd/update/v1/events", {"client_id": "mysql-update-device", "client_uuid": "mysql-update-uuid", "status": "installed", "to_build_seq": 2026100101}, expected=(201,))
         self.assertEqual(self.sql("SELECT status,to_build_seq FROM device_update_events WHERE device_id='mysql-update-device'"), ["installed\t2026100101"])
 
+    def test_20_release_identity_round_trip(self):
+        device_id = "mysql-release"
+        device_uuid = device_id + "-uuid"
+        status, body, _ = self.client.request("POST", "/api/sysinfo", {
+            "id": device_id, "uuid": device_uuid, "hostname": "mysql-release-host",
+            "client_id": "RustDesk Yan", "client_uuid": device_uuid,
+            "product": "rustdesk-yan", "edition": "custom", "version": "1.5.0",
+            "build_number": "20260930.2", "build_seq": 2026093002, "channel": "stable",
+            "platform": "windows", "arch": "x86_64", "distribution": "desktop",
+            "install_mode": "installed", "source_commit": "commit-sha",
+            "os": "Windows", "os_version": "Windows 11",
+        }, expected=(200,))
+        self.assertEqual(status, 200)
+        self.assertEqual(body, "SYSINFO_UPDATED")
+        self.assertEqual(self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.build_number')),JSON_UNQUOTE(JSON_EXTRACT(payload,'$.source_commit')),JSON_EXTRACT(payload,'$.build_seq') FROM device_reports WHERE id='mysql-release'"), ["20260930.2\tcommit-sha\t2026093002"])
+        self.admin_login()
+        _, listing, _ = self.client.json("GET", "/ops-x9/api/devices?q=mysql-release&page=1&pageSize=20")
+        row = next(item for item in listing["data"] if item["id"] == device_id)
+        self.assertEqual(row["client_id"], "RustDesk Yan")
+        self.assertEqual(row["build_number"], "20260930.2")
+        self.assertEqual(row["build_seq"], 2026093002)
+        self.assertEqual(row["arch"], "x86_64")
+        self.assertEqual(row["os_version"], "Windows 11")
+        stale_runtime = json.dumps({"platform": "windows", "distribution": "desktop", "install_mode": "installed", "client_arch": "x86_64", "executable_name": "rustdesk.exe"})
+        self.sql("UPDATE device_reports SET runtime_payload='" + stale_runtime.replace("'", "''") + "' WHERE id='mysql-release'")
+        _, again, _ = self.client.json("GET", "/ops-x9/api/devices?q=mysql-release&page=1&pageSize=20")
+        preserved = next(item for item in again["data"] if item["id"] == device_id)
+        self.assertEqual(preserved["build_number"], "20260930.2")
+        self.assertEqual(preserved["source_commit"], "commit-sha")
+        bare = "mysql-check-release"
+        self.client.json("POST", "/api/heartbeat", {"id": bare, "uuid": bare + "-uuid", "ver": 1, "conns": []})
+        self.client.json("POST", "/rd/update/v1/check", {
+            "client_id": "RustDesk Yan", "client_uuid": bare + "-uuid",
+            "product": "rustdesk-yan", "edition": "custom", "version": "1.5.0",
+            "build_number": "20260930.2", "build_seq": 2026093002, "channel": "stable",
+            "platform": "windows", "arch": "x86_64", "distribution": "desktop",
+            "install_mode": "installed", "source_commit": "commit-sha",
+            "os": "Windows", "os_version": "Windows 11",
+        })
+        _, checked, _ = self.client.json("GET", "/ops-x9/api/devices?q=mysql-check-release&page=1&pageSize=20")
+        shown = next(item for item in checked["data"] if item["id"] == bare)
+        self.assertEqual(shown["client_id"], "RustDesk Yan")
+        self.assertEqual(shown["build_seq"], 2026093002)
+        self.assertEqual(self.sql("SELECT JSON_UNQUOTE(JSON_EXTRACT(payload,'$.client_id')),JSON_UNQUOTE(JSON_EXTRACT(payload,'$.os_version')) FROM device_reports WHERE id='mysql-check-release'"), ["RustDesk Yan\tWindows 11"])
+
 
 if __name__ == "__main__":
     unittest.main()

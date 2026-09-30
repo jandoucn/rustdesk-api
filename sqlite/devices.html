@@ -215,14 +215,14 @@
       const groups = [
         ['身份', [['设备 ID', device.id], ['UUID', device.uuid], ['主机名', device.hostname], ['系统用户', device.username]]],
         ['系统', [['操作系统', device.os || device.platform], ['系统版本', device.os_version], ['CPU', device.cpu], ['内存', device.memory]]],
-        ['版本与运行', [['平台', platformLabel(device.platform)], ['客户端版本', device.version_text || device.version], ['发行形态', distributionLabel(device.distribution)], ['运行模式', installModeLabel(device.install_mode)], ['架构', device.client_arch], ['可执行文件', device.executable_name], ['产品', device.product], ['Edition', device.edition], ['Build number', device.build_number], ['Build sequence', device.build_seq], ['Channel', device.channel], ['Source commit', device.source_commit]]],
+        ['发行身份', [['客户端身份', device.client_id], ['客户端 UUID', device.client_uuid || device.uuid], ['产品', device.product], ['版本类型', device.edition], ['版本', device.version_text || device.version], ['构建号', device.build_number], ['构建序号', device.build_seq], ['渠道', device.channel], ['平台', platformLabel(device.platform)], ['架构', device.arch || device.client_arch], ['发行形态', distributionLabel(device.distribution)], ['安装模式', installModeLabel(device.install_mode)], ['源码提交', device.source_commit], ['操作系统', device.os], ['系统版本', device.os_version]]],
         ['网络', [['公网 IP', device.public_ip], ['地区', geoLabel(device.geo)], ['时区', device.geo?.timezone], ['内网 IP', Array.isArray(device.private_ips) ? device.private_ips.join('、') : device.private_ips]]],
         ['状态', [['当前状态', labels[presence(device)]], ['最后心跳', device.last_heartbeat ? new Date(Number(device.last_heartbeat) * 1000).toLocaleString() : '从未上报'], ['最近活动', device.last_seen ? new Date(Number(device.last_seen) * 1000).toLocaleString() : '未上报'], ['当前连接数', Array.isArray(device.heartbeat_payload?.conns) ? device.heartbeat_payload.conns.length : '未上报'], ['通讯录用户', Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.join(', ') : '无']]],
         ['升级遥测', [['最近检查', device.last_update_check], ['检查状态', device.last_update_status], ['错误信息', device.last_update_error], ['更新来源', device.last_update_source]]],
         ['原始遥测', [['Heartbeat payload', device.heartbeat_payload], ['Runtime payload', device.runtime_payload], ['Network payload', device.network_payload]]],
       ];
       const body = $('details-body'); body.replaceChildren();
-      groups.forEach(([title, entries]) => { const section = document.createElement('section'); section.className = 'details-section'; const heading = document.createElement('h4'); heading.textContent = title; section.append(heading); entries.forEach(([label, value]) => { const line = document.createElement('div'); line.className = 'details-line'; line.append(textLine('details-label', label), textLine('details-value', detailValue(value))); section.append(line); }); body.append(section); });
+      groups.forEach(([title, entries]) => { const section = document.createElement('section'); section.className = 'details-section' + (title === '发行身份' ? ' release-grid' : ''); const heading = document.createElement('h4'); heading.textContent = title; section.append(heading); entries.forEach(([label, value]) => { const line = document.createElement('div'); line.className = 'details-line'; line.append(textLine('details-label', label), textLine('details-value', detailValue(value))); section.append(line); }); body.append(section); });
       $('details-dialog').showModal();
     }
 
@@ -231,7 +231,7 @@
       const selectCell = appendCell(row, '选择'); const select = document.createElement('input'); select.type = 'checkbox'; select.checked = state.selected.has(deviceKey(device)); select.setAttribute('aria-label', '选择客户端 ' + device.id); select.addEventListener('change', () => { if (select.checked) state.selected.set(deviceKey(device), device); else state.selected.delete(deviceKey(device)); updateAssignmentButton(); }); selectCell.append(select);
       const primary = appendCell(row, '客户端', 'primary-cell'); primary.append(textLine('cell-title device-name', device.hostname || device.id || '未知客户端')); primary.append(textLine('cell-subtitle device-id', device.id));
       const aliasCell = appendCell(row, '备注'); const alias = String(device.alias || '').trim(); aliasCell.append(textLine(alias ? 'cell-title' : 'alias-empty', alias || '未备注')); if (device.deployed || device.owner_username || device.deployment_owner) aliasCell.append(textLine('cell-subtitle', '当前归属：' + (device.owner_username || device.deployment_owner || '已登记'))); const assignedCount = Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.length : 0; aliasCell.append(textLine('cell-subtitle', assignedCount ? '通讯录分配：' + assignedCount + ' 个用户' : '通讯录分配：无'));
-      const platformCell = appendCell(row, '版本 / 发行形态'); platformCell.append(textLine('cell-title release-title', [platformLabel(device.platform), distributionLabel(device.distribution)].join(' · '))); platformCell.append(textLine('cell-subtitle version-text', '系统版本：' + (device.os_version || device.os || '未上报'))); platformCell.append(textLine('cell-subtitle version-text', '客户端：' + (device.version || '未上报') + ' · 运行：' + installModeLabel(device.install_mode)));
+      const platformCell = appendCell(row, '版本 / 发行形态'); platformCell.append(textLine('cell-title release-title', [platformLabel(device.platform), distributionLabel(device.distribution)].join(' · '))); platformCell.append(textLine('cell-subtitle version-text', '客户端：' + (device.version || '未上报') + ' · 运行：' + installModeLabel(device.install_mode)));
       const networkCell = appendCell(row, '网络'); networkCell.append(textLine('cell-title network-ip', device.public_ip || '公网 IP 未上报')); const location = geoLabel(device.geo); if (location) networkCell.append(textLine('cell-subtitle network-location', location));
       const statusCell = appendCell(row, '状态'); const currentPresence = presence(device); const badge = document.createElement('span'); badge.className = 'status-badge ' + currentPresence; badge.append(textLine('status-dot ' + currentPresence, ''), document.createTextNode(labels[currentPresence])); statusCell.append(badge);
       const activity = appendCell(row, '最近活动'); const timestamp = activityAt(device); activity.append(textLine('cell-title', relativeTime(timestamp))); if (timestamp) activity.append(textLine('cell-subtitle', new Date(timestamp * 1000).toLocaleString()));
@@ -332,6 +332,26 @@
     document.addEventListener('visibilitychange', () => { if (!document.hidden && $('auto-refresh').checked) load({ quiet: true }); });
     $('alias-cancel').addEventListener('click', () => $('alias-dialog').close());
     $('details-close').addEventListener('click', () => $('details-dialog').close());
+    $('details-dialog').addEventListener('pointerdown', event => {
+      const dialog = $('details-dialog');
+      if (!dialog.open) return;
+      if (event.target === dialog) { dialog.close(); return; }
+      const rect = dialog.getBoundingClientRect();
+      const outside = event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom;
+      if (outside) dialog.close();
+    });
+    $('details-dialog').addEventListener('focusout', event => {
+      const dialog = $('details-dialog');
+      if (!dialog.open) return;
+      const next = event.relatedTarget;
+      if (next && (next === dialog || dialog.contains(next))) return;
+      window.setTimeout(() => {
+        if (!dialog.open) return;
+        const active = document.activeElement;
+        if (active && (active === dialog || dialog.contains(active))) return;
+        dialog.close();
+      }, 0);
+    });
     $('alias-form').addEventListener('submit', async event => {
       event.preventDefault();
       if (!state.aliasDevice) return;

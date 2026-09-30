@@ -37,15 +37,59 @@ function json_object_text(mixed $value): string
 function report_runtime_payload(array $data): array
 {
     $runtime = [];
+    if ((!isset($data['client_arch']) || $data['client_arch'] === '') && isset($data['arch']) && is_string($data['arch'])) $data['client_arch'] = $data['arch'];
     $allowed = ['distribution' => ['desktop','mobile','sos','installed','portable','msi','appimage','linux_package','unknown'], 'install_mode' => ['installed','portable','live','unknown']];
-    foreach (['platform', 'distribution', 'install_mode', 'client_arch', 'executable_name', 'product', 'edition', 'build_number', 'build_seq', 'source_commit', 'channel', 'last_update_check', 'last_update_status', 'last_update_error', 'last_update_source'] as $key) {
-        if (array_key_exists($key, $data) && is_string($data[$key]) && strlen($data[$key]) <= 128) {
-            $value = strtolower(trim($data[$key]));
-            $runtime[$key] = isset($allowed[$key]) ? (in_array($value, $allowed[$key], true) ? $value : 'unknown') : $value;
+    $preserve = ['client_id','client_uuid','product','edition','build_number','source_commit','channel','platform','client_arch','executable_name','os_version'];
+    foreach (['platform', 'distribution', 'install_mode', 'client_arch', 'executable_name', 'product', 'edition', 'build_number', 'build_seq', 'source_commit', 'channel', 'client_id', 'client_uuid', 'os_version', 'last_update_check', 'last_update_status', 'last_update_error', 'last_update_source'] as $key) {
+        if ($key === 'build_seq' && array_key_exists($key, $data) && is_numeric($data[$key])) { $runtime[$key] = (int)$data[$key]; continue; }
+        if (array_key_exists($key, $data) && is_string($data[$key]) && strlen($data[$key]) <= 256) {
+            $value = trim($data[$key]);
+            if (!in_array($key, $preserve, true)) $value = strtolower($value);
+            $runtime[$key] = isset($allowed[$key]) ? (in_array(strtolower($value), $allowed[$key], true) ? strtolower($value) : 'unknown') : $value;
         }
-        if (array_key_exists($key, $data) && is_int($data[$key])) $runtime[$key] = $data[$key];
     }
     return $runtime;
+}
+function release_identity(array $report, array $runtime): array
+{
+    $pick = static function (array $keys) use ($report, $runtime) {
+        foreach ([$report, $runtime] as $source) foreach ($keys as $key) {
+            if (!array_key_exists($key, $source)) continue;
+            $value = $source[$key];
+            if ($value === null || $value === '' || $value === []) continue;
+            return $value;
+        }
+        return null;
+    };
+    $text = static function (array $keys) use ($pick): string {
+        $value = $pick($keys);
+        return is_scalar($value) ? trim((string)$value) : '';
+    };
+    $seq = $pick(['build_seq']);
+    return ['client_id'=>$text(['client_id']),'client_uuid'=>$text(['client_uuid']),'product'=>$text(['product']),'edition'=>$text(['edition']),'version'=>$text(['version']),'build_number'=>$text(['build_number']),'build_seq'=>is_numeric($seq)?(int)$seq:null,'channel'=>$text(['channel']),'platform'=>$text(['platform']),'arch'=>$text(['arch','client_arch']),'distribution'=>$text(['distribution']),'install_mode'=>$text(['install_mode']),'source_commit'=>$text(['source_commit']),'os'=>$text(['os']),'os_version'=>$text(['os_version'])];
+}
+function remember_release_identity(PDO $db, array $data): void
+{
+    $text = static function (array $data, string $key, int $max): string {
+        $value = $data[$key] ?? '';
+        return is_string($value) && strlen($value) <= $max ? $value : '';
+    };
+    $uuid = $text($data, 'client_uuid', 256); if ($uuid === '') $uuid = $text($data, 'uuid', 256);
+    $id = $text($data, 'client_id', 128); if ($id === '') $id = $text($data, 'id', 128);
+    $rows = $uuid !== '' ? db_all($db, 'SELECT id,uuid,payload,runtime_payload FROM device_reports WHERE uuid=:uuid', ['uuid'=>$uuid]) : [];
+    if (count($rows) !== 1 && $id !== '') $rows = db_all($db, 'SELECT id,uuid,payload,runtime_payload FROM device_reports WHERE id=:id', ['id'=>$id]);
+    if (count($rows) !== 1) return;
+    $row = $rows[0]; $payload = decoded_payload($row['payload']); $runtime = decoded_payload($row['runtime_payload'] ?? null);
+    foreach (['client_id','client_uuid','product','edition','version','build_number','build_seq','channel','platform','arch','distribution','install_mode','source_commit','os','os_version'] as $key) {
+        if (!array_key_exists($key, $data) || $data[$key] === null || $data[$key] === '') continue;
+        if (in_array($key, ['distribution','install_mode','platform','os'], true) && isset($payload[$key]) && $payload[$key] !== '' && $payload[$key] !== null) continue;
+        if ($key === 'build_seq') { if (!is_numeric($data[$key])) continue; $payload[$key] = (int)$data[$key]; continue; }
+        if (!is_string($data[$key]) || strlen($data[$key]) > 256) continue;
+        $payload[$key] = $data[$key];
+    }
+    if (($payload['client_arch'] ?? '') === '' && ($payload['arch'] ?? '') !== '') $payload['client_arch'] = $payload['arch'];
+    $runtime = array_merge($runtime, report_runtime_payload($payload));
+    db_exec($db, 'UPDATE device_reports SET payload=:payload, runtime_payload=:runtime WHERE id=:id AND uuid=:uuid', ['payload'=>json_encode($payload, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR),'runtime'=>json_encode($runtime, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR),'id'=>$row['id'],'uuid'=>$row['uuid']]);
 }
 function report_network_payload(array $data): array
 {
@@ -381,6 +425,7 @@ function update_check_response(PDO $db, array $data): array
 {
     $id = text_field($data, 'client_id', 128, text_field($data, 'id', 128)); $uuid = text_field($data, 'client_uuid', 256, text_field($data, 'uuid', 256));
     if ($id === '' || $uuid === '') fail(422, '缺少客户端 ID 或 UUID');
+    remember_release_identity($db, $data);
     $version = text_field($data, 'version', 32, '0.0.0'); $build = (int)($data['build_seq'] ?? 0); $channel = text_field($data, 'channel', 32, 'stable'); $policy = update_policy($db, $id, $uuid, $channel); $channel = (string)($policy['channel'] ?: $channel);
     $manifest = public_update_manifest($db, $channel, $policy['target_version'] ?? null, isset($policy['target_build_seq']) ? (int)$policy['target_build_seq'] : null); $mode = update_mode((string)$policy['mode']);
     $base = rtrim((string)(getenv('RUSTDESK_UPDATE_BASE_URL') ?: ''), '/'); $empty = ['update_available'=>false,'mode'=>$mode,'auto_install'=>(bool)$policy['auto_install'],'channel'=>$channel,'current_version'=>$version,'current_build_seq'=>$build,'policy_revision'=>(int)$policy['policy_revision']];
@@ -1232,13 +1277,13 @@ try {
                     $storedGeo=$network['geo']??null;
                     $publicGeo=is_array($storedGeo)&&$storedGeo!==[]?$storedGeo:public_ip_geo($publicIp);
                 }
-                $aliasEntry=$aliases[$reportRow['id']]??null; $lastHeartbeat=(int)$reportRow['last_heartbeat'];
+                $aliasEntry=$aliases[$reportRow['id']]??null; $lastHeartbeat=(int)$reportRow['last_heartbeat']; $release=release_identity($report,$runtime);
                 $inventory[]=['id'=>$reportRow['id'],'uuid'=>$reportRow['uuid'],'owner_id'=>$deployment&&$deployment['uid']!==null?(int)$deployment['uid']:null,
                     'hostname'=>$report['hostname']??($deploy['device_name']??''),'username'=>$report['username']??($deploy['device_username']??''),
-                    'platform'=>$report['platform']??($report['os']??($deploy['platform']??'')),'os'=>$report['os']??'','os_version'=>$report['os_version']??($deploy['os_version']??''),'cpu'=>$report['cpu']??'','memory'=>$report['memory']??'','version'=>$report['version']??'',
-                    'product'=>$runtime['product']??'','edition'=>$runtime['edition']??'','build_number'=>$runtime['build_number']??'','build_seq'=>$runtime['build_seq']??0,'source_commit'=>$runtime['source_commit']??'','channel'=>$runtime['channel']??'',
+                    'platform'=>$release['platform']!==''?$release['platform']:($report['os']??($deploy['platform']??'')),'os'=>$release['os']!==''?$release['os']:($report['os']??''),'os_version'=>$release['os_version'],'cpu'=>$report['cpu']??'','memory'=>$report['memory']??'','version'=>$release['version']!==''?$release['version']:($report['version']??''),
+                    'client_id'=>$release['client_id'],'client_uuid'=>$release['client_uuid'],'product'=>$release['product'],'edition'=>$release['edition'],'build_number'=>$release['build_number'],'build_seq'=>$release['build_seq'],'source_commit'=>$release['source_commit'],'channel'=>$release['channel'],'arch'=>$release['arch'],
                     'last_update_check'=>$runtime['last_update_check']??'','last_update_status'=>$runtime['last_update_status']??'','last_update_error'=>$runtime['last_update_error']??'','last_update_source'=>$runtime['last_update_source']??'',
-                    'distribution'=>$runtime['distribution']??'','install_mode'=>$runtime['install_mode']??'','client_arch'=>$runtime['client_arch']??'','executable_name'=>$runtime['executable_name']??'',
+                    'distribution'=>$release['distribution'],'install_mode'=>$release['install_mode'],'client_arch'=>$release['arch'],'executable_name'=>$runtime['executable_name']??($report['executable_name']??''),
                     'public_ip'=>$publicIp,'private_ips'=>$network['private_ips']??[],'geo'=>$publicGeo,
                     'version_text'=>$report['version']??'','heartbeat_version'=>decoded_payload($reportRow['heartbeat_payload']??null)['ver']??null,
                     'heartbeat_payload'=>decoded_payload($reportRow['heartbeat_payload']??null),

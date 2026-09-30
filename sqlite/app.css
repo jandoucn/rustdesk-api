@@ -226,8 +226,40 @@ dialog::backdrop { background: rgba(27, 35, 35, .48); backdrop-filter: blur(2px)
 .tag-choice input { width: 15px; height: 15px; margin: 0; accent-color: var(--primary); }
 .tag-picker-empty { color: var(--muted); font-size: 12px; }
 #tag-dialog { width: min(640px, calc(100vw - 28px)); }
-#details-dialog { width: min(860px, calc(100vw - 28px)); }
-#details-dialog .details-value { white-space: pre-wrap; }
+#details-dialog[open] {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  display: flex;
+  flex-direction: column;
+  width: min(1120px, calc(100vw - 32px));
+  height: fit-content;
+  max-height: calc(100dvh - 24px);
+  margin: 0;
+  overflow: hidden;
+  transform: translate(-50%, -50%);
+}
+#details-dialog .dialog-form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: calc(100dvh - 24px);
+  overflow: hidden;
+  padding: 10px 12px 8px;
+}
+#details-dialog .dialog-head { margin-bottom: 6px; }
+#details-dialog .dialog-head h3 { margin-bottom: 2px; font-size: 16px; }
+#details-dialog .dialog-actions { margin-top: 8px; }
+#details-dialog .details-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; min-height: 0; max-height: calc(100dvh - 132px); overflow: auto; }
+#details-dialog .details-section { padding: 6px 8px; }
+#details-dialog .details-section h4 { margin-bottom: 2px; }
+#details-dialog .details-line { grid-template-columns: 76px minmax(0, 1fr); gap: 6px; padding: 1px 0; }
+#details-dialog .release-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 12px; }
+#details-dialog .release-grid h4 { grid-column: 1 / -1; }
+@media (max-width: 700px) {
+  #details-dialog .release-grid { grid-template-columns: 1fr; }
+}
+#details-dialog .details-value { white-space: pre-wrap; line-height: 1.35; }
 .tag-editor { display: grid; grid-template-columns: minmax(190px, 1fr) 64px auto auto; align-items: end; gap: 9px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
 .color-field input[type="color"] { width: 100%; height: 40px; padding: 4px; border: 1px solid var(--border-strong); border-radius: var(--radius); background: #fff; cursor: pointer; }
 .tag-management-list { display: grid; max-height: min(380px, 46vh); overflow: auto; }
@@ -355,6 +387,7 @@ dialog::backdrop { background: rgba(27, 35, 35, .48); backdrop-filter: blur(2px)
   .tag-management-row .row-actions { width: 100%; }
   .tag-editor { grid-template-columns: minmax(0, 1fr); }
   .details-grid { grid-template-columns: 1fr; }
+  #details-dialog .details-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .color-field input[type="color"] { width: 64px; }
 }
 

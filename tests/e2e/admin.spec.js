@@ -297,6 +297,60 @@ test('client inventory formats domestic and foreign IP locations without repeati
   expect(api.data.find(item => item.id === deviceId).geo).toEqual(london.geo);
 });
 
+test('client list omits the operating-system line and details close on outside focus', async ({ page, request }) => {
+  const deviceId = `osline-${Date.now().toString(36)}`;
+  const uuid = `${deviceId}-uuid`;
+  await expect((await request.post('/api/heartbeat', { data: { id: deviceId, uuid, ver: 10, conns: [] } })).ok()).toBeTruthy();
+  await expect((await request.post('/api/sysinfo', { data: {
+    id: deviceId, uuid, hostname: `${deviceId}-host`, platform: 'windows', distribution: 'desktop', install_mode: 'installed',
+    os: 'windows / Windows Server 2016 Datacenter - 10 (14393)', version: '1.5.0',
+    client_id: 'RustDesk Yan', client_uuid: uuid, product: 'rustdesk-yan', edition: 'custom',
+    build_number: '20260930.2', build_seq: 2026093002, channel: 'stable', arch: 'x86_64',
+    source_commit: 'commit-sha', os_version: 'Windows 11',
+  } })).ok()).toBeTruthy();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  await expect(row).toContainText('Windows · 安装版');
+  await expect(row).toContainText('客户端：1.5.0');
+  await expect(row).not.toContainText('系统版本');
+  await expect(row).not.toContainText('Windows Server 2016');
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  const dialog = page.locator('#details-dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText('Windows Server 2016 Datacenter');
+  await expect(dialog).toContainText('客户端身份');
+  await expect(dialog).toContainText('RustDesk Yan');
+  await expect(dialog).toContainText('构建号');
+  await expect(dialog).toContainText('20260930.2');
+  await expect(dialog).toContainText('构建序号');
+  await expect(dialog).toContainText('2026093002');
+  await expect(dialog).toContainText('源码提交');
+  await expect(dialog).toContainText('commit-sha');
+  await expect(dialog.locator('#details-close')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+  expect(await dialog.evaluate(node => {
+    const box = node.getBoundingClientRect();
+    const close = node.querySelector('#details-close').getBoundingClientRect();
+    return box.top >= 0 && box.bottom <= window.innerHeight + 1 && close.top >= box.top && close.bottom <= window.innerHeight + 1 && close.width > 0;
+  })).toBeTruthy();
+  await page.mouse.click(6, 6);
+  await expect(dialog).toBeHidden();
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  await dialog.locator('#details-close').click();
+  await expect(dialog).toBeHidden();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator('#details-close')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+  await page.mouse.click(4, 4);
+  await expect(dialog).toBeHidden();
+});
+
 test('desktop release renders as installed and keeps UUID out of the inventory row', async ({ page, request }) => {
   const deviceId = `desktop-release-${Date.now().toString(36)}`;
   const uuid = `${deviceId}-internal-uuid`;

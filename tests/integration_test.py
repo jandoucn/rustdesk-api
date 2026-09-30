@@ -375,6 +375,74 @@ class IntegrationTest(unittest.TestCase):
         _, heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {"id": "anonymous", "uuid": str(uuid.uuid4()), "conns": []})
         self.assertIsInstance(heartbeat, dict)
 
+    def test_client_release_identity_is_visible_from_sysinfo_and_update_check(self):
+        device_id = "release-" + uuid.uuid4().hex[:8]
+        device_uuid = device_id + "-uuid"
+        status, body, _ = self.client.request("POST", "/?s=/api/sysinfo", {
+            "id": device_id, "uuid": device_uuid, "hostname": "release-host",
+            "client_id": "RustDesk Yan", "client_uuid": device_uuid,
+            "product": "rustdesk-yan", "edition": "custom", "version": "1.5.0",
+            "build_number": "20260930.2", "build_seq": 2026093002, "channel": "stable",
+            "platform": "windows", "arch": "x86_64", "distribution": "desktop",
+            "install_mode": "installed", "source_commit": "commit-sha",
+            "os": "Windows", "os_version": "Windows 11",
+        }, expected=(200,))
+        self.assertEqual(status, 200)
+        self.assertEqual(body, "SYSINFO_UPDATED")
+        self.admin_csrf()
+        _, listing, _ = self.client.json("GET", f"/?s=/ops-x9/api/devices?q={device_id}&page=1&pageSize=20")
+        row = next(item for item in listing["data"] if item["id"] == device_id)
+        self.assertEqual(row["client_id"], "RustDesk Yan")
+        self.assertEqual(row["client_uuid"], device_uuid)
+        self.assertEqual(row["product"], "rustdesk-yan")
+        self.assertEqual(row["edition"], "custom")
+        self.assertEqual(row["version"], "1.5.0")
+        self.assertEqual(row["build_number"], "20260930.2")
+        self.assertEqual(row["build_seq"], 2026093002)
+        self.assertEqual(row["channel"], "stable")
+        self.assertEqual(row["arch"], "x86_64")
+        self.assertEqual(row["distribution"], "desktop")
+        self.assertEqual(row["install_mode"], "installed")
+        self.assertEqual(row["source_commit"], "commit-sha")
+        self.assertEqual(row["os"], "Windows")
+        self.assertEqual(row["os_version"], "Windows 11")
+        db = sqlite3.connect(self.db)
+        stored = json.loads(db.execute("SELECT payload FROM device_reports WHERE id=?", (device_id,)).fetchone()[0])
+        self.assertEqual(stored["build_number"], "20260930.2")
+        self.assertEqual(stored["source_commit"], "commit-sha")
+        db.execute(
+            "UPDATE device_reports SET runtime_payload=? WHERE id=?",
+            (json.dumps({"platform": "windows", "distribution": "desktop", "install_mode": "installed", "client_arch": "x86_64", "executable_name": "rustdesk.exe"}), device_id),
+        )
+        db.commit()
+        db.close()
+        _, again, _ = self.client.json("GET", f"/?s=/ops-x9/api/devices?q={device_id}&page=1&pageSize=20")
+        preserved = next(item for item in again["data"] if item["id"] == device_id)
+        self.assertEqual(preserved["build_number"], "20260930.2")
+        self.assertEqual(preserved["build_seq"], 2026093002)
+        self.assertEqual(preserved["client_id"], "RustDesk Yan")
+        self.assertEqual(preserved["source_commit"], "commit-sha")
+        bare = "check-" + uuid.uuid4().hex[:8]
+        bare_uuid = bare + "-uuid"
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": bare, "uuid": bare_uuid, "ver": 1, "conns": []})
+        self.client.json("POST", "/?s=/rd/update/v1/check", {
+            "client_id": "RustDesk Yan", "client_uuid": bare_uuid,
+            "product": "rustdesk-yan", "edition": "custom", "version": "1.5.0",
+            "build_number": "20260930.2", "build_seq": 2026093002, "channel": "stable",
+            "platform": "windows", "arch": "x86_64", "distribution": "desktop",
+            "install_mode": "installed", "source_commit": "commit-sha",
+            "os": "Windows", "os_version": "Windows 11",
+        })
+        _, checked, _ = self.client.json("GET", f"/?s=/ops-x9/api/devices?q={bare}&page=1&pageSize=20")
+        shown = next(item for item in checked["data"] if item["id"] == bare)
+        self.assertEqual(shown["client_id"], "RustDesk Yan")
+        self.assertEqual(shown["build_number"], "20260930.2")
+        self.assertEqual(shown["os_version"], "Windows 11")
+        self.assertEqual(shown["arch"], "x86_64")
+        before = self.client.json("GET", "/?s=/ops-x9/api/devices?q=Ghost&page=1&pageSize=20")[1]["total"]
+        self.client.json("POST", "/?s=/rd/update/v1/check", {"client_id": "Ghost", "client_uuid": "missing-uuid", "version": "1.5.0", "build_seq": 1, "channel": "stable"})
+        self.assertEqual(self.client.json("GET", "/?s=/ops-x9/api/devices?q=Ghost&page=1&pageSize=20")[1]["total"], before)
+
     def test_update_manifest_check_and_event_round_trip(self):
         csrf = self.admin_csrf()
         manifest = {"product": "rustdesk-yan", "edition": "custom", "targets": {"windows-x64-exe": {"primary": "https://rdapi.yan.life/update/files/stable/1.5.0/rustdesk.exe", "size": 12, "sha256": "abc", "signature": "sig"}}}
