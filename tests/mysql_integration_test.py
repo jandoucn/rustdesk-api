@@ -29,6 +29,81 @@ class MySQLIntegrationTest(unittest.TestCase):
         _, conflict, _ = self.client.json("DELETE", f"/ops-x9/api/devices/{device_id}?uuid={device_id}-uuid", {}, {"X-CSRF-Token": csrf}, expected=(409,))
         self.assertTrue(conflict["references"])
 
+    def test_20b_cross_user_address_book_crud_batch_counts_and_sql(self):
+        csrf = self.admin_login()
+        suffix = str(int(time.time() * 1000))[-9:]
+        _, source_created, _ = self.client.json("POST", "/ops-x9/api/users",
+            {"username": f"mysql-source-{suffix}", "password": "1", "enabled": True, "address_book_scope": "self"},
+            {"X-CSRF-Token": csrf}, expected=(201,))
+        _, target_created, _ = self.client.json("POST", "/ops-x9/api/users",
+            {"username": f"mysql-target-{suffix}", "password": "1", "enabled": True, "address_book_scope": "self"},
+            {"X-CSRF-Token": csrf}, expected=(201,))
+        source_uid, target_uid = int(source_created["id"]), int(target_created["id"])
+        online_id, offline_id, fresh_id = f"mysql-online-{suffix}", f"mysql-offline-{suffix}", f"mysql-fresh-{suffix}"
+        self.client.json("POST", "/api/heartbeat", {"id": online_id, "uuid": online_id + "-uuid", "conns": []})
+        query = f"?user_id={source_uid}"
+        self.client.json("POST", "/ops-x9/api/address-book/tags" + query, {"name": "old", "color": 4282668390}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.client.json("POST", "/ops-x9/api/address-book/tags" + query, {"name": "managed", "color": 4283215696}, {"X-CSRF-Token": csrf}, expected=(201,))
+        for peer_id, alias, tags, marker in ((online_id, "MySQL online", ["ops"], 1), (offline_id, "MySQL offline", ["old"], 2)):
+            self.client.json("POST", "/ops-x9/api/address-book/peers" + query,
+                {"id": peer_id, "alias": alias, "tags": tags, "future": {"keep": marker}},
+                {"X-CSRF-Token": csrf}, expected=(201,))
+        self.client.json("POST", "/ops-x9/api/address-book/peers" + query,
+            {"id": fresh_id, "alias": "MySQL fresh", "tags": ["fresh-tag"], "future": {"keep": 3}},
+            {"X-CSRF-Token": csrf}, expected=(201,))
+        for peer_id, alias, tags, marker in ((online_id, "MySQL target online", ["target-online"], 1), (offline_id, "MySQL target offline", ["target-offline"], 2)):
+            self.client.json("POST", f"/ops-x9/api/address-book/peers?user_id={target_uid}",
+                {"id": peer_id, "alias": alias, "tags": tags, "future": {"target": marker}},
+                {"X-CSRF-Token": csrf}, expected=(201,))
+        self.client.json("PATCH", f"/ops-x9/api/address-book/peers/{online_id}{query}", {"alias": "MySQL updated"}, {"X-CSRF-Token": csrf})
+        self.client.json("POST", "/ops-x9/api/address-book/tags" + query, {"name": "mysql-temp", "color": 4283215696}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.client.json("PATCH", "/ops-x9/api/address-book/tags/mysql-temp" + query, {"name": "mysql-renamed"}, {"X-CSRF-Token": csrf})
+        self.client.json("DELETE", "/ops-x9/api/address-book/tags/mysql-renamed" + query, None, {"X-CSRF-Token": csrf})
+        for payload in (
+            {"action": "add_tags", "peer_ids": [online_id, offline_id], "tags": ["managed"]},
+            {"action": "remove_tags", "peer_ids": [offline_id], "tags": ["old"]},
+            {"action": "copy", "peer_ids": [online_id], "target_user_id": target_uid},
+            {"action": "move", "peer_ids": [offline_id], "target_user_id": target_uid},
+            {"action": "copy", "peer_ids": [fresh_id], "target_user_id": target_uid},
+        ):
+            self.client.json("POST", "/ops-x9/api/address-book/batch" + query, payload, {"X-CSRF-Token": csrf})
+        _, users, _ = self.client.json("GET", "/ops-x9/api/users?q=mysql-&page=1&pageSize=100")
+        indexed = {row["id"]: row for row in users["data"]}
+        self.assertEqual((indexed[source_uid]["address_book_count"], indexed[source_uid]["address_book_online_count"]), (2, 1))
+        self.assertEqual((indexed[target_uid]["address_book_count"], indexed[target_uid]["address_book_online_count"]), (3, 1))
+        self.assertEqual(self.sql(
+            "SELECT a.uid,p.id,JSON_UNQUOTE(JSON_EXTRACT(p.payload,'$.alias')) "
+            "FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid "
+            f"WHERE a.uid IN ({source_uid},{target_uid}) AND p.id IN ('{online_id}','{offline_id}','{fresh_id}') ORDER BY a.uid,p.id"), [
+            f"{source_uid}\t{fresh_id}\tMySQL fresh",
+            f"{source_uid}\t{online_id}\tMySQL updated",
+            f"{target_uid}\t{fresh_id}\tMySQL fresh",
+            f"{target_uid}\t{offline_id}\tMySQL target offline",
+            f"{target_uid}\t{online_id}\tMySQL target online",
+        ])
+        self.assertEqual(self.sql(f"SELECT JSON_EXTRACT(payload,'$.future.keep') FROM ab_profile_peers WHERE guid=(SELECT guid FROM ab_profiles WHERE uid={source_uid} AND personal=1) AND id='{online_id}'"), ["1"])
+        self.assertEqual(self.sql(f"SELECT id,JSON_EXTRACT(payload,'$.future.target') FROM ab_profile_peers WHERE guid=(SELECT guid FROM ab_profiles WHERE uid={target_uid} AND personal=1) AND id IN ('{online_id}','{offline_id}') ORDER BY id"), [f"{offline_id}\t2", f"{online_id}\t1"])
+        self.assertEqual(self.sql(f"SELECT uid,id,alias,tags FROM rustdesk_peers WHERE uid IN ({source_uid},{target_uid}) AND id IN ('{online_id}','{offline_id}','{fresh_id}') ORDER BY uid,id"), [
+            f"{source_uid}\t{fresh_id}\tMySQL fresh\tfresh-tag",
+            f"{source_uid}\t{online_id}\tMySQL updated\tops,managed",
+            f"{target_uid}\t{fresh_id}\tMySQL fresh\tfresh-tag",
+            f"{target_uid}\t{offline_id}\tMySQL target offline\ttarget-offline",
+            f"{target_uid}\t{online_id}\tMySQL target online\ttarget-online",
+        ])
+        self.assertEqual(self.sql(f"SELECT uid,JSON_LENGTH(payload,'$.peers') FROM address_books WHERE uid IN ({source_uid},{target_uid}) ORDER BY uid"), [f"{source_uid}\t2", f"{target_uid}\t3"])
+        self.assertEqual(self.sql(f"SELECT color FROM ab_profile_tags WHERE guid=(SELECT guid FROM ab_profiles WHERE uid={source_uid} AND personal=1) AND name='managed'"), ["4283215696"])
+        self.assertEqual(self.sql(f"SELECT COUNT(*) FROM rustdesk_tags WHERE uid={source_uid} AND tag='managed'"), ["1"])
+        self.assertEqual(self.sql(f"SELECT JSON_CONTAINS(JSON_EXTRACT(payload,'$.tags'),JSON_QUOTE('managed')) FROM address_books WHERE uid={source_uid}"), ["1"])
+        self.assertEqual(self.sql(f"SELECT color FROM ab_profile_tags WHERE guid=(SELECT guid FROM ab_profiles WHERE uid={source_uid} AND personal=1) AND name='old'"), ["4282668390"])
+        self.assertEqual(self.sql(f"SELECT COUNT(*) FROM rustdesk_tags WHERE uid={source_uid} AND tag='old'"), ["1"])
+        self.assertEqual(self.sql(f"SELECT JSON_CONTAINS(JSON_EXTRACT(payload,'$.tags'),JSON_QUOTE('old')) FROM address_books WHERE uid={source_uid}"), ["1"])
+        self.assertEqual(self.sql(f"SELECT COUNT(*) FROM ab_profile_tags WHERE guid=(SELECT guid FROM ab_profiles WHERE uid={target_uid} AND personal=1) AND name='fresh-tag'"), ["1"])
+        self.assertEqual(self.sql(f"SELECT COUNT(*) FROM rustdesk_tags WHERE uid={target_uid} AND tag='fresh-tag'"), ["1"])
+        self.assertEqual(self.sql(f"SELECT JSON_CONTAINS(JSON_EXTRACT(payload,'$.tags'),JSON_QUOTE('fresh-tag')) FROM address_books WHERE uid={target_uid}"), ["1"])
+        self.assertEqual(self.sql(f"SELECT COUNT(*) FROM rustdesk_tags WHERE uid={source_uid} AND tag IN ('mysql-temp','mysql-renamed')"), ["0"])
+        self.client.json("DELETE", f"/ops-x9/api/users/{source_uid}", None, {"X-CSRF-Token": csrf})
+        self.client.json("DELETE", f"/ops-x9/api/users/{target_uid}", None, {"X-CSRF-Token": csrf})
+
     def test_21_device_update_policy_round_trip_and_sql(self):
         csrf = self.admin_login()
         device_id, uuid = "mysql-policy-" + str(int(time.time())), "mysql-policy-uuid"

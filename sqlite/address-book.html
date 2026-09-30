@@ -35,6 +35,10 @@
           </div>
         </div>
 
+        <section id="address-book-owner-panel" class="panel compact-panel" aria-label="通讯录用户选择">
+          <div class="toolbar"><div class="field grow"><label for="address-book-owner">当前通讯录用户</label><input id="address-book-owner" class="input" list="address-book-users" placeholder="搜索用户名或输入用户 ID" autocomplete="off"><datalist id="address-book-users"></datalist></div><button id="switch-address-book-owner" class="button" type="button">打开通讯录</button></div>
+        </section>
+
         <div class="sync-notice" role="note">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke-width="2"/><path d="M12 11v5M12 8h.01" stroke-width="2" stroke-linecap="round"/></svg>
           <div><strong>同步边界</strong><span>后台收藏只用于此管理页面筛选，不会同步到 RustDesk 客户端本机的原生收藏栏。</span></div>
@@ -55,10 +59,17 @@
             <button id="search-address-book" class="button" type="button">搜索</button>
             <div class="toolbar-switches"><label class="check" for="favorite-only"><input id="favorite-only" type="checkbox">仅后台收藏</label><button id="address-export-csv" class="button small" type="button">导出 CSV</button><button id="address-export-json" class="button small" type="button">导出 JSON</button><label class="button small" for="address-import">导入</label><input id="address-import" type="file" accept=".csv,.json,application/json,text/csv" hidden></div>
           </div>
+          <div id="batch-toolbar" class="toolbar batch-toolbar">
+            <span id="batch-selection" class="field-hint">已选择 0 个客户端</span>
+            <div class="field filter"><label for="batch-action">批量操作</label><select id="batch-action" class="select"><option value="add_tags">添加标签</option><option value="remove_tags">移除标签</option><option value="copy">复制到用户</option><option value="move">移动到用户</option><option value="remove">从通讯录移除</option></select></div>
+            <div id="batch-tags-field" class="field grow"><label for="batch-tags">标签</label><input id="batch-tags" class="input" placeholder="多个标签用逗号分隔"></div>
+            <div id="batch-target-field" class="field filter hidden"><label for="batch-target">目标用户</label><select id="batch-target" class="select"></select></div>
+            <button id="apply-batch" class="button primary" type="button" disabled>应用批量操作</button>
+          </div>
           <p id="address-book-status" class="feedback" aria-live="polite">正在读取个人通讯录...</p>
           <div class="table-wrap">
             <table>
-              <thead><tr><th><span class="sr-only">后台收藏</span></th><th>客户端</th><th>标签</th><th>备注</th><th>版本 / 发行形态</th><th>网络</th><th>状态</th><th>最近活动</th><th>操作</th></tr></thead>
+              <thead><tr><th><input id="select-all-peers" type="checkbox" aria-label="选择本页全部客户端"></th><th><span class="sr-only">后台收藏</span></th><th>客户端</th><th>标签</th><th>备注</th><th>版本 / 发行形态</th><th>网络</th><th>状态</th><th>最近活动</th><th>操作</th></tr></thead>
               <tbody id="address-book-rows"></tbody>
             </table>
           </div>
@@ -111,7 +122,7 @@
   'use strict';
   (() => {
     const $ = id => document.getElementById(id);
-    const state = { csrf: '', user: null, page: 1, size: 50, total: 0, q: '', tag: '', favorite: false, presence: 'all', peers: [], tags: [], summary: {}, loading: false, editingPeer: null, editingTag: null, confirmAction: null, returnToTags: false };
+    const state = { csrf: '', actor: null, targetUser: null, users: [], selected: new Set(), page: 1, size: 50, total: 0, q: '', tag: '', favorite: false, presence: 'all', peers: [], tags: [], summary: {}, loading: false, pendingLoad: null, loadGeneration: 0, editingPeer: null, editingTag: null, confirmAction: null, returnToTags: false };
     const starIcon = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9L12 3Z" stroke-width="2" stroke-linejoin="round"/></svg>';
 
     async function api(url, options = {}) {
@@ -138,7 +149,9 @@
     function isFavorite(peer) { return peer.favorite === true || peer.favorite === 1 || peer.is_favorite === true || peer.is_favorite === 1; }
     function colorHex(value) { const number = Number(value); return number ? '#' + ((number >>> 0) & 0xffffff).toString(16).padStart(6, '0') : '#176b87'; }
     function colorNumber(value) { return Number.parseInt('ff' + String(value).replace('#', ''), 16); }
-    function peerPath(id) { return '__ADMIN_PATH__/api/address-book/peers/' + encodeURIComponent(id); }
+    function targetQuery() { return state.targetUser ? 'user_id=' + encodeURIComponent(state.targetUser.id) : ''; }
+    function targetUrl(path) { return path + (path.includes('?') ? '&' : '?') + targetQuery(); }
+    function peerPath(id) { return targetUrl('__ADMIN_PATH__/api/address-book/peers/' + encodeURIComponent(id)); }
 
     function updatePager() {
       const pages = Math.max(1, Math.ceil(state.total / state.size));
@@ -190,6 +203,7 @@
       state.peers.forEach(peer => {
         const id = String(peer.id || '');
         const row = document.createElement('tr'); row.dataset.peerId = id;
+        const selectCell = appendCell(row, '选择'); const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = state.selected.has(id); checkbox.setAttribute('aria-label', '选择客户端 ' + id); checkbox.addEventListener('change', () => { if (checkbox.checked) state.selected.add(id); else state.selected.delete(id); updateBatchControls(); }); selectCell.append(checkbox);
         const favoriteCell = appendCell(row, '后台收藏', 'favorite-cell');
         const favorite = document.createElement('button'); favorite.type = 'button'; favorite.className = 'favorite-button' + (isFavorite(peer) ? ' active' : ''); favorite.innerHTML = starIcon; favorite.setAttribute('aria-pressed', String(isFavorite(peer))); favorite.setAttribute('aria-label', isFavorite(peer) ? '取消收藏' : '收藏'); favorite.title = isFavorite(peer) ? '取消后台收藏' : '加入后台收藏'; favorite.addEventListener('click', () => toggleFavorite(peer, favorite)); favoriteCell.append(favorite);
 
@@ -216,18 +230,22 @@
         const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button small danger'; remove.textContent = '删除客户端'; remove.setAttribute('aria-label', '删除客户端'); remove.addEventListener('click', () => confirmPeerDelete(peer));
         actions.append(edit, remove); actionsCell.append(actions); body.append(row);
       });
-      updateStats(); updatePager();
+      updateStats(); updatePager(); updateBatchControls();
     }
 
     async function load(options = {}) {
-      if (state.loading) return;
+      const generation = ++state.loadGeneration;
+      if (!state.targetUser) return;
+      if (state.loading) { state.pendingLoad = options; return; }
       state.loading = true; $('refresh-address-book').disabled = true; updatePager();
       if (!options.quiet) setFeedback('正在读取个人通讯录...');
       try {
-        const params = new URLSearchParams({ q: state.q, tag: state.tag, page: String(state.page), pageSize: String(state.size) });
+        const params = new URLSearchParams({ q: state.q, tag: state.tag, page: String(state.page), pageSize: String(state.size), user_id: String(state.targetUser.id) });
         if (state.favorite) params.set('favorite', '1');
         if (state.presence !== 'all') params.set('presence', state.presence);
         const data = await api('__ADMIN_PATH__/api/address-book?' + params);
+        if (generation !== state.loadGeneration) return;
+        state.targetUser = data.user || state.targetUser;
         state.peers = Array.isArray(data.data) ? data.data : (Array.isArray(data.peers) ? data.peers : []);
         state.tags = (Array.isArray(data.tags) ? data.tags : []).map(normalizedTag).filter(tag => tag.name !== '');
         state.total = Number(data.total ?? state.peers.length) || 0;
@@ -235,9 +253,13 @@
         renderTagFilter(); renderPeers();
         setFeedback('已加载 ' + state.total + ' 个匹配客户端', 'success');
       } catch (error) {
+        if (generation !== state.loadGeneration) return;
         if (String(error.message).includes('登录')) location.href = '__ADMIN_PATH__';
         else setFeedback(error.message, 'error');
-      } finally { state.loading = false; $('refresh-address-book').disabled = false; updatePager(); }
+      } finally {
+        state.loading = false; $('refresh-address-book').disabled = false; updatePager();
+        const pending = state.pendingLoad; state.pendingLoad = null; if (pending) load(pending);
+      }
     }
 
     function openPeerDialog(peer = null) {
@@ -255,12 +277,15 @@
     async function savePeer(event) {
       event.preventDefault();
       const button = $('peer-save'); button.disabled = true; $('peer-error').textContent = '';
+      const creating = !state.editingPeer;
       const id = state.editingPeer ? String(state.editingPeer.id) : $('peer-id').value.trim();
       const payload = { id, alias: $('peer-alias').value.trim(), note: $('peer-note').value.trim(), tags: Array.from($('peer-tags').querySelectorAll('input:checked'), input => input.value) };
       try {
         if (state.editingPeer) await api(peerPath(id), { method: 'PATCH', body: JSON.stringify(payload) });
-        else await api('__ADMIN_PATH__/api/address-book/peers', { method: 'POST', body: JSON.stringify(payload) });
-        $('peer-dialog').close(); state.editingPeer = null; await load({ quiet: true });
+        else await api(targetUrl('__ADMIN_PATH__/api/address-book/peers'), { method: 'POST', body: JSON.stringify(payload) });
+        $('peer-dialog').close(); state.editingPeer = null;
+        if (creating) { state.q = id; state.page = 1; $('address-search').value = id; }
+        await load({ quiet: true });
         setFeedback('通讯录已保存，RustDesk 客户端将在下次地址簿同步时收到更新', 'success');
       } catch (error) { $('peer-error').textContent = error.message; }
       finally { button.disabled = false; }
@@ -269,7 +294,7 @@
     async function toggleFavorite(peer, button) {
       const next = !isFavorite(peer); button.disabled = true;
       try {
-        await api('__ADMIN_PATH__/api/address-book/favorites/' + encodeURIComponent(peer.id), { method: 'PATCH', body: JSON.stringify({ favorite: next }) });
+        await api(targetUrl('__ADMIN_PATH__/api/address-book/favorites/' + encodeURIComponent(peer.id)), { method: 'PATCH', body: JSON.stringify({ favorite: next }) });
         await load({ quiet: true }); setFeedback(next ? '已加入后台收藏' : '已取消后台收藏', 'success');
       } catch (error) { setFeedback(error.message, 'error'); }
       finally { button.disabled = false; }
@@ -304,8 +329,8 @@
       event.preventDefault(); const button = $('tag-save'); button.disabled = true; $('tag-error').textContent = '';
       const name = $('tag-name').value.trim(); const payload = { name, new: name, old: state.editingTag?.name || '', color: colorNumber($('tag-color').value) };
       try {
-        if (state.editingTag) await api('__ADMIN_PATH__/api/address-book/tags/' + encodeURIComponent(state.editingTag.name), { method: 'PATCH', body: JSON.stringify(payload) });
-        else await api('__ADMIN_PATH__/api/address-book/tags', { method: 'POST', body: JSON.stringify(payload) });
+        if (state.editingTag) await api(targetUrl('__ADMIN_PATH__/api/address-book/tags/' + encodeURIComponent(state.editingTag.name)), { method: 'PATCH', body: JSON.stringify(payload) });
+        else await api(targetUrl('__ADMIN_PATH__/api/address-book/tags'), { method: 'POST', body: JSON.stringify(payload) });
         resetTagEditor(); await load({ quiet: true }); renderTagManagement();
       } catch (error) { $('tag-error').textContent = error.message; }
       finally { button.disabled = false; }
@@ -313,7 +338,7 @@
     function confirmTagDelete(tag) {
       $('tag-dialog').close();
       openConfirm('删除标签', '确认删除标签“' + tag.name + '”？该标签会从当前个人通讯录的客户端中移除。', '删除标签', async () => {
-        await api('__ADMIN_PATH__/api/address-book/tags/' + encodeURIComponent(tag.name), { method: 'DELETE' });
+        await api(targetUrl('__ADMIN_PATH__/api/address-book/tags/' + encodeURIComponent(tag.name)), { method: 'DELETE' });
         if (state.tag === tag.name) { state.tag = ''; $('tag-filter').value = ''; }
         await load({ quiet: true }); renderTagManagement();
       }, true);
@@ -325,6 +350,52 @@
       try { await action(); state.confirmAction = null; $('confirm-dialog').close(); if (state.returnToTags) { state.returnToTags = false; renderTagManagement(); $('tag-dialog').showModal(); } }
       catch (error) { $('confirm-error').textContent = error.message; }
       finally { $('confirm-submit').disabled = false; }
+    }
+
+    function renderUsers() {
+      const list = $('address-book-users'); list.replaceChildren();
+      const target = $('batch-target'); target.replaceChildren(new Option('选择目标用户', ''));
+      state.users.forEach(user => {
+        const option = document.createElement('option'); option.value = user.username; option.label = 'ID ' + user.id; list.append(option);
+        if (!state.targetUser || Number(user.id) !== Number(state.targetUser.id)) target.add(new Option(user.username, String(user.id)));
+      });
+      $('address-book-owner').value = state.targetUser?.username || '';
+      $('address-book-owner-panel').classList.toggle('hidden', state.actor?.address_book_scope !== 'all');
+    }
+    function resolveOwner() {
+      const value = $('address-book-owner').value.trim();
+      return state.users.find(user => String(user.id) === value || user.username === value);
+    }
+    async function switchOwner() {
+      const target = resolveOwner();
+      if (!target) { setFeedback('没有找到该用户', 'error'); return; }
+      state.targetUser = target; state.page = 1; state.selected.clear(); renderUsers();
+      const url = new URL(location.href); url.searchParams.set('user_id', target.id); url.searchParams.delete('presence'); history.replaceState(null, '', url);
+      await load();
+    }
+    function updateBatchControls() {
+      const count = state.selected.size; $('batch-selection').textContent = '已选择 ' + count + ' 个客户端'; $('apply-batch').disabled = count === 0;
+      const action = $('batch-action').value; $('batch-tags-field').classList.toggle('hidden', !['add_tags', 'remove_tags'].includes(action)); $('batch-target-field').classList.toggle('hidden', !['copy', 'move'].includes(action));
+      const visibleIds = state.peers.map(peer => String(peer.id)); const selectedVisible = visibleIds.filter(id => state.selected.has(id)).length;
+      $('select-all-peers').checked = visibleIds.length > 0 && selectedVisible === visibleIds.length; $('select-all-peers').indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
+    }
+    async function performBatch(action, payload) {
+      const result = await api(targetUrl('__ADMIN_PATH__/api/address-book/batch'), { method: 'POST', body: JSON.stringify(payload) });
+      state.selected.clear(); await load({ quiet: true }); setFeedback('操作成功：已更新 ' + result.changed + ' 个客户端', 'success');
+    }
+    async function applyBatch() {
+      const action = $('batch-action').value; const payload = { action, peer_ids: Array.from(state.selected) };
+      if (['add_tags', 'remove_tags'].includes(action)) payload.tags = $('batch-tags').value.split(',').map(value => value.trim()).filter(Boolean);
+      if (['copy', 'move'].includes(action)) payload.target_user_id = Number($('batch-target').value);
+      if (action === 'remove') {
+        openConfirm('批量移除通讯录客户端', '确认从当前用户的通讯录移除选中的 ' + payload.peer_ids.length + ' 个客户端？客户端上报和部署记录不会被删除。', '确认移除', () => performBatch(action, payload));
+        return;
+      }
+      $('apply-batch').disabled = true;
+      try {
+        await performBatch(action, payload);
+      } catch (error) { setFeedback(error.message, 'error'); }
+      finally { updateBatchControls(); }
     }
 
     async function logout() { try { await api('__ADMIN_PATH__/api/logout', { method: 'POST', body: '{}' }); } catch (_) {} location.href = '__ADMIN_PATH__'; }
@@ -339,29 +410,24 @@
         const rect = dialog.getBoundingClientRect();
         if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close();
       });
-      dialog.addEventListener('focusout', event => {
-        if (!dialog.open) return;
-        const next = event.relatedTarget;
-        if (next && (next === dialog || dialog.contains(next))) return;
-        window.setTimeout(() => {
-          if (!dialog.open) return;
-          const active = document.activeElement;
-          if (active && (active === dialog || dialog.contains(active))) return;
-          dialog.close();
-        }, 0);
-      });
     });
     $('search-address-book').addEventListener('click', () => { state.q = $('address-search').value.trim(); state.page = 1; load(); }); $('address-search').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); $('search-address-book').click(); } });
     $('tag-filter').addEventListener('change', () => { state.tag = $('tag-filter').value; state.page = 1; load(); }); $('address-presence-filter').addEventListener('change', () => { state.presence = $('address-presence-filter').value; state.page = 1; load(); }); $('favorite-only').addEventListener('change', () => { state.favorite = $('favorite-only').checked; state.page = 1; load(); }); $('refresh-address-book').addEventListener('click', () => load());
-    async function exportAddressBook(format) { const params = new URLSearchParams({ format, q: state.q, tag: state.tag, user_id: String(state.user?.id || '') }); const response = await fetch('__ADMIN_PATH__/api/address-book/export?' + params, { credentials: 'same-origin', headers: { Accept: format === 'json' ? 'application/json' : 'text/csv', 'X-CSRF-Token': state.csrf } }); if (!response.ok) throw Error('导出失败'); const blob = await response.blob(); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = 'rustdesk-address-book.' + (format === 'json' ? 'json' : 'csv'); link.click(); URL.revokeObjectURL(url); }
+    async function exportAddressBook(format) { const params = new URLSearchParams({ format, q: state.q, tag: state.tag, user_id: String(state.targetUser?.id || '') }); const response = await fetch('__ADMIN_PATH__/api/address-book/export?' + params, { credentials: 'same-origin', headers: { Accept: format === 'json' ? 'application/json' : 'text/csv', 'X-CSRF-Token': state.csrf } }); if (!response.ok) throw Error('导出失败'); const blob = await response.blob(); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = 'rustdesk-address-book.' + (format === 'json' ? 'json' : 'csv'); link.click(); URL.revokeObjectURL(url); }
     $('address-export-csv').addEventListener('click', () => exportAddressBook('csv').catch(error => setFeedback(error.message, 'error'))); $('address-export-json').addEventListener('click', () => exportAddressBook('json').catch(error => setFeedback(error.message, 'error')));
-    $('address-import').addEventListener('change', async event => { const file = event.target.files?.[0]; if (!file) return; try { const content = await file.text(); const format = file.name.toLowerCase().endsWith('.json') ? 'json' : 'csv'; const parsed = format === 'json' ? JSON.parse(content) : content; const payload = { format, data: parsed }; const data = await api('__ADMIN_PATH__/api/address-book/import/preview', { method: 'POST', body: JSON.stringify(payload) }); const plan = data.plan || {}; setFeedback('导入预览：' + (plan.add || []).length + ' 条新增、' + (plan.already_present || []).length + ' 条已存在、' + (plan.invalid || []).length + ' 条无效', 'success'); if (window.confirm('确认应用这份通讯录导入？')) { await api('__ADMIN_PATH__/api/address-book/import/apply', { method: 'POST', body: JSON.stringify(payload) }); await load({ quiet: true }); setFeedback('通讯录导入已应用', 'success'); } } catch (error) { setFeedback(error.message, 'error'); } finally { event.target.value = ''; } });
+    $('address-import').addEventListener('change', async event => { const file = event.target.files?.[0]; if (!file) return; try { const content = await file.text(); const format = file.name.toLowerCase().endsWith('.json') ? 'json' : 'csv'; const parsed = format === 'json' ? JSON.parse(content) : content; const payload = { format, data: parsed }; const data = await api(targetUrl('__ADMIN_PATH__/api/address-book/import/preview'), { method: 'POST', body: JSON.stringify(payload) }); const plan = data.plan || {}; setFeedback('导入预览：' + (plan.add || []).length + ' 条新增、' + (plan.already_present || []).length + ' 条已存在、' + (plan.invalid || []).length + ' 条无效', 'success'); if (window.confirm('确认应用这份通讯录导入？')) { await api(targetUrl('__ADMIN_PATH__/api/address-book/import/apply'), { method: 'POST', body: JSON.stringify(payload) }); await load({ quiet: true }); setFeedback('通讯录导入已应用', 'success'); } } catch (error) { setFeedback(error.message, 'error'); } finally { event.target.value = ''; } });
     $('address-prev').addEventListener('click', () => { if (state.page > 1) { state.page -= 1; load(); } }); $('address-next').addEventListener('click', () => { state.page += 1; load(); });
 
-    api('__ADMIN_PATH__/api/session').then(data => {
-      state.csrf = data.csrf || ''; state.user = data.user || null;
-      if (!state.user) { location.href = '__ADMIN_PATH__'; return; }
-      $('who').textContent = '当前：' + state.user.username; $('avatar').textContent = String(state.user.username || 'A').slice(0, 1).toUpperCase(); load();
+    $('switch-address-book-owner').addEventListener('click', switchOwner); $('address-book-owner').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); switchOwner(); } });
+    $('batch-action').addEventListener('change', updateBatchControls); $('apply-batch').addEventListener('click', applyBatch); $('select-all-peers').addEventListener('change', event => { state.peers.forEach(peer => event.target.checked ? state.selected.add(String(peer.id)) : state.selected.delete(String(peer.id))); renderPeers(); });
+    api('__ADMIN_PATH__/api/session').then(async data => {
+      state.csrf = data.csrf || ''; state.actor = data.user || null;
+      if (!state.actor) { location.href = '__ADMIN_PATH__'; return; }
+      $('who').textContent = '当前：' + state.actor.username; $('avatar').textContent = String(state.actor.username || 'A').slice(0, 1).toUpperCase();
+      const options = await api('__ADMIN_PATH__/api/address-book/assignment-options'); state.users = Array.isArray(options.users) ? options.users : [];
+      const requested = new URL(location.href).searchParams.get('user_id'); state.targetUser = state.users.find(user => String(user.id) === requested) || state.users.find(user => Number(user.id) === Number(state.actor.id)) || state.actor;
+      const presence = new URL(location.href).searchParams.get('presence'); if (['online','recent','offline','unreported'].includes(presence)) { state.presence = presence; $('address-presence-filter').value = presence; }
+      renderUsers(); load();
     }).catch(() => { location.href = '__ADMIN_PATH__'; });
   })();
   </script>

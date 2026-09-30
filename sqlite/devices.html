@@ -122,21 +122,10 @@
           const rect = dialog.getBoundingClientRect();
           if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close();
         });
-        dialog.addEventListener('focusout', event => {
-          if (!dialog.open) return;
-          const next = event.relatedTarget;
-          if (next && (next === dialog || dialog.contains(next))) return;
-          window.setTimeout(() => {
-            if (!dialog.open) return;
-            const active = document.activeElement;
-            if (active && (active === dialog || dialog.contains(active))) return;
-            dialog.close();
-          }, 0);
-        });
       });
     }
     const labels = { online: '在线', recent: '最近在线', offline: '离线', unreported: '未上报' };
-    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, aliasDevice: null, policyDevice: null, timer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [], assignmentDevices: [] };
+    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, pendingLoad: null, aliasDevice: null, policyDevice: null, timer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [], assignmentDevices: [] };
 
     async function api(url, options = {}) {
       const headers = new Headers(options.headers || {});
@@ -203,6 +192,14 @@
     function selectedDevices() { return Array.from(state.selected.values()); }
     function updateAssignmentButton() { const count = state.selected.size; $('address-book-action').disabled = count === 0; $('address-book-action').textContent = count ? '加入通讯录（' + count + '）' : '加入通讯录'; }
     function updateSelectAll(devices = visibleDevices()) { const control = $('select-all-devices'); const selected = devices.filter(device => state.selected.has(deviceKey(device))).length; control.checked = devices.length > 0 && selected === devices.length; control.indeterminate = selected > 0 && selected < devices.length; }
+    function syncSelectionControls(devices = visibleDevices()) {
+      const visibleKeys = new Set(devices.map(deviceKey));
+      document.querySelectorAll('#rows input[type="checkbox"][aria-label^="选择客户端 "]').forEach(control => {
+        const row = control.closest('tr');
+        control.checked = visibleKeys.has(row?.dataset.deviceKey) && state.selected.has(row.dataset.deviceKey);
+      });
+      updateSelectAll(devices);
+    }
     function openAssignment(devices = selectedDevices()) {
       if (!devices.length) return;
       state.assignmentDevices = devices; $('assignment-device').textContent = '已选择 ' + devices.length + ' 台客户端。勾选保留，取消勾选移除。';
@@ -280,7 +277,7 @@
 
     function renderDevice(device, row) {
       row.replaceChildren(); row.dataset.deviceId = device.id; row.dataset.deviceKey = deviceKey(device);
-      const selectCell = appendCell(row, '选择'); const select = document.createElement('input'); select.type = 'checkbox'; select.checked = state.selected.has(deviceKey(device)); select.setAttribute('aria-label', '选择客户端 ' + device.id); select.addEventListener('change', () => { if (select.checked) state.selected.set(deviceKey(device), device); else state.selected.delete(deviceKey(device)); updateAssignmentButton(); }); selectCell.append(select);
+      const selectCell = appendCell(row, '选择'); const select = document.createElement('input'); select.type = 'checkbox'; select.checked = state.selected.has(deviceKey(device)); select.setAttribute('aria-label', '选择客户端 ' + device.id); select.addEventListener('change', () => { if (select.checked) state.selected.set(deviceKey(device), device); else state.selected.delete(deviceKey(device)); updateAssignmentButton(); updateSelectAll(); }); selectCell.append(select);
       const primary = appendCell(row, '客户端', 'primary-cell'); primary.append(textLine('cell-title device-name', device.hostname || device.id || '未知客户端')); primary.append(textLine('cell-subtitle device-id', device.id));
       const aliasCell = appendCell(row, '备注'); const alias = String(device.alias || '').trim(); aliasCell.append(textLine(alias ? 'cell-title' : 'alias-empty', alias || '未备注')); if (device.deployed || device.owner_username || device.deployment_owner) aliasCell.append(textLine('cell-subtitle', '当前归属：' + (device.owner_username || device.deployment_owner || '已登记'))); const assignedCount = Array.isArray(device.address_book_user_ids) ? device.address_book_user_ids.length : 0; aliasCell.append(textLine('cell-subtitle', '通讯录分配：' + assignedCount + ' 个用户'));
       const platformCell = appendCell(row, '版本 / 发行形态'); platformCell.append(textLine('cell-title release-title', [platformLabel(device.platform), distributionLabel(device.distribution)].join(' · '))); platformCell.append(textLine('cell-subtitle version-text', '客户端：' + (device.version || '未上报') + ' · 运行：' + installModeLabel(device.install_mode)));
@@ -309,6 +306,7 @@
         if (row !== cursor) body.insertBefore(row, cursor); cursor = row.nextElementSibling;
       }
       existing.forEach(row => row.remove());
+      syncSelectionControls(devices);
       if (activeKey && activeLabel) {
         const focusedRow = Array.from(body.children).find(row => row.dataset.deviceKey === activeKey);
         const focusedControl = focusedRow && Array.from(focusedRow.querySelectorAll('[aria-label]')).find(control => control.getAttribute('aria-label') === activeLabel);
@@ -319,7 +317,7 @@
     }
 
     async function load(options = {}) {
-      if (state.loading) return;
+      if (state.loading) { state.pendingLoad = options; return; }
       state.loading = true;
       $('refresh').disabled = true;
       if (!options.quiet) setFeedback('正在读取客户端上报数据...');
@@ -351,6 +349,7 @@
       } finally {
         state.loading = false;
         $('refresh').disabled = false;
+        const pending = state.pendingLoad; state.pendingLoad = null; if (pending) load(pending);
       }
     }
 

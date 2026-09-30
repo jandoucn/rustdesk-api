@@ -66,7 +66,7 @@
             <button id="sq" class="button" type="button">搜索</button>
           </div>
           <p id="st" class="feedback" aria-live="polite">等待加载用户数据</p>
-          <div class="table-wrap"><table><thead><tr><th>ID</th><th>用户名</th><th>管理员</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>ID</th><th>用户名</th><th>管理员</th><th>状态</th><th>通讯录</th><th>在线客户端</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table></div>
           <div id="empty" class="empty-state hidden"><strong>没有匹配的用户。</strong><p>调整搜索条件或创建一个新用户。</p></div>
           <div class="pager"><button id="prev" class="button small" type="button">上一页</button><span id="pi"></span><button id="next" class="button small" type="button">下一页</button></div>
         </section>
@@ -89,7 +89,8 @@
     function updatePager() { const pages = Math.max(1, Math.ceil(state.total / state.size)); text($('pi'), '第 ' + state.page + '/' + pages + ' 页，共 ' + state.total); $('prev').disabled = state.busy || state.page <= 1; $('next').disabled = state.busy || state.page >= pages; }
     async function api(url, options = {}) { const headers = new Headers(options.headers || {}); headers.set('Accept', 'application/json'); if (options.body !== undefined) headers.set('Content-Type', 'application/json'); if (state.csrf) headers.set('X-CSRF-Token', state.csrf); const response = await fetch(url, { ...options, headers, credentials: 'same-origin' }); const data = await response.json().catch(() => ({ error: '响应无效' })); if (!response.ok) throw Error(data.error || '请求失败'); return data; }
     async function session() { const data = await api('__ADMIN_PATH__/api/session'); state.csrf = data.csrf || ''; state.user = data.user || null; return data; }
-    function updateView() { $('login').classList.toggle('hidden', Boolean(state.user)); $('app').classList.toggle('hidden', !state.user); if (!state.user) return; text($('who'), '当前：' + state.user.username); text($('avatar'), String(state.user.username || 'A').slice(0, 1).toUpperCase()); }
+    function canManageUsers() { return Boolean(state.user && state.user.address_book_scope === 'all'); }
+    function updateView() { $('login').classList.toggle('hidden', Boolean(state.user)); $('app').classList.toggle('hidden', !state.user); if (!state.user) return; text($('who'), '当前：' + state.user.username); text($('avatar'), String(state.user.username || 'A').slice(0, 1).toUpperCase()); $('cu').classList.toggle('hidden', !canManageUsers()); }
     function appendCell(row, label, value, className = '') { const cell = document.createElement('td'); cell.dataset.label = label; if (className) cell.className = className; text(cell, value); row.append(cell); return cell; }
     function updateStats(users) { text($('stat-total'), state.total); text($('stat-enabled'), users.filter(user => user.enabled !== false).length); text($('stat-disabled'), users.filter(user => user.enabled === false).length); text($('stat-admins'), users.filter(user => user.is_admin).length); }
     function render(users) {
@@ -97,8 +98,10 @@
       users.forEach(user => {
         const row = document.createElement('tr'); appendCell(row, 'ID', user.id, 'mono'); appendCell(row, '用户名', user.username, 'primary-cell'); appendCell(row, '管理员', user.is_admin ? '是' : '否');
         const statusCell = appendCell(row, '状态', ''); const badge = document.createElement('span'); badge.className = 'status-badge ' + (user.enabled === false ? 'offline' : 'online'); const dot = document.createElement('span'); dot.className = 'status-dot ' + (user.enabled === false ? 'offline' : 'online'); badge.append(dot, document.createTextNode(user.enabled === false ? '停用' : '启用')); statusCell.append(badge);
+        const bookCell = appendCell(row, '通讯录', ''); const bookLink = document.createElement('a'); bookLink.className = 'button small'; bookLink.href = '__ADMIN_PATH__/address-book?user_id=' + encodeURIComponent(user.id); bookLink.textContent = Number(user.address_book_count || 0) + ' 个客户端'; bookCell.append(bookLink);
+        const onlineCell = appendCell(row, '在线客户端', ''); const onlineLink = document.createElement('a'); onlineLink.href = '__ADMIN_PATH__/address-book?user_id=' + encodeURIComponent(user.id) + '&presence=online'; onlineLink.textContent = Number(user.address_book_online_count || 0) + ' 个在线'; onlineCell.append(onlineLink);
         appendCell(row, '创建时间', user.create_time ? new Date(Number(user.create_time) * 1000).toLocaleString() : '-');
-        const actions = appendCell(row, '操作', '', 'actions-cell'); const group = document.createElement('div'); group.className = 'row-actions'; const editButton = document.createElement('button'); editButton.className = 'button small'; editButton.type = 'button'; editButton.textContent = '编辑'; editButton.onclick = () => editUser(user); const deleteButton = document.createElement('button'); deleteButton.className = 'button small danger'; deleteButton.type = 'button'; deleteButton.textContent = '删除'; deleteButton.onclick = () => deleteUser(user); group.append(editButton, deleteButton); actions.append(group); body.append(row);
+        const actions = appendCell(row, '操作', '', 'actions-cell'); const group = document.createElement('div'); group.className = 'row-actions'; const manageLink = document.createElement('a'); manageLink.className = 'button small'; manageLink.href = bookLink.href; manageLink.textContent = '通讯录'; group.append(manageLink); if (canManageUsers()) { const editButton = document.createElement('button'); editButton.className = 'button small'; editButton.type = 'button'; editButton.textContent = '编辑'; editButton.onclick = () => editUser(user); const deleteButton = document.createElement('button'); deleteButton.className = 'button small danger'; deleteButton.type = 'button'; deleteButton.textContent = '删除'; deleteButton.onclick = () => deleteUser(user); group.append(editButton, deleteButton); } actions.append(group); body.append(row);
       });
     }
     async function load() { if (!state.user) return; setBusy(true); setFeedback('正在加载用户数据...'); try { const params = new URLSearchParams({ q: state.q, page: state.page, pageSize: state.size }); const data = await api('__ADMIN_PATH__/api/users?' + params); state.total = Number(data.total) || 0; render(Array.isArray(data.data) ? data.data : []); setFeedback('已加载 ' + state.total + ' 个匹配用户', 'success'); } catch (error) { setFeedback(error.message, 'error'); } finally { setBusy(false); updatePager(); } }
@@ -119,17 +122,6 @@
         if (event.target === dialog) { dialog.close(); return; }
         const rect = dialog.getBoundingClientRect();
         if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close();
-      });
-      dialog.addEventListener('focusout', event => {
-        if (!dialog.open) return;
-        const next = event.relatedTarget;
-        if (next && (next === dialog || dialog.contains(next))) return;
-        window.setTimeout(() => {
-          if (!dialog.open) return;
-          const active = document.activeElement;
-          if (active && (active === dialog || dialog.contains(active))) return;
-          dialog.close();
-        }, 0);
       });
     });
   })();

@@ -822,6 +822,72 @@ function assert_address_book_scope(array $actor, int $uid): void
     $scope = (string)($actor['address_book_scope'] ?? ((bool)($actor['is_admin'] ?? false) ? 'all' : 'self'));
     if ((int)$actor['id'] !== $uid && $scope !== 'all') fail(403, '无权访问该用户通讯录');
 }
+function address_book_target(PDO $db, array $actor, mixed $rawUid = null): array
+{
+    if ($rawUid === null || $rawUid === '') $uid = (int)$actor['id'];
+    elseif ((is_int($rawUid) && $rawUid > 0) || (is_string($rawUid) && ctype_digit($rawUid) && (int)$rawUid > 0)) $uid = (int)$rawUid;
+    else fail(422, 'user_id 格式错误');
+    assert_address_book_scope($actor, $uid);
+    return address_book_user($db, $uid);
+}
+function address_book_peer_ids(mixed $value): array
+{
+    if (!is_array($value) || !array_is_list($value) || count($value) < 1 || count($value) > 200) fail(422, '至少选择一个通讯录客户端');
+    $ids = [];
+    foreach ($value as $raw) {
+        if (!is_string($raw)) fail(422, '客户端 ID 列表格式错误');
+        $id = address_book_peer_id($raw); $ids[$id] = true;
+    }
+    return array_keys($ids);
+}
+function address_book_user_counts_batch(PDO $db, array $users): array
+{
+    if (!$users) return [];
+    $params = []; $holders = []; $peersByUser = [];
+    foreach ($users as $index=>$user) {
+        $uid = (int)$user['id']; $key = 'uid_' . $index;
+        $params[$key] = $uid; $holders[] = ':' . $key; $peersByUser[$uid] = [];
+    }
+    $in = implode(',', $holders);
+    foreach (db_all($db, 'SELECT uid,id FROM rustdesk_peers WHERE uid IN (' . $in . ')', $params) as $row) {
+        $peersByUser[(int)$row['uid']][(string)$row['id']] = true;
+    }
+    foreach (db_all($db, 'SELECT a.uid,p.id FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.personal=1 AND a.uid IN (' . $in . ')', $params) as $row) {
+        $peersByUser[(int)$row['uid']][(string)$row['id']] = true;
+    }
+    foreach (db_all($db, 'SELECT uid,payload FROM address_books WHERE uid IN (' . $in . ')', $params) as $row) {
+        $book = decoded_payload($row['payload']); $uid = (int)$row['uid'];
+        foreach (($book['peers'] ?? []) as $peer) if (is_array($peer) && is_string($peer['id'] ?? null) && $peer['id'] !== '') $peersByUser[$uid][$peer['id']] = true;
+    }
+    $peerIds = [];
+    foreach ($peersByUser as $peers) foreach (array_keys($peers) as $id) $peerIds[$id] = true;
+    $lastHeartbeats = [];
+    foreach (array_chunk(array_keys($peerIds), 500) as $chunkIndex=>$chunk) {
+        $params = []; $holders = [];
+        foreach ($chunk as $index=>$id) { $key = 'peer_' . $chunkIndex . '_' . $index; $holders[] = ':' . $key; $params[$key] = $id; }
+        foreach (db_all($db, 'SELECT id,MAX(last_heartbeat) AS last_heartbeat FROM device_reports WHERE id IN (' . implode(',', $holders) . ') GROUP BY id', $params) as $row) {
+            $lastHeartbeats[(string)$row['id']] = (int)$row['last_heartbeat'];
+        }
+    }
+    $counts = []; $now = time();
+    foreach ($peersByUser as $uid=>$peers) {
+        $online = 0;
+        foreach (array_keys($peers) as $id) if (device_presence($lastHeartbeats[$id] ?? 0, $now) === 'online') $online++;
+        $counts[$uid] = ['address_book_count'=>count($peers), 'address_book_online_count'=>$online];
+    }
+    return $counts;
+}
+
+function ensure_address_book_tag_catalogs(PDO $db, array $actor, array $profile, array $tags): void
+{
+    $book = exact_address_book($db, (int)$actor['id']);
+    foreach ($tags as $tag) {
+        db_insert_ignore($db, 'ab_profile_tags', ['guid'=>$profile['guid'],'name'=>$tag,'color'=>0]);
+        db_insert_ignore($db, 'rustdesk_tags', ['uid'=>(int)$actor['id'],'tag'=>$tag]);
+        if (!in_array($tag, $book['tags'], true)) $book['tags'][] = $tag;
+    }
+    save_exact_address_book($db, (int)$actor['id'], $book, time());
+}
 function address_book_export(PDO $db, int $uid): array
 {
     $user = address_book_user($db, $uid);
@@ -1034,6 +1100,7 @@ try {
         foreach ($embeddedParams as $key=>$value) if (!array_key_exists($key, $_GET)) $_GET[$key] = $value;
     }
     $path = rtrim($path, '/') ?: '/';
+    if (in_array($path, ['/favicon.ico','/.well-known/appspecific/com.chrome.devtools.json'], true)) { method('GET'); http_response_code(204); exit; }
     $initialized=has_administrator($db);
     if(!$initialized){
         if($path==='/setup/assets/setup.css'||$path==='/setup/assets/setup.js'){
@@ -1145,11 +1212,15 @@ try {
             [$limit, $offset] = pagination(); $search = $_GET['q'] ?? '';
             if (!is_string($search) || strlen($search) > 128) fail(422, '搜索内容过长');
             $args = ['q' => $search]; $where = 'delete_time=0 AND instr(username,:q)>0';
+            if ((string)($actor['address_book_scope'] ?? 'self') !== 'all') { $where .= ' AND id=:actor_id'; $args['actor_id'] = (int)$actor['id']; }
             $total = db_one($db, 'SELECT COUNT(*) AS n FROM rustdesk_users WHERE ' . $where, $args)['n'];
             $list = db_all($db, 'SELECT * FROM rustdesk_users WHERE ' . $where . ' ORDER BY id LIMIT :limit OFFSET :offset', $args + ['limit' => $limit, 'offset' => $offset]);
-            reply(['data' => array_map('public_user', $list), 'total' => (int)$total]);
+            $counts = address_book_user_counts_batch($db, $list); $data = [];
+            foreach ($list as $row) $data[] = public_user($row) + ($counts[(int)$row['id']] ?? ['address_book_count'=>0,'address_book_online_count'=>0]);
+            reply(['data' => $data, 'total' => (int)$total]);
         }
         method(...($id ? ['PATCH', 'DELETE'] : ['POST'])); csrf_check();
+        if ((string)($actor['address_book_scope'] ?? 'self') !== 'all') fail(403, '用户管理需要跨用户通讯录权限');
         $d = $_SERVER['REQUEST_METHOD'] === 'DELETE' ? [] : json_body();
         if (!$id) {
             $name = username($d); $hash = new_password($d);
@@ -1188,13 +1259,14 @@ try {
     }
     if ($adminApi && $path === '/admin/api/address-book') {
         method('GET'); $actor = admin_user($db); [$limit,$offset] = pagination();
+        $target = address_book_target($db, $actor, $_GET['user_id'] ?? null);
         $q = $_GET['q'] ?? ''; $tag = $_GET['tag'] ?? '';
         if (!is_string($q) || strlen($q) > 128) fail(422, '搜索内容过长');
         if (!is_string($tag) || strlen($tag) > 256) fail(422, '标签筛选错误');
         $favoriteFilter = $_GET['favorite'] ?? '';
         if (!is_string($favoriteFilter) || !in_array($favoriteFilter, ['', '0', '1', 'false', 'true'], true)) fail(422, '收藏筛选错误');
-        $profile = db_one($db, 'SELECT * FROM ab_profiles WHERE uid=:uid AND personal=1', ['uid'=>$actor['id']]);
-        $state = admin_address_book_state($db, $actor, $profile ?? ['guid'=>'']);
+        $profile = db_one($db, 'SELECT * FROM ab_profiles WHERE uid=:uid AND personal=1', ['uid'=>$target['id']]);
+        $state = admin_address_book_state($db, $target, $profile ?? ['guid'=>'']);
         foreach ($state['peers'] as $peerId=>&$peer) {
             $peer = enrich_admin_address_book_peer($db, $peer);
         }
@@ -1220,62 +1292,68 @@ try {
             return true;
         }));
         reply([
+            'user'=>['id'=>(int)$target['id'],'username'=>$target['username']],
             'profile'=>$profile ? ['guid'=>$profile['guid'],'name'=>$profile['name'],'owner'=>$profile['owner'],'note'=>$profile['note'],'rule'=>(int)$profile['rule']] : null,
             'summary'=>$summary, 'tags'=>$state['tags'], 'total'=>count($filtered), 'data'=>array_slice($filtered,$offset,$limit),
         ]);
     }
     if ($adminApi && $path === '/admin/api/address-book/peers') {
         method('POST'); $actor = admin_user($db); csrf_check(); $d = json_body();
+        $target = address_book_target($db, $actor, $_GET['user_id'] ?? null);
         if (!array_key_exists('id', $d) || !is_string($d['id'])) fail(422, '设备 ID 不能为空');
         $id = address_book_peer_id($d['id']);
         $favorite = $d['favorite'] ?? false; if (!is_bool($favorite)) fail(422, 'favorite 必须为布尔值');
-        txn($db, function() use ($db,$actor,$d,$id,$favorite) {
-            $profile = personal_profile($db, $actor); $state = admin_address_book_state($db, $actor, $profile);
+        txn($db, function() use ($db,$target,$d,$id,$favorite) {
+            $profile = personal_profile($db, $target); $state = admin_address_book_state($db, $target, $profile);
             if (isset($state['peers'][$id])) fail(409, '联系人已存在');
             $payload = validate_admin_peer_payload($d); $payload['id'] = $id;
-            sync_admin_book_peer($db, $actor, $profile, $id, $payload);
-            if ($favorite) db_upsert($db, 'admin_peer_favorites', ['uid'=>(int)$actor['id'],'id'=>$id,'created_at'=>time()], ['uid','id'], ['created_at']);
+            sync_admin_book_peer($db, $target, $profile, $id, $payload);
+            if ($favorite) db_upsert($db, 'admin_peer_favorites', ['uid'=>(int)$target['id'],'id'=>$id,'created_at'=>time()], ['uid','id'], ['created_at']);
         });
         reply(['ok'=>true,'id'=>$id,'sync'=>'next_address_book_pull'], 201);
     }
     if ($adminApi && preg_match('#^/admin/api/address-book/peers/([^/]+)$#', $path, $match)) {
         $actor = admin_user($db); csrf_check(); $id = address_book_peer_id($match[1]);
+        $target = address_book_target($db, $actor, $_GET['user_id'] ?? null);
         if ($_SERVER['REQUEST_METHOD'] === 'DELETE') {
-            txn($db, function() use ($db,$actor,$id) {
-                $profile = personal_profile($db, $actor);
-                if (!delete_admin_book_peer($db, $actor, $profile, $id)) fail(404, '联系人不存在');
+            txn($db, function() use ($db,$target,$id) {
+                $profile = personal_profile($db, $target);
+                if (!delete_admin_book_peer($db, $target, $profile, $id)) fail(404, '联系人不存在');
             });
             reply(['ok'=>true,'id'=>$id,'sync'=>'next_address_book_pull']);
         }
         method('PATCH'); $d = json_body();
         if (array_key_exists('id', $d) && $d['id'] !== $id) fail(422, '不能修改设备 ID');
-        txn($db, function() use ($db,$actor,$id,$d) {
-            $profile = personal_profile($db, $actor); $state = admin_address_book_state($db, $actor, $profile);
+        txn($db, function() use ($db,$target,$id,$d) {
+            $profile = personal_profile($db, $target); $state = admin_address_book_state($db, $target, $profile);
             if (!isset($state['peers'][$id])) fail(404, '联系人不存在');
             $existing = $state['peers'][$id]; unset($existing['favorite']);
             $payload = validate_admin_peer_payload($d, $existing); $payload['id'] = $id;
-            sync_admin_book_peer($db, $actor, $profile, $id, $payload);
+            sync_admin_book_peer($db, $target, $profile, $id, $payload);
         });
         reply(['ok'=>true,'id'=>$id,'sync'=>'next_address_book_pull']);
     }
     if ($adminApi && preg_match('#^/admin/api/address-book/favorites/([^/]+)$#', $path, $match)) {
         method('PATCH'); $actor = admin_user($db); csrf_check(); $id = address_book_peer_id($match[1]); $d = json_body();
+        $target = address_book_target($db, $actor, $_GET['user_id'] ?? null);
         if (!array_key_exists('favorite', $d) || !is_bool($d['favorite'])) fail(422, 'favorite 必须为布尔值');
-        txn($db, function() use ($db,$actor,$id,$d) {
-            $profile = db_one($db, 'SELECT * FROM ab_profiles WHERE uid=:uid AND personal=1', ['uid'=>$actor['id']]);
-            $state = admin_address_book_state($db, $actor, $profile ?? ['guid'=>'']);
+        txn($db, function() use ($db,$target,$id,$d) {
+            $profile = db_one($db, 'SELECT * FROM ab_profiles WHERE uid=:uid AND personal=1', ['uid'=>$target['id']]);
+            $state = admin_address_book_state($db, $target, $profile ?? ['guid'=>'']);
             if (!isset($state['peers'][$id])) fail(404, '联系人不存在');
-            if ($d['favorite']) db_upsert($db, 'admin_peer_favorites', ['uid'=>(int)$actor['id'],'id'=>$id,'created_at'=>time()], ['uid','id'], ['created_at']);
-            else db_exec($db, 'DELETE FROM admin_peer_favorites WHERE uid=:uid AND id=:id', ['uid'=>$actor['id'],'id'=>$id]);
+            if ($d['favorite']) db_upsert($db, 'admin_peer_favorites', ['uid'=>(int)$target['id'],'id'=>$id,'created_at'=>time()], ['uid','id'], ['created_at']);
+            else db_exec($db, 'DELETE FROM admin_peer_favorites WHERE uid=:uid AND id=:id', ['uid'=>$target['id'],'id'=>$id]);
         });
         reply(['ok'=>true,'id'=>$id,'favorite'=>$d['favorite'],'sync'=>'admin_only']);
     }
     if ($adminApi && $path === '/admin/api/address-book/assignment-options') {
-        method('GET'); admin_user($db);
-        $users = array_map(static fn($user) => ['id'=>(int)$user['id'],'username'=>(string)$user['username'],'is_admin'=>(bool)$user['is_admin']], assignment_users($db));
+        method('GET'); $actor = admin_user($db);
+        $available = (string)($actor['address_book_scope'] ?? 'self') === 'all' ? assignment_users($db) : [$actor];
+        $availableIds = array_fill_keys(array_map(static fn($user)=>(int)$user['id'], $available), true);
+        $users = array_map(static fn($user) => ['id'=>(int)$user['id'],'username'=>(string)$user['username'],'is_admin'=>(bool)$user['is_admin']], $available);
         $assignments = [];
         foreach (db_all($db, 'SELECT p.id,a.uid FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.personal=1 AND a.uid IN (SELECT id FROM rustdesk_users WHERE delete_time=0 AND enabled=1)') as $row) {
-            $assignments[(string)$row['id']][] = (int)$row['uid'];
+            if (isset($availableIds[(int)$row['uid']])) $assignments[(string)$row['id']][] = (int)$row['uid'];
         }
         reply(['users'=>$users,'assignments'=>$assignments]);
     }
@@ -1305,6 +1383,42 @@ try {
         if ($currentSnapshot !== $plan['snapshot']) fail(409, '导入预览已过期，请重新预览');
         $count = txn($db, fn() => address_book_import($db, $uid, $book)); reply(['ok'=>true,'imported'=>$count,'plan'=>$plan]);
     }
+    if ($adminApi && $path === '/admin/api/address-book/batch') {
+        method('POST'); $actor = admin_user($db); csrf_check();
+        $source = address_book_target($db, $actor, $_GET['user_id'] ?? null); $d = json_body();
+        $action = $d['action'] ?? ''; if (!is_string($action) || !in_array($action, ['remove','add_tags','remove_tags','copy','move'], true)) fail(422, '批量操作类型错误');
+        $ids = address_book_peer_ids($d['peer_ids'] ?? null);
+        $tags = in_array($action, ['add_tags','remove_tags'], true) ? address_book_tags($d['tags'] ?? null) : [];
+        if (in_array($action, ['add_tags','remove_tags'], true) && count($tags) < 1) fail(422, '至少选择一个标签');
+        $target = null;
+        if (in_array($action, ['copy','move'], true)) {
+            $target = address_book_target($db, $actor, $d['target_user_id'] ?? null);
+            if ((int)$target['id'] === (int)$source['id']) fail(422, '目标用户不能与来源用户相同');
+        }
+        $changed = txn($db, function() use ($db,$source,$target,$action,$ids,$tags) {
+            $sourceProfile = personal_profile($db, $source); $sourceState = admin_address_book_state($db, $source, $sourceProfile);
+            foreach ($ids as $id) if (!isset($sourceState['peers'][$id])) fail(404, '通讯录客户端不存在：' . $id);
+            $targetProfile = $target ? personal_profile($db, $target) : null;
+            $targetState = $target ? admin_address_book_state($db, $target, $targetProfile) : null;
+            foreach ($ids as $id) {
+                if ($action === 'remove') { delete_admin_book_peer($db, $source, $sourceProfile, $id); continue; }
+                $payload = $sourceState['peers'][$id]; unset($payload['favorite']);
+                if ($action === 'add_tags') $payload['tags'] = array_values(array_unique(array_merge(address_book_tags($payload['tags'] ?? []), $tags)));
+                elseif ($action === 'remove_tags') $payload['tags'] = array_values(array_filter(address_book_tags($payload['tags'] ?? []), fn($tag)=>!in_array($tag, $tags, true)));
+                elseif (!isset($targetState['peers'][$id])) {
+                    sync_admin_book_peer($db, $target, $targetProfile, $id, $payload);
+                    ensure_address_book_tag_catalogs($db, $target, $targetProfile, address_book_tags($payload['tags'] ?? []));
+                    $targetState['peers'][$id] = $payload;
+                }
+                if (in_array($action, ['add_tags','remove_tags'], true)) sync_admin_book_peer($db, $source, $sourceProfile, $id, $payload);
+                if ($action === 'move') delete_admin_book_peer($db, $source, $sourceProfile, $id);
+            }
+            if ($action === 'add_tags') ensure_address_book_tag_catalogs($db, $source, $sourceProfile, $tags);
+            return count($ids);
+        });
+        admin_event($db, (int)$actor['id'], 'batch_address_book_' . $action, (int)$source['id']);
+        reply(['ok'=>true,'action'=>$action,'changed'=>$changed,'sync'=>'next_address_book_pull']);
+    }
     if ($adminApi && ($path === '/admin/api/devices/address-book' || $path === '/admin/api/devices/address-book/preview')) {
         method('POST'); $actor = admin_user($db); csrf_check(); $d = json_body();
         $mode = $d['mode'] ?? 'add'; $preview = $path === '/admin/api/devices/address-book/preview' || $mode === 'preview'; $requestedPreview = $mode === 'preview';
@@ -1320,7 +1434,7 @@ try {
         }
         $users = normalize_assignment_users($db, $d['user_ids'] ?? [], $mode === 'replace');
         foreach ($users as $target) assert_address_book_scope($actor, (int)$target['id']);
-        if ($mode === 'replace' && (string)($actor['address_book_scope'] ?? 'self') !== 'all') fail(403, '替换分配需要跨用户通讯录权限');
+        $crossUserScope = (string)($actor['address_book_scope'] ?? 'self') === 'all';
         if ($preview) {
             $snapshot=[]; $add=[]; $already=[]; $remove=[]; $skipped=[]; $invalid=[];
             foreach ($devices as $device) foreach ($users as $target) {
@@ -1331,7 +1445,8 @@ try {
                 else { if ($exists) $already[]=$entry; else $add[]=$entry; }
             }
             if ($mode === 'replace') {
-                foreach ($devices as $device) foreach (assignment_users($db) as $target) {
+                $replaceTargets = $crossUserScope ? assignment_users($db) : [$actor];
+                foreach ($devices as $device) foreach ($replaceTargets as $target) {
                     if (in_array((int)$target['id'], array_map(static fn($u)=>(int)$u['id'],$users), true)) continue;
                     $exists=db_one($db,'SELECT p.id FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=:uid AND a.personal=1 AND p.id=:id UNION SELECT id FROM rustdesk_peers WHERE uid=:uid AND id=:id',['uid'=>$target['id'],'id'=>$device['id']]);
                     if ($exists) $remove[]=['id'=>$device['id'],'uuid'=>$device['uuid'],'user_id'=>(int)$target['id'],'assigned'=>true];
@@ -1341,10 +1456,10 @@ try {
         }
         // Keep the established add/remove/replace calls backward compatible; clients
         // using preview can opt into an explicit apply=true acknowledgement.
-        txn($db, function () use ($db, $actor, $devices, $users, $mode) {
+        txn($db, function () use ($db, $actor, $devices, $users, $mode, $crossUserScope) {
             if ($mode === 'replace') {
                 foreach ($devices as $device) {
-                    foreach (assignment_users($db) as $target) {
+                    foreach ($crossUserScope ? assignment_users($db) : [$actor] as $target) {
                         $profile = personal_profile($db, $target);
                         delete_admin_book_peer($db, $target, $profile, $device['id']);
                     }
@@ -1372,34 +1487,36 @@ try {
     }
     if ($adminApi && $path === '/admin/api/address-book/tags') {
         method('POST'); $actor = admin_user($db); csrf_check(); $d = json_body();
+        $target = address_book_target($db, $actor, $_GET['user_id'] ?? null);
         $name = address_book_tag_name($d['name'] ?? null); $color = $d['color'] ?? 0;
         if (!is_int($color) || $color < 0) fail(422, 'color 字段格式错误');
-        txn($db, function() use ($db,$actor,$name,$color) {
-            $profile = personal_profile($db, $actor); $state = admin_address_book_state($db, $actor, $profile);
+        txn($db, function() use ($db,$target,$name,$color) {
+            $profile = personal_profile($db, $target); $state = admin_address_book_state($db, $target, $profile);
             foreach ($state['tags'] as $tag) if ($tag['name'] === $name) fail(409, '标签已存在');
-            sync_admin_book_tags($db, $actor, $profile, null, $name, $color, false);
+            sync_admin_book_tags($db, $target, $profile, null, $name, $color, false);
         });
         reply(['ok'=>true,'name'=>$name,'color'=>$color,'sync'=>'next_address_book_pull'], 201);
     }
     if ($adminApi && preg_match('#^/admin/api/address-book/tags/([^/]+)$#', $path, $match)) {
         $actor = admin_user($db); csrf_check(); $old = address_book_tag_name(rawurldecode($match[1]));
+        $target = address_book_target($db, $actor, $_GET['user_id'] ?? null);
         if ($_SERVER['REQUEST_METHOD'] === 'DELETE') {
-            txn($db, function() use ($db,$actor,$old) {
-                $profile = personal_profile($db, $actor); $state = admin_address_book_state($db, $actor, $profile); $exists = false;
+            txn($db, function() use ($db,$target,$old) {
+                $profile = personal_profile($db, $target); $state = admin_address_book_state($db, $target, $profile); $exists = false;
                 foreach ($state['tags'] as $tag) if ($tag['name'] === $old) { $exists = true; break; }
                 if (!$exists) fail(404, '标签不存在');
-                sync_admin_book_tags($db, $actor, $profile, $old, null, null, true);
+                sync_admin_book_tags($db, $target, $profile, $old, null, null, true);
             });
             reply(['ok'=>true,'name'=>$old,'sync'=>'next_address_book_pull']);
         }
         method('PATCH'); $d = json_body(); $new = array_key_exists('name',$d) ? address_book_tag_name($d['name']) : $old;
         $color = $d['color'] ?? null; if ($color !== null && (!is_int($color) || $color < 0)) fail(422, 'color 字段格式错误');
-        txn($db, function() use ($db,$actor,$old,$new,$color) {
-            $profile = personal_profile($db, $actor); $state = admin_address_book_state($db, $actor, $profile); $existing = null;
+        txn($db, function() use ($db,$target,$old,$new,$color) {
+            $profile = personal_profile($db, $target); $state = admin_address_book_state($db, $target, $profile); $existing = null;
             foreach ($state['tags'] as $tag) if ($tag['name'] === $old) { $existing = $tag; break; }
             if ($existing === null) fail(404, '标签不存在');
             if ($new !== $old) foreach ($state['tags'] as $tag) if ($tag['name'] === $new) fail(409, '标签已存在');
-            sync_admin_book_tags($db, $actor, $profile, $old, $new, $color ?? (int)$existing['color'], false);
+            sync_admin_book_tags($db, $target, $profile, $old, $new, $color ?? (int)$existing['color'], false);
         });
         reply(['ok'=>true,'old'=>$old,'name'=>$new,'color'=>$color,'sync'=>'next_address_book_pull']);
     }
@@ -1441,6 +1558,11 @@ try {
             }
             foreach ($addressBookAssignments as &$assignedUsers) sort($assignedUsers, SORT_NUMERIC);
             unset($assignedUsers);
+            if ((string)($actor['address_book_scope'] ?? 'self') !== 'all') {
+                foreach ($addressBookAssignments as $peerId=>$assignedUsers) {
+                    $addressBookAssignments[$peerId] = in_array((int)$actor['id'], $assignedUsers, true) ? [(int)$actor['id']] : [];
+                }
+            }
             $deployments=[];
             foreach(db_all($db,'SELECT id,uuid,uid,payload,updated_at FROM device_deployments') as $deployment)$deployments[$deployment['id']."\0".$deployment['uuid']]=$deployment;
             $inventory=[]; $reportedIds=[]; $now=time();

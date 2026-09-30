@@ -4,9 +4,13 @@ const { execFileSync } = require('node:child_process');
 const adminPath = process.env.RUSTDESK_ADMIN_PATH || '/ops-x9';
 
 async function loginAdmin(page) {
+  await loginUser(page, 'admin', 'admin123');
+}
+
+async function loginUser(page, username, password) {
   await page.goto(adminPath);
-  await page.locator('#lu').fill('admin');
-  await page.locator('#lp').fill('admin123');
+  await page.locator('#lu').fill(username);
+  await page.locator('#lp').fill(password);
   await page.getByRole('button', { name: '登录' }).click();
   await expect(page.locator('#app')).toBeVisible();
 }
@@ -57,6 +61,50 @@ function persistNetworkPayload(id, uuid, network) {
     'exec', '-e', `TEST_DEVICE_ID=${id}`, '-e', `TEST_DEVICE_UUID=${uuid}`,
     '-e', `TEST_NETWORK_PAYLOAD=${encoded}`, container, 'php', '-r', php,
   ], { encoding: 'utf8' });
+  return JSON.parse(output.trim());
+}
+
+function addressBookSqlSnapshot(uid, peerIds) {
+  const container = process.env.RUSTDESK_API_CONTAINER;
+  if (!container) throw new Error('RUSTDESK_API_CONTAINER is required for persisted address-book E2E');
+  const php = [
+    "require '/var/www/html/lib.php';",
+    '$db=open_database();',
+    '$uid=(int)getenv(\'TEST_UID\');',
+    '$ids=json_decode((string)base64_decode((string)getenv(\'TEST_PEER_IDS\'),true),true,16,JSON_THROW_ON_ERROR);',
+    '$profile=db_one($db,\'SELECT guid FROM ab_profiles WHERE uid=:uid AND personal=1\',[\'uid\'=>$uid]);',
+    '$profileRows=$profile?db_all($db,\'SELECT id FROM ab_profile_peers WHERE guid=:guid ORDER BY id\',[\'guid\'=>$profile[\'guid\']]):[];',
+    '$legacyRows=db_all($db,\'SELECT id FROM rustdesk_peers WHERE uid=:uid ORDER BY id\',[\'uid\'=>$uid]);',
+    '$book=db_one($db,\'SELECT payload FROM address_books WHERE uid=:uid\',[\'uid\'=>$uid]);',
+    '$payload=$book?json_decode((string)$book[\'payload\'],true,64,JSON_THROW_ON_ERROR):[];',
+    '$only=static fn(array $rows)=>array_values(array_filter(array_map(static fn($row)=>(string)$row[\'id\'],$rows),static fn($id)=>in_array($id,$ids,true)));',
+    '$payloadIds=array_values(array_filter(array_map(static fn($peer)=>(string)($peer[\'id\']??\'\'),is_array($payload[\'peers\']??null)?$payload[\'peers\']:[]),static fn($id)=>in_array($id,$ids,true)));sort($payloadIds);',
+    'echo json_encode([\'profile\'=>$only($profileRows),\'legacy\'=>$only($legacyRows),\'payload\'=>$payloadIds],JSON_THROW_ON_ERROR);',
+  ].join('');
+  const encodedIds = Buffer.from(JSON.stringify(peerIds), 'utf8').toString('base64');
+  const output = execFileSync('docker', [
+    'exec', '-e', `TEST_UID=${uid}`, '-e', `TEST_PEER_IDS=${encodedIds}`,
+    container, 'php', '-r', php,
+  ], { encoding: 'utf8' });
+  return JSON.parse(output.trim());
+}
+
+function addressBookTagSqlSnapshot(uid) {
+  const container = process.env.RUSTDESK_API_CONTAINER;
+  if (!container) throw new Error('RUSTDESK_API_CONTAINER is required for persisted address-book E2E');
+  const php = [
+    "require '/var/www/html/lib.php';",
+    '$db=open_database();',
+    '$uid=(int)getenv(\'TEST_UID\');',
+    '$profile=db_one($db,\'SELECT guid FROM ab_profiles WHERE uid=:uid AND personal=1\',[\'uid\'=>$uid]);',
+    '$profileTags=$profile?array_column(db_all($db,\'SELECT name FROM ab_profile_tags WHERE guid=:guid ORDER BY name\',[\'guid\'=>$profile[\'guid\']]),\'name\'):[];',
+    '$legacyTags=array_column(db_all($db,\'SELECT tag FROM rustdesk_tags WHERE uid=:uid ORDER BY tag\',[\'uid\'=>$uid]),\'tag\');',
+    '$book=db_one($db,\'SELECT payload FROM address_books WHERE uid=:uid\',[\'uid\'=>$uid]);',
+    '$payload=$book?json_decode((string)$book[\'payload\'],true,64,JSON_THROW_ON_ERROR):[];',
+    '$bookTags=is_array($payload[\'tags\']??null)?$payload[\'tags\']:[];sort($bookTags);',
+    'echo json_encode([\'profile\'=>$profileTags,\'legacy\'=>$legacyTags,\'payload\'=>$bookTags],JSON_THROW_ON_ERROR);',
+  ].join('');
+  const output = execFileSync('docker', ['exec', '-e', `TEST_UID=${uid}`, container, 'php', '-r', php], { encoding: 'utf8' });
   return JSON.parse(output.trim());
 }
 
@@ -230,10 +278,12 @@ test('client inventory previews a multi-device assignment before applying it', a
   await page.locator('#rows tr input[type="checkbox"]').check();
   await page.locator('#q').fill(`multi-b-` + suffix);
   await page.getByRole('button', { name: '搜索' }).click();
-  await expect(page.locator('#rows tr')).toHaveCount(1);
-  await page.locator('#rows tr input[type="checkbox"]').check();
-  await expect(page.getByRole('button', { name: /加入通讯录（2）/ })).toBeEnabled();
-  await page.getByRole('button', { name: /加入通讯录（2）/ }).click();
+  const secondRow = page.locator(`[data-device-id="multi-b-${suffix}"]`);
+  await expect(secondRow).toBeVisible();
+  await secondRow.locator('input[type="checkbox"]').check();
+  await expect(page.locator('#address-book-action')).toHaveText('加入通讯录（2）');
+  await expect(page.locator('#address-book-action')).toBeEnabled();
+  await page.locator('#address-book-action').click();
   const assignment = page.getByRole('dialog', { name: '分配通讯录' });
   await assignment.locator('#assignment-users input[type="checkbox"]').first().check();
   await assignment.getByRole('button', { name: '保存分配' }).click();
@@ -271,6 +321,39 @@ test('address book uses inventory columns, telemetry and an explicit refresh', a
   await expect(row).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+});
+
+test('address-book search queued during the initial load wins over the stale response', async ({ page }) => {
+  const suffix = Date.now().toString(36);
+  const matchingId = `address-race-${suffix}`;
+  await loginAdmin(page);
+  const session = await page.request.get(`${adminPath}/api/session`);
+  const { csrf } = await session.json();
+  expect((await page.request.post(`${adminPath}/api/address-book/peers`, {
+    headers: { 'X-CSRF-Token': csrf }, data: { id: matchingId, alias: '竞态搜索客户端', tags: [] },
+  })).ok()).toBeTruthy();
+
+  let releaseInitial;
+  let initialStarted;
+  const initialStartedPromise = new Promise(resolve => { initialStarted = resolve; });
+  const releaseInitialPromise = new Promise(resolve => { releaseInitial = resolve; });
+  let addressBookRequests = 0;
+  await page.route('**/api/address-book?*', async route => {
+    addressBookRequests += 1;
+    if (addressBookRequests === 1) {
+      initialStarted();
+      await releaseInitialPromise;
+    }
+    await route.continue();
+  });
+
+  await page.goto(`${adminPath}/address-book`);
+  await initialStartedPromise;
+  await page.locator('#address-search').fill(matchingId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  releaseInitial();
+  await expect(page.locator(`[data-peer-id="${matchingId}"]`)).toBeVisible();
+  await expect(page.locator('#address-page-info')).toContainText('共 1');
 });
 
 test('client inventory keeps runtime and network details aligned with persisted report data', async ({ page, request }) => {
@@ -587,6 +670,33 @@ test('client inventory loads and manages devices beyond the first 200 rows', asy
   await expect(page.locator('#stat-total')).toHaveText('205');
 });
 
+test('client inventory select-all checks every visible device row', async ({ page, request }) => {
+  const suffix = Date.now().toString(36);
+  const ids = Array.from({ length: 3 }, (_, index) => `select-all-${suffix}-${index}`);
+  await Promise.all(ids.map(id => reportClient(request, id)));
+
+  await loginAdmin(page);
+  await page.getByRole('link', { name: '客户端管理' }).click();
+  await page.locator('#q').fill(`select-all-${suffix}`);
+  await page.getByRole('button', { name: '搜索' }).click();
+
+  const rows = page.locator('#rows tr');
+  await expect(rows).toHaveCount(ids.length);
+  const selectAll = page.locator('#select-all-devices');
+  await selectAll.check();
+  await expect(rows.locator('input[type="checkbox"]:checked')).toHaveCount(ids.length);
+  await expect(page.locator('#address-book-action')).toHaveText(`加入通讯录（${ids.length}）`);
+  await selectAll.uncheck();
+  await expect(rows.locator('input[type="checkbox"]:checked')).toHaveCount(0);
+  await expect(page.locator('#address-book-action')).toHaveText('加入通讯录');
+  await rows.nth(0).locator('input[type="checkbox"]').check();
+  await expect(selectAll).not.toBeChecked();
+  await expect(selectAll).toHaveJSProperty('indeterminate', true);
+  await rows.nth(0).locator('input[type="checkbox"]').uncheck();
+  await expect(selectAll).not.toBeChecked();
+  await expect(selectAll).toHaveJSProperty('indeterminate', false);
+});
+
 for (const width of [320, 390, 768, 1024, 1440]) test(`client management has no horizontal page overflow at ${width}px`, async ({ page, request }) => {
   const suffix = Date.now().toString(36);
   const deviceId = `mobile-client-${suffix}`;
@@ -680,6 +790,200 @@ test('personal address book manages peers tags favorites and confirmation dialog
   expect(errors).toEqual([]);
 });
 
+test('user address-book shortcut and batch actions persist for the selected user', async ({ page, request }) => {
+  const suffix = Date.now().toString(36);
+  const sourceName = `e2e-source-${suffix}`;
+  const targetName = `e2e-target-${suffix}`;
+  const firstId = `e2e-first-${suffix}`;
+  const secondId = `e2e-second-${suffix}`;
+  const errors = collectPageErrors(page);
+  await reportClient(request, firstId);
+  await reportClient(request, secondId);
+  await loginAdmin(page);
+  const session = await page.request.get(`${adminPath}/api/session`);
+  const { csrf } = await session.json();
+  const sourceResponse = await page.request.post(`${adminPath}/api/users`, { headers: { 'X-CSRF-Token': csrf }, data: { username: sourceName, password: '1', enabled: true } });
+  const targetResponse = await page.request.post(`${adminPath}/api/users`, { headers: { 'X-CSRF-Token': csrf }, data: { username: targetName, password: '1', enabled: true } });
+  const sourceId = (await sourceResponse.json()).id;
+  const targetId = (await targetResponse.json()).id;
+  for (const id of [firstId, secondId]) {
+    expect((await page.request.post(`${adminPath}/api/address-book/peers?user_id=${sourceId}`, {
+      headers: { 'X-CSRF-Token': csrf }, data: { id, alias: `${id}-alias`, tags: [] },
+    })).ok()).toBeTruthy();
+  }
+
+  await page.reload();
+  await page.locator('#q').fill(sourceName);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const userRow = page.locator('tbody tr').filter({ hasText: sourceName });
+  await expect(userRow.getByRole('link', { name: '2 个客户端' })).toBeVisible();
+  await userRow.getByRole('link', { name: '2 个客户端' }).click();
+  await expect(page).toHaveURL(new RegExp(`address-book\\?user_id=${sourceId}`));
+  await expect(page.locator('#address-book-owner')).toHaveValue(sourceName);
+  await expect(page.locator('#address-book-rows tr')).toHaveCount(2);
+
+  await page.locator(`[data-peer-id="${firstId}"] input[type="checkbox"]`).check();
+  await page.locator(`[data-peer-id="${secondId}"] input[type="checkbox"]`).check();
+  await page.locator('#batch-action').selectOption('add_tags');
+  await page.locator('#batch-tags').fill('批量标签');
+  await page.getByRole('button', { name: '应用批量操作' }).click();
+  await expect(page.locator('#address-book-status')).toContainText('已更新 2 个客户端');
+  await expect(page.locator(`[data-peer-id="${firstId}"]`)).toContainText('批量标签');
+
+  await page.locator(`[data-peer-id="${firstId}"] input[type="checkbox"]`).check();
+  await page.locator('#batch-action').selectOption('copy');
+  await page.locator('#batch-target').selectOption(String(targetId));
+  await page.getByRole('button', { name: '应用批量操作' }).click();
+  await page.locator('#address-book-owner').fill(targetName);
+  await page.locator('#address-book-owner').press('Enter');
+  await expect(page.locator(`[data-peer-id="${firstId}"]`)).toContainText('批量标签');
+
+  await page.locator('#address-book-owner').fill(sourceName);
+  await page.locator('#address-book-owner').press('Enter');
+  await page.locator(`[data-peer-id="${secondId}"] input[type="checkbox"]`).check();
+  await page.locator('#batch-action').selectOption('move');
+  await page.locator('#batch-target').selectOption(String(targetId));
+  await page.getByRole('button', { name: '应用批量操作' }).click();
+  await expect(page.locator(`[data-peer-id="${secondId}"]`)).toHaveCount(0);
+
+  await page.locator('#address-book-owner').fill(targetName);
+  await page.locator('#address-book-owner').press('Enter');
+  await expect(page.locator(`[data-peer-id="${secondId}"]`)).toBeVisible();
+  await page.locator(`[data-peer-id="${secondId}"] input[type="checkbox"]`).check();
+  await page.locator('#batch-action').selectOption('remove');
+  await page.getByRole('button', { name: '应用批量操作' }).click();
+  await page.getByRole('dialog', { name: '批量移除通讯录客户端' }).getByRole('button', { name: '确认移除' }).click();
+  await expect(page.locator(`[data-peer-id="${secondId}"]`)).toHaveCount(0);
+
+  await page.reload();
+  await expect(page.locator(`[data-peer-id="${firstId}"]`)).toContainText('批量标签');
+  const persisted = await page.evaluate(async ({ adminPath, targetId }) => (await fetch(`${adminPath}/api/address-book?user_id=${targetId}&page=1&pageSize=20`)).json(), { adminPath, targetId });
+  expect(persisted.data.map(peer => peer.id)).toContain(firstId);
+  expect(persisted.data.find(peer => peer.id === firstId).tags).toContain('批量标签');
+  expect(addressBookSqlSnapshot(sourceId, [firstId, secondId])).toEqual({ profile: [firstId], legacy: [firstId], payload: [firstId] });
+  expect(addressBookSqlSnapshot(targetId, [firstId, secondId])).toEqual({ profile: [firstId], legacy: [firstId], payload: [firstId] });
+  expect(errors).toEqual([]);
+});
+
+test('self-scoped administrator cannot self-promote and replaces only personal client assignments', async ({ page, request }) => {
+  const suffix = Date.now().toString(36);
+  const username = `self-admin-${suffix}`;
+  const peerId = `self-peer-${suffix}`;
+  const deviceId = `self-device-${suffix}`;
+  await reportClient(request, deviceId);
+  await loginAdmin(page);
+  const adminSession = await page.request.get(`${adminPath}/api/session`);
+  const { csrf, user: rootUser } = await adminSession.json();
+  const created = await page.request.post(`${adminPath}/api/users`, {
+    headers: { 'X-CSRF-Token': csrf },
+    data: { username, password: '1', enabled: true, address_book_scope: 'self' },
+  });
+  expect(created.ok()).toBeTruthy();
+  const userId = (await created.json()).id;
+  expect((await page.request.patch(`${adminPath}/api/users/${userId}`, {
+    headers: { 'X-CSRF-Token': csrf },
+    data: { is_admin: true, enabled: true, address_book_scope: 'self' },
+  })).ok()).toBeTruthy();
+  expect((await page.request.post(`${adminPath}/api/devices/address-book`, {
+    headers: { 'X-CSRF-Token': csrf },
+    data: { devices: [{ id: deviceId, uuid: `${deviceId}-uuid` }], user_ids: [rootUser.id], mode: 'add' },
+  })).ok()).toBeTruthy();
+
+  await page.context().clearCookies();
+  await loginUser(page, username, '1');
+  const selfSession = await page.request.get(`${adminPath}/api/session`);
+  const { csrf: selfCsrf } = await selfSession.json();
+  const scopedOptions = await (await page.request.get(`${adminPath}/api/address-book/assignment-options`)).json();
+  expect(scopedOptions.users.map(user => user.id)).toEqual([userId]);
+  expect(scopedOptions.assignments[deviceId] || []).toEqual([]);
+  const scopedInventory = await (await page.request.get(`${adminPath}/api/devices?q=${encodeURIComponent(deviceId)}&page=1&pageSize=20`)).json();
+  expect(scopedInventory.data.find(device => device.id === deviceId).address_book_user_ids).toEqual([]);
+  const promote = await page.request.patch(`${adminPath}/api/users/${userId}`, {
+    headers: { 'X-CSRF-Token': selfCsrf }, data: { address_book_scope: 'all' },
+  });
+  expect(promote.status()).toBe(403);
+  await page.goto(adminPath);
+  await expect(page.getByRole('button', { name: '新建用户' })).toBeHidden();
+  await expect(page.getByRole('button', { name: '编辑' })).toHaveCount(0);
+
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const deviceRow = page.locator(`[data-device-id="${deviceId}"]`);
+  await deviceRow.getByRole('checkbox', { name: `选择客户端 ${deviceId}` }).check();
+  await page.getByRole('button', { name: /加入通讯录（1）/ }).click();
+  const assignment = page.getByRole('dialog', { name: '分配通讯录' });
+  await expect(assignment.locator('#assignment-users input[type="checkbox"]')).toHaveCount(1);
+  await assignment.locator('#assignment-users input[type="checkbox"]').check();
+  await assignment.getByRole('button', { name: '保存分配' }).click();
+  await expect(page.getByText('通讯录分配已保存')).toBeVisible();
+  expect(addressBookSqlSnapshot(rootUser.id, [deviceId])).toEqual({ profile: [deviceId], legacy: [deviceId], payload: [deviceId] });
+  expect(addressBookSqlSnapshot(userId, [deviceId])).toEqual({ profile: [deviceId], legacy: [deviceId], payload: [deviceId] });
+
+  await deviceRow.getByRole('checkbox', { name: `选择客户端 ${deviceId}` }).check();
+  await page.getByRole('button', { name: /加入通讯录（1）/ }).click();
+  await assignment.locator('#assignment-users input[type="checkbox"]').uncheck();
+  await assignment.getByRole('button', { name: '保存分配' }).click();
+  await expect(page.getByText('通讯录分配已保存')).toBeVisible();
+  expect(addressBookSqlSnapshot(rootUser.id, [deviceId])).toEqual({ profile: [deviceId], legacy: [deviceId], payload: [deviceId] });
+  expect(addressBookSqlSnapshot(userId, [deviceId])).toEqual({ profile: [], legacy: [], payload: [] });
+
+  await page.goto(`${adminPath}/address-book`);
+  await expect(page.locator('#address-book-owner-panel')).toBeHidden();
+  await page.getByRole('button', { name: '新增客户端' }).click();
+  await page.locator('#peer-id').fill(peerId);
+  await page.locator('#peer-alias').fill('自管通讯录客户端');
+  await page.getByRole('button', { name: '新增客户端' }).last().click();
+  await expect(page.locator(`[data-peer-id="${peerId}"]`)).toBeVisible();
+  await expect(page.locator('#address-book-status')).toContainText('通讯录已保存');
+
+  const options = await page.request.get(`${adminPath}/api/address-book/assignment-options`);
+  expect(options.ok()).toBeTruthy();
+  expect((await options.json()).users.map(user => user.id)).toEqual([userId]);
+  const forbidden = await page.request.get(`${adminPath}/api/address-book?user_id=${rootUser.id}`);
+  expect(forbidden.status()).toBe(403);
+  expect(addressBookSqlSnapshot(userId, [peerId])).toEqual({ profile: [peerId], legacy: [peerId], payload: [peerId] });
+});
+
+test('cross-user copy persists through the 390px browser workflow', async ({ page }) => {
+  const suffix = Date.now().toString(36);
+  const sourceName = `mobile-source-${suffix}`;
+  const targetName = `mobile-target-${suffix}`;
+  const peerId = `mobile-copy-${suffix}`;
+  await page.setViewportSize({ width: 390, height: 844 });
+  await loginAdmin(page);
+  const session = await page.request.get(`${adminPath}/api/session`);
+  const { csrf } = await session.json();
+  const sourceResponse = await page.request.post(`${adminPath}/api/users`, { headers: { 'X-CSRF-Token': csrf }, data: { username: sourceName, password: '1', enabled: true } });
+  const targetResponse = await page.request.post(`${adminPath}/api/users`, { headers: { 'X-CSRF-Token': csrf }, data: { username: targetName, password: '1', enabled: true } });
+  const sourceId = (await sourceResponse.json()).id;
+  const targetId = (await targetResponse.json()).id;
+  expect((await page.request.post(`${adminPath}/api/address-book/peers?user_id=${sourceId}`, {
+    headers: { 'X-CSRF-Token': csrf }, data: { id: peerId, alias: '移动端跨用户复制', tags: ['mobile'] },
+  })).ok()).toBeTruthy();
+  await page.goto(`${adminPath}/address-book?user_id=${sourceId}`);
+  await expect(page.locator('#address-book-owner')).toBeVisible();
+  await expect(page.locator('#batch-action')).toBeVisible();
+  await page.locator(`[data-peer-id="${peerId}"] input[type="checkbox"]`).check();
+  await page.locator('#batch-action').selectOption('copy');
+  await page.locator('#batch-target').selectOption(String(targetId));
+  await page.getByRole('button', { name: '应用批量操作' }).click();
+  await expect(page.locator('#address-book-status')).toContainText('操作成功：已更新 1 个客户端');
+  await page.locator('#address-book-owner').fill(targetName);
+  await page.locator('#address-book-owner').press('Enter');
+  await expect(page.locator(`[data-peer-id="${peerId}"]`)).toContainText('移动端跨用户复制');
+  await page.reload();
+  await expect(page.locator(`[data-peer-id="${peerId}"]`)).toContainText('移动端跨用户复制');
+  const persisted = await page.evaluate(async ({ adminPath, targetId }) => (await fetch(`${adminPath}/api/address-book?user_id=${targetId}&page=1&pageSize=20`)).json(), { adminPath, targetId });
+  expect(persisted.data.find(peer => peer.id === peerId).alias).toBe('移动端跨用户复制');
+  expect(addressBookSqlSnapshot(targetId, [peerId])).toEqual({ profile: [peerId], legacy: [peerId], payload: [peerId] });
+  const targetTags = addressBookTagSqlSnapshot(targetId);
+  expect(targetTags.profile).toContain('mobile');
+  expect(targetTags.legacy).toContain('mobile');
+  expect(targetTags.payload).toContain('mobile');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+});
+
 test('personal address book is usable without horizontal overflow at 390px', async ({ page }) => {
   const suffix = Date.now().toString(36);
   const peerId = `mobile-book-${suffix}`;
@@ -703,7 +1007,7 @@ test('personal address book is usable without horizontal overflow at 390px', asy
   await row.getByRole('button', { name: '编辑客户端' }).click();
   await page.locator('#peer-alias').fill('移动端电脑-更新');
   await page.getByRole('dialog', { name: '编辑客户端' }).getByRole('button', { name: '保存修改' }).click();
-  await expect(row.getByText('移动端电脑-更新', { exact: true })).toBeVisible();
+  await expect(row.locator('.cell-title', { hasText: '移动端电脑-更新' })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
   await row.getByRole('button', { name: '删除客户端' }).click();
   await page.getByRole('dialog', { name: '删除通讯录客户端' }).getByRole('button', { name: '删除客户端' }).click();
