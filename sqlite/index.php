@@ -557,6 +557,12 @@ function publish_update_manifest(PDO $db, array $manifest): array
     $encoded = canonical_update_manifest_json($manifest);
     $driver = database_driver();
     if ($driver === 'sqlite') $db->exec('BEGIN IMMEDIATE'); else $db->beginTransaction();
+    $commit = static function () use ($db, $driver): void {
+        if ($driver === 'sqlite') $db->exec('COMMIT'); else $db->commit();
+    };
+    $rollback = static function () use ($db, $driver): void {
+        if ($driver === 'sqlite') $db->exec('ROLLBACK'); elseif ($db->inTransaction()) $db->rollBack();
+    };
     try {
         $lock = $driver === 'mysql' ? ' FOR UPDATE' : '';
         $sameBuild = db_all($db, 'SELECT manifest FROM update_releases WHERE channel=:channel AND build_seq=:build'.$lock, ['channel'=>$channel,'build'=>$build]);
@@ -564,16 +570,16 @@ function publish_update_manifest(PDO $db, array $manifest): array
             foreach ($sameBuild as $row) {
                 if (canonical_update_manifest_json(decoded_payload($row['manifest'])) !== $encoded) fail(409, '相同 build_seq 已发布不同清单');
             }
-            $db->commit();
+            $commit();
             return ['ok'=>true,'version'=>$version,'build_seq'=>$build,'channel'=>$channel,'idempotent'=>true];
         }
         $latest = db_one($db, 'SELECT build_seq FROM update_releases WHERE channel=:channel ORDER BY build_seq DESC LIMIT 1'.$lock, ['channel'=>$channel]);
         if ($latest && (int)$latest['build_seq'] > $build) fail(409, 'build_seq 低于已发布清单');
         db_exec($db, 'INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(:version,:build,:channel,:manifest,:published_at,1)', ['version'=>$version,'build'=>$build,'channel'=>$channel,'manifest'=>$encoded,'published_at'=>time()]);
-        $db->commit();
+        $commit();
         return ['ok'=>true,'version'=>$version,'build_seq'=>$build,'channel'=>$channel];
     } catch (Throwable $error) {
-        if ($db->inTransaction()) $db->rollBack();
+        $rollback();
         throw $error;
     }
 }

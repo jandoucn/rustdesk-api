@@ -11,6 +11,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OfflineBundleTest(unittest.TestCase):
+    def test_sqlite_manifest_publish_pairs_immediate_transaction_with_sql_commit(self):
+        source = (ROOT / "sqlite/index.php").read_text()
+        function = source[source.index("function publish_update_manifest") :]
+        function = function[: function.index("function record_update_event")]
+
+        self.assertIn("$db->exec('BEGIN IMMEDIATE')", function)
+        self.assertIn("$db->exec('COMMIT')", function)
+        self.assertIn("$db->exec('ROLLBACK')", function)
+
     def test_export_pulls_latest_images_and_builds_verified_bundle(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
