@@ -347,7 +347,13 @@ function read_book(PDO $db, int $uid): array
             $tags = array_values(array_unique(array_merge(is_array($payload['tags']??null)?$payload['tags']:[], array_column(db_all($db, 'SELECT name FROM ab_profile_tags WHERE guid=:guid ORDER BY name', ['guid'=>$profile['guid']]), 'name'))));
             $payload['tags'] = $tags;
             $encoded = json_encode($payload, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR);
-            if ($encoded !== (string)$book['payload']) { save_exact_address_book($db, $uid, $payload, time()); $book['payload']=$encoded; }
+            if ($encoded !== (string)$book['payload']) {
+                $updatedAt = time();
+                save_exact_address_book($db, $uid, $payload, $updatedAt);
+                $book['payload'] = $encoded;
+                // RustDesk uses this value to decide whether its local address book cache is stale.
+                $book['updated_at'] = $updatedAt;
+            }
         }
         return ['updated_at' => date('Y-m-d H:i:s', (int)$book['updated_at']), 'data' => $book['payload']];
     }

@@ -1041,6 +1041,7 @@ class IntegrationTest(unittest.TestCase):
         self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": uuid_value, "ver": 11, "conns": []})
         self.client.json("POST", "/?s=/api/sysinfo", {"id": device_id, "uuid": uuid_value, "hostname": "remove-host"})
         self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {"devices":[{"id":device_id,"uuid":uuid_value}],"user_ids":[1],"mode":"add"}, {"X-CSRF-Token":csrf})
+        before_updated_at = sqlite3.connect(self.db).execute("SELECT updated_at FROM address_books WHERE uid=1").fetchone()[0]
         _, preview, _ = self.client.json("POST", "/?s=/ops-x9/api/devices/address-book/preview", {"devices":[{"id":device_id,"uuid":uuid_value}],"user_ids":[1],"mode":"remove"}, {"X-CSRF-Token":csrf})
         self.assertEqual(len(preview["plan"]["remove"]), 1)
         self.client.json("POST", "/?s=/ops-x9/api/devices/address-book", {"devices":[{"id":device_id,"uuid":uuid_value}],"user_ids":[1],"mode":"remove"}, {"X-CSRF-Token":csrf})
@@ -1049,6 +1050,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(db.execute("SELECT COUNT(*) FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=1 AND a.personal=1 AND p.id=?", (device_id,)).fetchone()[0], 0)
         book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=1").fetchone()[0])
         self.assertNotIn(device_id, {peer.get("id") for peer in book.get("peers", [])})
+        self.assertGreaterEqual(db.execute("SELECT updated_at FROM address_books WHERE uid=1").fetchone()[0], before_updated_at)
         db.close()
 
     def test_27_sysinfo_recursively_preserves_unknown_json_and_refreshes_ip_geo_together(self):
