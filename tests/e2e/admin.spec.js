@@ -64,6 +64,23 @@ function persistNetworkPayload(id, uuid, network) {
   return JSON.parse(output.trim());
 }
 
+function setLatestUpdateCommandStatus(id, uuid, status) {
+  const container = process.env.RUSTDESK_API_CONTAINER;
+  if (!container) throw new Error('RUSTDESK_API_CONTAINER is required for update-command status E2E');
+  const php = [
+    "require '/var/www/html/lib.php';",
+    '$db=open_database();',
+    "$row=db_one($db,'SELECT command_id FROM device_update_commands WHERE device_id=:id AND uuid=:uuid ORDER BY created_at DESC,command_id DESC LIMIT 1',['id'=>getenv('TEST_DEVICE_ID'),'uuid'=>getenv('TEST_DEVICE_UUID')]);",
+    "if(!$row)throw new RuntimeException('missing command');",
+    "db_exec($db,'UPDATE device_update_commands SET status=:status,updated_at=:updated WHERE command_id=:command',['status'=>getenv('TEST_COMMAND_STATUS'),'updated'=>time(),'command'=>$row['command_id']]);",
+    "echo $row['command_id'];",
+  ].join('');
+  return execFileSync('docker', [
+    'exec', '-e', `TEST_DEVICE_ID=${id}`, '-e', `TEST_DEVICE_UUID=${uuid}`,
+    '-e', `TEST_COMMAND_STATUS=${status}`, container, 'php', '-r', php,
+  ], { encoding: 'utf8' }).trim();
+}
+
 function addressBookSqlSnapshot(uid, peerIds) {
   const container = process.env.RUSTDESK_API_CONTAINER;
   if (!container) throw new Error('RUSTDESK_API_CONTAINER is required for persisted address-book E2E');
@@ -460,6 +477,7 @@ test('selected clients can be removed in bulk after confirmation', async ({ page
   await page.goto(`${adminPath}/devices`);
   await page.locator('#q').fill(`batch-remove-ui-${suffix}`);
   await page.getByRole('button', { name: '搜索' }).click();
+  await expect(page.locator('#rows tr')).toHaveCount(2);
   await page.locator('#select-all-devices').check();
   const remove = page.locator('#batch-remove-devices');
   await expect(remove).toBeEnabled();
@@ -487,6 +505,7 @@ test('selected clients receive batch check commands and scheduled-update policy'
   await page.goto(`${adminPath}/devices`);
   await page.locator('#q').fill(`batch-update-ui-${suffix}`);
   await page.getByRole('button', { name: '搜索' }).click();
+  await expect(page.locator('#rows tr')).toHaveCount(2);
   await page.locator('#select-all-devices').check();
   await expect(page.locator('#batch-check-update')).toBeEnabled();
   await page.locator('#batch-scheduled-enabled').check();
@@ -658,6 +677,8 @@ test('client details sends one-shot check and install commands and shows command
   await expect(page.locator('#status')).toContainText('安装命令已发送');
   await expect(page.locator('#details-dialog')).toContainText('最近更新命令');
   await expect(page.locator('#details-dialog')).toContainText('等待客户端接收');
+  setLatestUpdateCommandStatus(deviceId, uuid, 'installing');
+  await expect(page.locator('#details-dialog')).toContainText('正在安装', { timeout: 5000 });
 });
 
 test('inventory backfills GeoLite region and timezone for a stored public IP', async ({ page, request }) => {
@@ -735,7 +756,7 @@ test('client inventory refreshes every five seconds and pauses while hidden', as
 test('long inventory keeps its scroll anchor and focused control when a row changes during refresh', async ({ page, request }) => {
   const suffix = Date.now().toString(36);
   const ids = Array.from({ length: 45 }, (_, index) => `stable-${suffix}-${String(index).padStart(2, '0')}`);
-  await Promise.all(ids.map(id => reportClient(request, id)));
+  for (const id of ids) await reportClient(request, id);
   const deviceId = ids[22];
   await loginAdmin(page);
   await page.getByRole('link', { name: '客户端管理' }).click();
@@ -762,10 +783,12 @@ test('client inventory loads and manages devices beyond the first 200 rows', asy
   test.setTimeout(60_000);
   const suffix = Date.now().toString(36);
   const ids = Array.from({ length: 205 }, (_, index) => `bulk-${suffix}-${String(index).padStart(3, '0')}`);
-  const responses = await Promise.all(ids.map(id => request.post('/api/heartbeat', {
-    data: { id, uuid: `${id}-uuid`, ver: 10, conns: [], modified_at: 0 },
-  })));
-  expect(responses.every(response => response.ok())).toBeTruthy();
+  for (const id of ids) {
+    const response = await request.post('/api/heartbeat', {
+      data: { id, uuid: `${id}-uuid`, ver: 10, conns: [], modified_at: 0 },
+    });
+    expect(response.ok()).toBeTruthy();
+  }
 
   await loginAdmin(page);
   await page.getByRole('link', { name: '客户端管理' }).click();

@@ -271,7 +271,7 @@
       $('peer-dialog-description').textContent = peer ? '更新当前个人通讯录中的客户端信息。' : '客户端会添加到当前管理员的个人通讯录。';
       $('peer-save').textContent = peer ? '保存修改' : '新增客户端';
       renderTagPicker(peer ? peerTags(peer) : []); $('peer-dialog').showModal();
-      requestAnimationFrame(() => (peer ? $('peer-alias') : $('peer-id')).focus());
+      (peer ? $('peer-alias') : $('peer-id')).focus();
     }
 
     async function savePeer(event) {

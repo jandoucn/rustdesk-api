@@ -9,7 +9,7 @@
 
 ## Scope
 
-This repository is a dual-backend RustDesk API and operations console. SQLite and MySQL must expose the same behavior. The container listens on port 80 and Compose publishes `7000:80`. The management prefix is configured only through `RUSTDESK_ADMIN_PATH` and must never fall back to `/admin`.
+This repository is a RustDesk API and operations console whose active production and development backend is SQLite. MySQL support is frozen at the baseline recorded in `docs/mysql-support-freeze.md`: preserve existing code and tests, but do not extend MySQL behavior or run MySQL gates unless the user explicitly reactivates that backend. The container listens on port 80 and Compose publishes `7000:80`. The management prefix is configured only through `RUSTDESK_ADMIN_PATH` and must never fall back to `/admin`.
 
 ## Git publishing contract
 
@@ -18,18 +18,24 @@ This repository is a dual-backend RustDesk API and operations console. SQLite an
 - Requests to fix, modify, test, build, review, or start the project locally do not imply permission to commit, tag, release, or push.
 - AOCI maintenance is separate from Git publishing. AOCI-managed files may be updated when required by its contract, but they must not be committed or pushed without the same explicit user instruction.
 
+## Production deployment contract
+
+- Use Termark asset `NTServer-SH` at `47.100.7.221` for production server access; do not use raw `ssh`, `scp` or `sftp`.
+- Update the production API only with `cd /opt/1panel/apps/rustdesk-api && ./upgrade-api.sh` after the release tag image workflow has completed successfully.
+- After an upgrade, verify the `rustdesk-api` container is running the newly published image, remains bound through host `127.0.0.1:7000` to container port `80`, and the configured public health/API route responds successfully.
+- Do not alter production data, deployment secrets or unrelated containers during an API upgrade.
+
 ## Required verification for every behavior change
 
 Do not declare a feature complete from HTTP status codes alone. Before completion, run all applicable gates:
 
 1. SQLite HTTP integration tests against a disposable legacy database.
-2. MySQL 8.4 integration tests against a fresh real container.
-3. Direct SQL assertions for created, updated and deleted values, JSON payloads, BLOB sizes, timestamps and row counts.
-4. Playwright browser E2E for every changed page workflow, including error state, desktop and 390px mobile viewport.
-5. Container build, internal port 80, configured admin path, public fallback routing and volume restart persistence.
-6. PHP syntax checks, Python compile checks, Compose config validation and `git diff --check`.
+2. Direct SQLite assertions for created, updated and deleted values, JSON payloads, BLOB sizes, timestamps and row counts.
+3. Playwright browser E2E for every changed page workflow, including error state, desktop and 390px mobile viewport.
+4. Container build, internal port 80, configured admin path, public fallback routing and volume restart persistence.
+5. PHP syntax checks, Python compile checks, Compose config validation and `git diff --check`.
 
-Tests must use real CRUD and compare persisted values. New SQLite behavior requires equivalent MySQL coverage. New page actions require a checked-in Playwright scenario.
+Tests must use real CRUD and compare persisted SQLite values. New page actions require a checked-in Playwright scenario. Do not add or run MySQL parity coverage while MySQL is frozen.
 
 ## Test resource cleanup contract
 
@@ -43,15 +49,15 @@ Tests must use real CRUD and compare persisted values. New SQLite behavior requi
 ## Mandatory TDD, E2E and Code Review Contract
 
 - Every behavior change starts with a failing test or a recorded regression test gap; implementation is incomplete until the test passes.
-- Use TDD at every applicable layer: API/integration tests, SQLite persistence, MySQL 8.4 persistence, and Playwright browser E2E for changed workflows.
+- Use TDD at every applicable layer: API/integration tests, SQLite persistence, and Playwright browser E2E for changed workflows.
 - Tests must use real CRUD and real persisted data. HTTP status codes, mocked responses, DOM presence, or optimistic client state alone are insufficient.
 - After every create, update, delete, sync, migration, and refresh workflow, compare the API response, rendered result, and direct SQL state. Any difference is a defect; fix it and rerun the affected matrix.
 - Every feature module must have checked-in E2E scenarios for success, validation failure, authorization/CSRF failure where applicable, persistence after reload, and the relevant empty/loading/error states.
 - Page workflows must run through a real browser using Playwright or the available MCP/computer-use surface. Cover desktop and 390px mobile viewports, keyboard/focus behavior, responsive overflow, auto-refresh, and destructive confirmations when relevant.
-- After local tests pass, perform a dedicated code review of the changed files before declaring completion. Review must check data ownership, authorization, SQL correctness, SQLite/MySQL parity, backward compatibility, error handling, accessibility, responsive layout, and test sufficiency.
+- After local tests pass, perform a dedicated code review of the changed files before declaring completion. Review must check data ownership, authorization, SQLite correctness, backward compatibility, error handling, accessibility, responsive layout, and test sufficiency.
 - The review must be evidence-based: inspect the final diff, run the relevant checks, and record findings or explicitly record that no findings remain. A green test run does not replace code review.
 - Do not claim full verification when a required integration dependency is unavailable. Keep the missing gate checked in, run the strongest real-data substitute, and report the exact gap.
-- New fields require legacy-payload compatibility tests and SQLite/MySQL parity tests. Unknown client JSON fields must survive round trips unchanged.
+- New fields require legacy-payload compatibility tests and SQLite persistence tests. Unknown client JSON fields must survive round trips unchanged.
 - A failed test is a stop-and-fix signal. Iterate implementation -> test -> direct SQL comparison -> browser verification -> code review until the changed behavior and persisted representation agree.
 - When production-like data is needed, use a read-only consistency snapshot (for example the NTServer-SH baseline documented in `docs/sqlite-web-admin-migration.md`) copied to a temporary test path. Never run migrations or CRUD tests against the original snapshot or the live database.
 

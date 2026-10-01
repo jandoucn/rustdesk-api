@@ -152,7 +152,7 @@
       });
     }
     const labels = { online: '在线', recent: '最近在线', offline: '离线', unreported: '未上报' };
-    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, pendingLoad: null, aliasDevice: null, policyDevice: null, timer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [], assignmentDevices: [] };
+    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, pendingLoad: null, aliasDevice: null, policyDevice: null, timer: null, commandTimer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [], assignmentDevices: [] };
 
     async function api(url, options = {}) {
       const headers = new Headers(options.headers || {});
@@ -293,10 +293,12 @@
       const response = await api('__ADMIN_PATH__/api/update/policies/batch', { method: 'PATCH', body: JSON.stringify({ enable_scheduled_update: $('batch-scheduled-enabled').checked, scheduled_update_interval_hours: hours, ...(all ? { all: true } : { devices }) }) });
       setFeedback('定时检查策略已更新：' + response.updated + ' 台客户端', 'success');
     }
-    async function loadUpdateCommands(device) {
-      const history = $('update-command-history'); history.replaceChildren(textLine('muted', '正在读取命令状态...'));
+    async function loadUpdateCommands(device, options = {}) {
+      const history = $('update-command-history');
+      if (!options.quiet) history.replaceChildren(textLine('muted', '正在读取命令状态...'));
       try {
         const response = await api('__ADMIN_PATH__/api/update/commands/' + encodeURIComponent(device.id) + '?uuid=' + encodeURIComponent(device.uuid));
+        if (!state.policyDevice || deviceKey(state.policyDevice) !== deviceKey(device) || !$('details-dialog').open) return;
         const commands = Array.isArray(response.data) ? response.data : [];
         history.replaceChildren();
         if (!commands.length) { history.append(textLine('muted', '暂无一次性更新命令')); return; }
@@ -307,7 +309,17 @@
           line.append(textLine('details-label', action), textLine('details-value', [command.status_label || command.status, when].filter(Boolean).join(' · ')));
           history.append(line);
         });
-      } catch (error) { history.replaceChildren(textLine('form-error', error.message)); }
+      } catch (error) { if (!options.quiet) history.replaceChildren(textLine('form-error', error.message)); }
+    }
+    function startCommandRefresh() {
+      if (state.commandTimer) clearInterval(state.commandTimer);
+      state.commandTimer = setInterval(() => {
+        if (!document.hidden && $('details-dialog').open && state.policyDevice) loadUpdateCommands(state.policyDevice, { quiet: true });
+      }, 2000);
+    }
+    function stopCommandRefresh() {
+      if (state.commandTimer) clearInterval(state.commandTimer);
+      state.commandTimer = null;
     }
     async function sendUpdateCommand(device, action, button) {
       const label = action === 'install' ? '安装' : '检查';
@@ -343,6 +355,7 @@
       });
       loadUpdatePolicy(device); loadUpdateCommands(device);
       $('details-dialog').showModal();
+      startCommandRefresh();
     }
 
     function renderDevice(device, row) {
@@ -471,6 +484,7 @@
     document.addEventListener('visibilitychange', () => { if (!document.hidden && $('auto-refresh').checked) load({ quiet: true }); });
     $('alias-cancel').addEventListener('click', () => $('alias-dialog').close());
     $('details-close').addEventListener('click', () => $('details-dialog').close());
+    $('details-dialog').addEventListener('close', stopCommandRefresh);
     ['update-mode', 'update-channel'].forEach(id => $(id).addEventListener('change', updatePolicySummary));
     ['update-version', 'update-build'].forEach(id => $(id).addEventListener('input', updatePolicySummary));
     $('update-policy-save').addEventListener('click', saveUpdatePolicy);

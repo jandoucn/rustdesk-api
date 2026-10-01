@@ -41,19 +41,19 @@ def php_sodium(expression: str, env: dict[str, str] | None = None) -> str:
     return subprocess.check_output(command, cwd=ROOT, env={**os.environ, **(env or {})}, text=True).strip()
 
 
-def device_public_key() -> str:
+def device_public_key(seed_hex: str = DEVICE_AUTH_SEED_HEX) -> str:
     return php_sodium(
         '$kp=sodium_crypto_sign_seed_keypair(hex2bin(getenv("SEED")));'
         'echo base64_encode(sodium_crypto_sign_publickey($kp));',
-        {"SEED": DEVICE_AUTH_SEED_HEX},
+        {"SEED": seed_hex},
     )
 
 
-def device_auth_headers(method: str, canonical_path: str, client_id: str, client_uuid: str, payload=None, command_id: str = "", nonce: str | None = None, timestamp: int | None = None) -> dict[str, str]:
+def device_auth_headers(method: str, canonical_path: str, client_id: str, client_uuid: str, payload=None, command_id: str = "", nonce: str | None = None, timestamp: int | None = None, seed_hex: str = DEVICE_AUTH_SEED_HEX) -> dict[str, str]:
     body = b"" if payload is None else json.dumps(payload).encode()
     timestamp = int(time.time()) if timestamp is None else timestamp
     nonce = nonce or uuid.uuid4().hex
-    public_key = device_public_key()
+    public_key = device_public_key(seed_hex)
     canonical = (
         "rustdesk-update-auth-v1\n"
         f"method={method.upper()}\npath={canonical_path}\nclient_id={client_id}\nclient_uuid={client_uuid}\n"
@@ -62,7 +62,7 @@ def device_auth_headers(method: str, canonical_path: str, client_id: str, client
     signature = php_sodium(
         '$kp=sodium_crypto_sign_seed_keypair(hex2bin(getenv("SEED")));'
         'echo base64_encode(sodium_crypto_sign_detached(getenv("MESSAGE"),sodium_crypto_sign_secretkey($kp)));',
-        {"SEED": DEVICE_AUTH_SEED_HEX, "MESSAGE": canonical},
+        {"SEED": seed_hex, "MESSAGE": canonical},
     )
     return {
         "X-RustDesk-Device-ID": client_id,
@@ -325,7 +325,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(row, ("legacy", legacy_password("legacy123"), 1700000001, 0))
         self.assertEqual(peer, (2, "legacy-id", "Old alias", "prod,blue", "legacy-hash"))
         self.assertEqual(token, ("a" * 64, 0))
-        self.assertEqual(schema_version, "13")
+        self.assertEqual(schema_version, "14")
         self.assertTrue({"runtime_payload", "network_payload"}.issubset(columns))
         self.assertTrue({"enable_check_update", "allow_auto_update", "enable_scheduled_update", "scheduled_update_interval_hours"}.issubset(policy_columns))
         auth = {"Authorization": "Bearer " + ("a" * 64)}
@@ -373,7 +373,7 @@ class IntegrationTest(unittest.TestCase):
         db.close()
         self.assertTrue({"enable_check_update", "allow_auto_update", "enable_scheduled_update", "scheduled_update_interval_hours"}.issubset(columns))
         self.assertEqual(policy, ("download", "beta", "1.9.0", 99, 1, 0, 0, 0, 5, 7))
-        self.assertEqual(version, "13")
+        self.assertEqual(version, "14")
 
     def test_01c_v10_update_events_migrate_before_command_index(self):
         db_path = self.temp / "events-v10.db"
@@ -413,7 +413,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertIn("command_id", columns)
         self.assertIn("device_update_event_command_status", indexes)
         self.assertEqual(event, ("legacy-device", "legacy-uuid", "completed", None))
-        self.assertEqual(version, "13")
+        self.assertEqual(version, "14")
 
     def test_02_rustdesk_login_current_user_and_logout_revokes_token(self):
         status, body, _ = self.client.json("POST", "/?s=/api/login", {"username": "legacy", "password": "legacy123", "id": "legacy-id", "uuid": "legacy-uuid"})
@@ -1116,6 +1116,51 @@ class IntegrationTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assertIn("event: update-command\n", stream)
         self.assertIn(created["command_id"], stream)
+
+    def test_heartbeat_client_enrolls_update_key_and_receives_commands(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id, device_uuid = f"command-tofu-{suffix}", f"command-tofu-uuid-{suffix}"
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_uuid, "conns": []})
+        _, created, _ = self.client.json("POST", f"/?s=/ops-x9/api/update/commands/{device_id}", {
+            "uuid": device_uuid, "action": "check",
+        }, {"X-CSRF-Token": csrf}, expected=(201,))
+
+        stream_path = f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={device_uuid}&after_revision=0"
+        headers = {"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid)}
+        _, stream, _ = self.client.request("GET", stream_path, headers=headers, expected=(200,))
+        self.assertIn("event: update-command\n", stream)
+        self.assertIn(created["command_id"], stream)
+
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute(
+            "SELECT device_id,uuid,public_key,first_seen_at,last_seen_at FROM device_update_keys WHERE device_id=? AND uuid=?",
+            (device_id, device_uuid),
+        ).fetchone()[:3], (device_id, device_uuid, device_public_key()))
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM device_deployments WHERE id=? AND uuid=?", (device_id, device_uuid)).fetchone()[0], 0)
+        db.close()
+
+        other_seed = "22" * 32
+        rejected = {"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid, seed_hex=other_seed)}
+        self.assertEqual(self.client.request("GET", stream_path, headers=rejected, expected=(401,))[0], 401)
+
+        self.client.json("DELETE", f"/?s=/ops-x9/api/devices/{device_id}?uuid={device_uuid}", {}, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute(
+            "SELECT COUNT(*) FROM device_update_keys WHERE device_id=? AND uuid=?", (device_id, device_uuid)
+        ).fetchone()[0], 0)
+        db.close()
+
+    def test_stale_heartbeat_cannot_enroll_update_key(self):
+        suffix = uuid.uuid4().hex[:10]
+        device_id, device_uuid = f"command-stale-{suffix}", f"command-stale-uuid-{suffix}"
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_uuid, "conns": []})
+        db = sqlite3.connect(self.db)
+        db.execute("UPDATE device_reports SET last_seen=?,last_heartbeat=? WHERE id=? AND uuid=?", (int(time.time()) - 91, int(time.time()) - 91, device_id, device_uuid))
+        db.commit(); db.close()
+        stream_path = f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={device_uuid}"
+        headers = {"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid)}
+        self.assertEqual(self.client.request("GET", stream_path, headers=headers, expected=(401,))[0], 401)
 
     def test_06_admin_session_csrf_login_and_user_lifecycle(self):
         status, session, _ = self.client.json("GET", "/?s=/ops-x9/api/session")

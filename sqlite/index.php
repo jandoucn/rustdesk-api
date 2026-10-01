@@ -637,11 +637,23 @@ function update_device_auth(PDO $db, string $method, string $path, string $id, s
     if ($headerId !== $id || !preg_match('/^-?[0-9]{1,20}$/', $timestampText) || !preg_match('/^[A-Za-z0-9._~-]{16,128}$/', $nonce)) fail(401, '设备签名凭据无效');
     $timestamp = (int)$timestampText;
     if (abs(time() - $timestamp) > 300) fail(401, '设备签名已过期');
-    $deployment = db_one($db, 'SELECT pk FROM device_deployments WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
-    $registeredKey = strict_base64((string)($deployment['pk'] ?? ''), SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES);
     $suppliedKey = strict_base64($headerKey, SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES);
     $signature = strict_base64($signatureText, SODIUM_CRYPTO_SIGN_BYTES);
-    if ($registeredKey === null || $suppliedKey === null || $signature === null || !hash_equals($registeredKey, $suppliedKey)) fail(401, '设备公钥未登记或不匹配');
+    if ($suppliedKey === null || $signature === null) fail(401, '设备签名凭据无效');
+    $trusted = database_driver() === 'sqlite'
+        ? db_one($db, 'SELECT public_key FROM device_update_keys WHERE device_id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid])
+        : null;
+    $deployment = db_one($db, 'SELECT pk FROM device_deployments WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
+    $registeredText = (string)($trusted['public_key'] ?? $deployment['pk'] ?? '');
+    $registeredKey = $registeredText === '' ? null : strict_base64($registeredText, SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES);
+    if ($registeredText !== '' && $registeredKey === null) fail(401, '设备公钥未登记或不匹配');
+    if ($registeredKey !== null && !hash_equals($registeredKey, $suppliedKey)) fail(401, '设备公钥未登记或不匹配');
+    if ($registeredKey === null) {
+        if (database_driver() !== 'sqlite') fail(401, '设备公钥未登记或不匹配');
+        $report = db_one($db, 'SELECT last_seen,last_heartbeat FROM device_reports WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
+        $latest = max((int)($report['last_seen'] ?? 0), (int)($report['last_heartbeat'] ?? 0));
+        if (!$report || $latest < time() - 90) fail(401, '设备公钥未登记或不匹配');
+    }
     $canonical = "rustdesk-update-auth-v1\n"
         .'method='.strtoupper($method)."\n"
         .'path='.$path."\n"
@@ -651,9 +663,18 @@ function update_device_auth(PDO $db, string $method, string $path, string $id, s
         .'nonce='.$nonce."\n"
         .'command_id='.$commandId."\n"
         .'body_sha256='.hash('sha256', request_body())."\n";
-    if (!sodium_crypto_sign_verify_detached($signature, $canonical, $registeredKey)) fail(401, '设备签名校验失败');
+    $verificationKey = $registeredKey ?? $suppliedKey;
+    if (!sodium_crypto_sign_verify_detached($signature, $canonical, $verificationKey)) fail(401, '设备签名校验失败');
     try {
-        txn($db, function () use ($db, $id, $uuid, $nonce) {
+        txn($db, function () use ($db, $id, $uuid, $nonce, $headerKey, $suppliedKey) {
+            $now = time();
+            if (database_driver() === 'sqlite') {
+                db_insert_ignore($db, 'device_update_keys', ['device_id'=>$id,'uuid'=>$uuid,'public_key'=>$headerKey,'first_seen_at'=>$now,'last_seen_at'=>$now]);
+                $bound = db_one($db, 'SELECT public_key FROM device_update_keys WHERE device_id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
+                $boundKey = strict_base64((string)($bound['public_key'] ?? ''), SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES);
+                if ($boundKey === null || !hash_equals($boundKey, $suppliedKey)) fail(401, '设备公钥未登记或不匹配');
+                db_exec($db, 'UPDATE device_update_keys SET last_seen_at=:seen WHERE device_id=:id AND uuid=:uuid', ['seen'=>$now,'id'=>$id,'uuid'=>$uuid]);
+            }
             db_exec($db, 'DELETE FROM device_update_nonces WHERE created_at<:expired', ['expired'=>time()-600]);
             db_exec($db, 'INSERT INTO device_update_nonces(device_id,uuid,nonce,created_at) VALUES(:id,:uuid,:nonce,:created)', ['id'=>$id,'uuid'=>$uuid,'nonce'=>$nonce,'created'=>time()]);
         });
@@ -2086,6 +2107,7 @@ try {
             txn($db, function() use ($db,$devices,$actor) {
                 foreach ($devices as $device) {
                     db_exec($db,'DELETE FROM device_deployments WHERE id=:id AND uuid=:uuid',$device);
+                    if (database_driver() === 'sqlite') db_exec($db,'DELETE FROM device_update_keys WHERE device_id=:id AND uuid=:uuid',$device);
                     db_exec($db,'DELETE FROM device_reports WHERE id=:id AND uuid=:uuid',$device);
                     admin_event($db,(int)$actor['id'],'delete_device',0);
                 }
@@ -2095,7 +2117,7 @@ try {
         $uuid=device_uuid($db,$id,text_field($_GET,'uuid',256));
         $references = db_all($db, 'SELECT a.uid,u.username FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid JOIN rustdesk_users u ON u.id=a.uid WHERE a.personal=1 AND p.id=:id ORDER BY a.uid', ['id'=>$id]);
         if ($references) reply(['error'=>'设备仍被通讯录引用，请先移除通讯录分配','references'=>array_map(static fn($row)=>['user_id'=>(int)$row['uid'],'username'=>$row['username']],$references)], 409);
-        txn($db,function()use($db,$id,$uuid,$actor){db_exec($db,'DELETE FROM device_deployments WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);db_exec($db,'DELETE FROM device_reports WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);admin_event($db,(int)$actor['id'],'delete_device',0);}); reply(['ok'=>true]);
+        txn($db,function()use($db,$id,$uuid,$actor){db_exec($db,'DELETE FROM device_deployments WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);if(database_driver()==='sqlite')db_exec($db,'DELETE FROM device_update_keys WHERE device_id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);db_exec($db,'DELETE FROM device_reports WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);admin_event($db,(int)$actor['id'],'delete_device',0);}); reply(['ok'=>true]);
     }
     if ($path === '/api/login') {
         method('POST'); $d = json_body(); $u = authenticate($db, $d, false);
