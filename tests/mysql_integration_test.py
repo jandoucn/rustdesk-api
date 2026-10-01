@@ -110,11 +110,23 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.client.json("POST", "/api/heartbeat", {"id": device_id, "uuid": uuid, "conns": []})
         _, initial, _ = self.client.json("GET", f"/ops-x9/api/update/policies/{device_id}?uuid={uuid}")
         self.assertEqual(initial["mode"], "notify")
-        _, saved, _ = self.client.json("PATCH", f"/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "disabled", "channel": "stable", "target_version": None, "target_build_seq": None, "auto_install": False}, {"X-CSRF-Token": csrf})
+        self.assertFalse(initial["enable_check_update"])
+        self.assertFalse(initial["allow_auto_update"])
+        _, saved, _ = self.client.json("PATCH", f"/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "disabled", "channel": "stable", "target_version": None, "target_build_seq": None, "auto_install": False, "enable_check_update": True, "allow_auto_update": True}, {"X-CSRF-Token": csrf})
         self.assertEqual(saved["mode"], "disabled")
+        self.assertTrue(saved["enable_check_update"])
+        self.assertTrue(saved["allow_auto_update"])
         _, persisted, _ = self.client.json("GET", f"/ops-x9/api/update/policies/{device_id}?uuid={uuid}")
         self.assertEqual(persisted["mode"], "disabled")
-        self.assertEqual(self.sql(f"SELECT mode,channel,auto_install FROM device_update_policies WHERE id='{device_id}' AND uuid='{uuid}'"), ["disabled\tstable\t0"])
+        self.assertTrue(persisted["enable_check_update"])
+        self.assertTrue(persisted["allow_auto_update"])
+        self.assertEqual(self.sql(f"SELECT mode,channel,auto_install,enable_check_update,allow_auto_update FROM device_update_policies WHERE id='{device_id}' AND uuid='{uuid}'"), ["disabled\tstable\t0\t1\t1"])
+        _, stream, content_type = self.client.request("GET", f"/rd/update/v1/policy/stream?client_id={device_id}&client_uuid={uuid}", headers={"Accept": "text/event-stream"}, expected=(200,))
+        self.assertIn("text/event-stream", content_type)
+        event = json.loads(next(line[6:] for line in stream.splitlines() if line.startswith("data: ")))
+        self.assertEqual(event["policy_revision"], 1)
+        self.assertTrue(event["enable_check_update"])
+        self.assertTrue(event["allow_auto_update"])
     @classmethod
     def setUpClass(cls):
         cls.client = HttpClient(os.environ.get("RUSTDESK_TEST_URL", "http://127.0.0.1:17000"))
@@ -148,15 +160,17 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.sql("CREATE TABLE app_meta (`key` VARCHAR(128) PRIMARY KEY,value TEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; INSERT INTO app_meta VALUES ('schema_version','5');", database)
         self.sql("CREATE TABLE device_deployments (id VARCHAR(128) PRIMARY KEY,uuid VARCHAR(256) NOT NULL,pk TEXT NOT NULL,uid BIGINT UNSIGNED,payload LONGTEXT NOT NULL,updated_at BIGINT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; INSERT INTO device_deployments VALUES ('LegacyID','LegacyUUID','legacy-pk',NULL,'{\"future\":{\"keep\":1}}',1700000000);", database)
         self.sql("CREATE TABLE device_reports (id VARCHAR(128) NOT NULL,uuid VARCHAR(256) NOT NULL,payload LONGTEXT NOT NULL,last_seen BIGINT NOT NULL,last_heartbeat BIGINT NOT NULL DEFAULT 0,heartbeat_payload LONGTEXT NOT NULL,PRIMARY KEY(id,uuid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; INSERT INTO device_reports VALUES ('LegacyID','LegacyUUID','{\"hostname\":\"legacy-host\"}',1700000001,1700000002,'{\"ver\":9}');", database)
+        self.sql("CREATE TABLE device_update_policies (id VARCHAR(128) NOT NULL,uuid VARCHAR(256) NOT NULL,mode VARCHAR(32) NOT NULL DEFAULT 'notify',channel VARCHAR(32) NOT NULL DEFAULT 'stable',target_version VARCHAR(32),target_build_seq BIGINT UNSIGNED,auto_install TINYINT(1) NOT NULL DEFAULT 0,policy_revision BIGINT UNSIGNED NOT NULL DEFAULT 1,updated_by BIGINT UNSIGNED,updated_at BIGINT NOT NULL,PRIMARY KEY(id,uuid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; INSERT INTO device_update_policies VALUES ('LegacyID','LegacyUUID','download','beta','1.9.0',99,1,7,NULL,1700000000);", database)
         php = (
             "require '/var/www/html/lib.php';"
             f"open_database(null,['database'=>'mysql','mysql_host'=>'{self.container}','mysql_port'=>3306,'mysql_database'=>'{database}','mysql_user'=>'rustdesk','mysql_password'=>'{self.password}']);"
         )
         command = ["docker", "exec", self.api_container, "php", "-r", php]
         subprocess.check_call(command, env={**os.environ, "HOME": "/tmp/codex-home", "DOCKER_HOST": "unix:///Users/olly/.docker/run/docker.sock"})
-        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'", database), ["9"])
+        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'", database), ["10"])
         self.assertEqual(self.sql("SELECT id,uuid,pk,JSON_EXTRACT(payload,'$.future.keep') FROM device_deployments", database), ["LegacyID\tLegacyUUID\tlegacy-pk\t1"])
         self.assertEqual(self.sql("SELECT id,uuid,JSON_UNQUOTE(JSON_EXTRACT(payload,'$.hostname')),JSON_UNQUOTE(JSON_EXTRACT(heartbeat_payload,'$.ver')) FROM device_reports", database), ["LegacyID\tLegacyUUID\tlegacy-host\t9"])
+        self.assertEqual(self.sql("SELECT mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update,policy_revision FROM device_update_policies WHERE id='LegacyID'", database), ["download\tbeta\t1.9.0\t99\t1\t0\t0\t7"])
         self.assertEqual(self.sql("SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION),GROUP_CONCAT(COLLATION_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_deployments' AND COLUMN_NAME IN ('id','uuid')", database), ["id,uuid\tutf8mb4_bin,utf8mb4_bin"])
         self.assertEqual(self.sql("SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_deployments' AND CONSTRAINT_NAME='PRIMARY'", database), ["id,uuid"])
 
@@ -215,7 +229,7 @@ class MySQLIntegrationTest(unittest.TestCase):
         return {"Authorization": "Bearer " + body["access_token"]}
 
     def test_01_public_and_custom_admin_path(self):
-        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'"), ["9"])
+        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'"), ["10"])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_reports' AND COLUMN_NAME IN ('runtime_payload','network_payload')"), ["2"])
         self.assertEqual(
             self.sql("SELECT COUNT(*),COUNT(DISTINCT TABLE_COLLATION),MIN(TABLE_COLLATION) FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()"),

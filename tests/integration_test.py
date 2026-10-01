@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -280,12 +281,14 @@ class IntegrationTest(unittest.TestCase):
         token = db.execute("SELECT access_token,expire_time FROM rustdesk_token WHERE uid=2").fetchone()
         schema_version = db.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row[1] for row in db.execute("PRAGMA table_info(device_reports)").fetchall()}
+        policy_columns = {row[1] for row in db.execute("PRAGMA table_info(device_update_policies)").fetchall()}
         db.close()
         self.assertEqual(row, ("legacy", legacy_password("legacy123"), 1700000001, 0))
         self.assertEqual(peer, (2, "legacy-id", "Old alias", "prod,blue", "legacy-hash"))
         self.assertEqual(token, ("a" * 64, 0))
-        self.assertEqual(schema_version, "9")
+        self.assertEqual(schema_version, "10")
         self.assertTrue({"runtime_payload", "network_payload"}.issubset(columns))
+        self.assertTrue({"enable_check_update", "allow_auto_update"}.issubset(policy_columns))
         auth = {"Authorization": "Bearer " + ("a" * 64)}
         _, current, _ = self.client.json("POST", "/?s=/api/currentUser", {"id": "legacy-id", "uuid": "legacy-uuid"}, auth)
         self.assertEqual(current.get("name"), "legacy")
@@ -299,6 +302,39 @@ class IntegrationTest(unittest.TestCase):
         db.execute("UPDATE app_meta SET value=? WHERE key='migrated_at'", (str(migrated),))
         db.commit()
         db.close()
+
+    def test_01b_v9_update_policy_migrates_without_losing_values(self):
+        db_path = self.temp / "policy-v9.db"
+        db = sqlite3.connect(db_path)
+        db.executescript(
+            """
+            CREATE TABLE app_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            INSERT INTO app_meta VALUES ('schema_version','9');
+            CREATE TABLE device_update_policies (
+              id TEXT NOT NULL,uuid TEXT NOT NULL,mode TEXT NOT NULL DEFAULT 'notify',
+              channel TEXT NOT NULL DEFAULT 'stable',target_version TEXT,target_build_seq INTEGER,
+              auto_install INTEGER NOT NULL DEFAULT 0,policy_revision INTEGER NOT NULL DEFAULT 1,
+              updated_by INTEGER,updated_at INTEGER NOT NULL,PRIMARY KEY(id,uuid)
+            );
+            INSERT INTO device_update_policies VALUES ('legacy-policy','legacy-policy-uuid','download','beta','1.9.0',99,1,7,NULL,1700000000);
+            """
+        )
+        db.commit()
+        db.close()
+        script = self.temp / "migrate-policy-v9.php"
+        script.write_text("<?php require $argv[1].'/lib.php'; open_database($argv[2]);", encoding="utf-8")
+        runtime = Path(self.runtime or os.environ.get("FRANKENPHP", DEFAULT_RUNTIME))
+        command = [str(runtime), "php-cli", str(script), str(SQLITE_DIR), str(db_path)] if runtime.name == "frankenphp" else [str(runtime), str(script), str(SQLITE_DIR), str(db_path)]
+        result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        db = sqlite3.connect(db_path)
+        columns = {row[1] for row in db.execute("PRAGMA table_info(device_update_policies)")}
+        policy = db.execute("SELECT mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update,policy_revision FROM device_update_policies WHERE id='legacy-policy'").fetchone()
+        version = db.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0]
+        db.close()
+        self.assertTrue({"enable_check_update", "allow_auto_update"}.issubset(columns))
+        self.assertEqual(policy, ("download", "beta", "1.9.0", 99, 1, 0, 0, 7))
+        self.assertEqual(version, "10")
 
     def test_02_rustdesk_login_current_user_and_logout_revokes_token(self):
         status, body, _ = self.client.json("POST", "/?s=/api/login", {"username": "legacy", "password": "legacy123", "id": "legacy-id", "uuid": "legacy-uuid"})
@@ -417,8 +453,23 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(stored["build_number"], "20260930.2")
         self.assertEqual(stored["source_commit"], "commit-sha")
         db.execute(
+            "UPDATE device_reports SET payload=?, runtime_payload=? WHERE id=?",
+            (
+                json.dumps({"version": "1.4.0", "hostname": "release-host", "build_number": "20260930.2", "build_seq": 2026093002, "source_commit": "commit-sha", "client_id": "RustDesk Yan", "client_uuid": device_uuid, "product": "rustdesk-yan", "edition": "custom", "channel": "stable", "platform": "windows", "arch": "x86_64", "distribution": "desktop", "install_mode": "installed", "os": "Windows", "os_version": "Windows 11"}),
+                json.dumps({"version": "1.5.0", "build_number": "20260930.2", "build_seq": 2026093002, "source_commit": "commit-sha"}),
+                device_id,
+            ),
+        )
+        db.commit()
+        db.close()
+        _, conflict, _ = self.client.json("GET", f"/?s=/ops-x9/api/devices?q={device_id}&page=1&pageSize=20")
+        conflicted = next(item for item in conflict["data"] if item["id"] == device_id)
+        self.assertEqual(conflicted["version"], "1.5.0")
+        self.assertEqual(conflicted["version_text"], "1.5.0")
+        db = sqlite3.connect(self.db)
+        db.execute(
             "UPDATE device_reports SET runtime_payload=? WHERE id=?",
-            (json.dumps({"platform": "windows", "distribution": "desktop", "install_mode": "installed", "client_arch": "x86_64", "executable_name": "rustdesk.exe"}), device_id),
+            (json.dumps({"version": "1.5.0", "platform": "windows", "distribution": "desktop", "install_mode": "installed", "client_arch": "x86_64", "executable_name": "rustdesk.exe"}), device_id),
         )
         db.commit()
         db.close()
@@ -617,13 +668,55 @@ class IntegrationTest(unittest.TestCase):
         self.client.json("POST", "/?s=/rd/update/v1/check", {"client_id": device_id, "client_uuid": uuid, "version": "1.5.0", "build_seq": 1, "channel": "stable"})
         _, initial, _ = self.client.json("GET", f"/?s=/ops-x9/api/update/policies/{device_id}?uuid={uuid}")
         self.assertEqual(initial["mode"], "notify")
-        _, saved, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "auto_install", "channel": "beta", "target_version": "1.6.0", "target_build_seq": 2026100102, "auto_install": True}, {"X-CSRF-Token": csrf})
+        self.assertFalse(initial["enable_check_update"])
+        self.assertFalse(initial["allow_auto_update"])
+        _, saved, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "auto_install", "channel": "beta", "target_version": "1.6.0", "target_build_seq": 2026100102, "auto_install": True, "enable_check_update": True, "allow_auto_update": True}, {"X-CSRF-Token": csrf})
         self.assertEqual(saved["mode"], "auto_install")
+        self.assertTrue(saved["enable_check_update"])
+        self.assertTrue(saved["allow_auto_update"])
         _, persisted, _ = self.client.json("GET", f"/?s=/ops-x9/api/update/policies/{device_id}?uuid={uuid}&channel=stable")
         self.assertEqual((persisted["mode"], persisted["channel"], persisted["target_version"], int(persisted["target_build_seq"])), ("auto_install", "beta", "1.6.0", 2026100102))
+        self.assertTrue(persisted["enable_check_update"])
+        self.assertTrue(persisted["allow_auto_update"])
         db = sqlite3.connect(self.db)
-        self.assertEqual(db.execute("SELECT mode,channel,target_version,target_build_seq,auto_install FROM device_update_policies WHERE id=? AND uuid=?", (device_id, uuid)).fetchone(), ("auto_install", "beta", "1.6.0", 2026100102, 1))
+        self.assertEqual(db.execute("SELECT mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update FROM device_update_policies WHERE id=? AND uuid=?", (device_id, uuid)).fetchone(), ("auto_install", "beta", "1.6.0", 2026100102, 1, 1, 1))
         db.close()
+        status, stream, content_type = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}", headers={"Accept": "text/event-stream"}, expected=(200,))
+        self.assertEqual(status, 200)
+        self.assertIn("text/event-stream", content_type)
+        self.assertIn("event: update-policy\n", stream)
+        self.assertIn("id: 1\n", stream)
+        event = json.loads(next(line[6:] for line in stream.splitlines() if line.startswith("data: ")))
+        self.assertEqual((event["client_id"], event["client_uuid"], event["policy_revision"]), (device_id, uuid, 1))
+        self.assertTrue(event["enable_check_update"])
+        self.assertTrue(event["allow_auto_update"])
+        _, saved_again, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "target_version": None, "target_build_seq": None, "auto_install": False, "enable_check_update": False, "allow_auto_update": False}, {"X-CSRF-Token": csrf})
+        self.assertEqual(saved_again["policy_revision"], 2)
+        _, resumed, _ = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}", headers={"Accept": "text/event-stream", "Last-Event-ID": "1"}, expected=(200,))
+        resumed_event = json.loads(next(line[6:] for line in resumed.splitlines() if line.startswith("data: ")))
+        self.assertEqual(resumed_event["policy_revision"], 2)
+        self.assertFalse(resumed_event["enable_check_update"])
+        self.assertFalse(resumed_event["allow_auto_update"])
+        def wait_for_policy():
+            request = urllib.request.Request(
+                self.url + f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}",
+                headers={"Accept": "text/event-stream", "Last-Event-ID": "2"},
+            )
+            with urllib.request.urlopen(request, timeout=6) as response:
+                return response.read().decode("utf-8", "replace")
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            waiting = pool.submit(wait_for_policy)
+            time.sleep(0.5)
+            self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "enable_check_update": True, "allow_auto_update": True}, {"X-CSRF-Token": csrf})
+            live_stream = waiting.result(timeout=5)
+        self.assertLess(time.monotonic() - started, 5)
+        live_event = json.loads(next(line[6:] for line in live_stream.splitlines() if line.startswith("data: ")))
+        self.assertEqual(live_event["policy_revision"], 3)
+        self.assertTrue(live_event["enable_check_update"])
+        self.assertTrue(live_event["allow_auto_update"])
+        self.assertEqual(self.client.request("GET", "/?s=/rd/update/v1/policy/stream", headers={"Accept": "text/event-stream"}, expected=(422,))[0], 422)
+        self.assertEqual(self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}", headers={"Accept": "text/event-stream", "Last-Event-ID": "bad"}, expected=(422,))[0], 422)
         status, error, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "target_build_seq": "not-a-number"}, {"X-CSRF-Token": csrf}, expected=(422,))
         self.assertEqual(status, 422)
         self.assertIn("build_seq", error["error"])

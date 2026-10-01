@@ -95,7 +95,11 @@
       <div id="details-body" class="details-grid"></div>
       <section class="details-section update-policy-section" aria-labelledby="update-policy-title">
         <h4 id="update-policy-title">更新策略</h4>
-        <p class="muted">仅影响当前客户端，不需要重新打包客户端。客户端下次检查更新时生效。</p>
+        <p class="muted">仅影响当前客户端，不需要重新打包客户端。保存后客户端会通过实时策略流接收变更。</p>
+        <div class="toolbar-switches">
+          <label class="check" for="enable-check-update"><input id="enable-check-update" type="checkbox">启动时检查软件更新</label>
+          <label class="check" for="allow-auto-update"><input id="allow-auto-update" type="checkbox">自动更新</label>
+        </div>
         <div class="policy-controls">
           <div class="field"><label for="update-mode">更新方式</label><select id="update-mode" class="select"><option value="notify">仅提示</option><option value="download">自动下载</option><option value="auto_install">自动安装</option><option value="disabled">关闭更新</option></select></div>
           <div class="field"><label for="update-channel">更新通道</label><select id="update-channel" class="select"><option value="stable">stable</option><option value="beta">beta</option></select></div>
@@ -235,7 +239,7 @@
       state.policyDevice = device; $('update-policy-error').textContent = ''; $('update-policy-save').disabled = true;
       try {
         const policy = await api('__ADMIN_PATH__/api/update/policies/' + encodeURIComponent(device.id) + '?uuid=' + encodeURIComponent(device.uuid) + '&channel=' + encodeURIComponent(device.channel || 'stable'));
-        $('update-mode').value = policy.mode || 'notify'; $('update-channel').value = policy.channel || 'stable'; $('update-version').value = policy.target_version || ''; $('update-build').value = policy.target_build_seq == null ? '' : String(policy.target_build_seq); updatePolicySummary();
+        $('enable-check-update').checked = Boolean(policy.enable_check_update); $('allow-auto-update').checked = Boolean(policy.allow_auto_update); $('update-mode').value = policy.mode || 'notify'; $('update-channel').value = policy.channel || 'stable'; $('update-version').value = policy.target_version || ''; $('update-build').value = policy.target_build_seq == null ? '' : String(policy.target_build_seq); updatePolicySummary();
       } catch (error) { $('update-policy-error').textContent = error.message; }
       finally { $('update-policy-save').disabled = false; }
     }
@@ -244,7 +248,7 @@
       const build = $('update-build').value.trim(); if (build && !/^\d+$/.test(build)) { $('update-policy-error').textContent = 'build_seq 必须是非负整数'; return; }
       $('update-policy-save').disabled = true; $('update-policy-error').textContent = '';
       try {
-        await api('__ADMIN_PATH__/api/update/policies/' + encodeURIComponent(device.id), { method: 'PATCH', body: JSON.stringify({ uuid: device.uuid, mode: $('update-mode').value, channel: $('update-channel').value, target_version: $('update-version').value.trim() || null, target_build_seq: build ? Number(build) : null, auto_install: $('update-mode').value === 'auto_install' }) });
+        await api('__ADMIN_PATH__/api/update/policies/' + encodeURIComponent(device.id), { method: 'PATCH', body: JSON.stringify({ uuid: device.uuid, mode: $('update-mode').value, channel: $('update-channel').value, target_version: $('update-version').value.trim() || null, target_build_seq: build ? Number(build) : null, auto_install: $('update-mode').value === 'auto_install', enable_check_update: $('enable-check-update').checked, allow_auto_update: $('allow-auto-update').checked }) });
         await loadUpdatePolicy(device); setFeedback('客户端更新策略已保存', 'success');
       } catch (error) { $('update-policy-error').textContent = error.message; }
       finally { $('update-policy-save').disabled = false; }
@@ -254,7 +258,7 @@
       $('details-device').textContent = [device.alias || device.hostname || device.id, device.id].filter(Boolean).join(' · ');
       const privateIps = Array.isArray(device.private_ips) ? device.private_ips.join('、') : device.private_ips;
       const groups = [
-        ['发行身份', [['客户端身份', device.client_id], ['客户端 UUID', device.client_uuid || device.uuid], ['产品', device.product], ['版本类型', device.edition], ['版本', device.version_text || device.version], ['构建号', device.build_number], ['构建序号', device.build_seq], ['渠道', device.channel], ['平台', platformLabel(device.platform)], ['架构', device.arch || device.client_arch], ['发行形态', distributionLabel(device.distribution)], ['安装模式', installModeLabel(device.install_mode)], ['源码提交', device.source_commit]]],
+        ['发行身份', [['客户端身份', device.client_id], ['客户端 UUID', device.client_uuid || device.uuid], ['产品', device.product], ['版本类型', device.edition], ['版本', device.version || device.version_text], ['构建号', device.build_number], ['构建序号', device.build_seq], ['渠道', device.channel], ['平台', platformLabel(device.platform)], ['架构', device.arch || device.client_arch], ['发行形态', distributionLabel(device.distribution)], ['安装模式', installModeLabel(device.install_mode)], ['源码提交', device.source_commit]]],
         ['机器', [['主机名', device.hostname], ['系统用户', device.username], ['设备 ID', device.id], ['UUID', device.uuid], ['操作系统', device.os], ['系统版本', device.os_version], ['CPU', device.cpu], ['内存', device.memory]]],
         ['网络', [['公网 IP', device.public_ip], ['地区', geoLabel(device.geo)], ['时区', device.geo?.timezone], ['内网 IP', privateIps]]],
         ['运行与升级', [['当前状态', labels[presence(device)]], ['最后心跳', device.last_heartbeat ? new Date(Number(device.last_heartbeat) * 1000).toLocaleString() : ''], ['最近活动', device.last_seen ? new Date(Number(device.last_seen) * 1000).toLocaleString() : ''], ['当前连接数', Array.isArray(device.heartbeat_payload?.conns) ? device.heartbeat_payload.conns.length : ''], ['通讯录用户', Array.isArray(device.address_book_user_ids) && device.address_book_user_ids.length ? device.address_book_user_ids.join(', ') : '无'], ['最近检查', device.last_update_check], ['检查状态', device.last_update_status], ['错误信息', device.last_update_error], ['更新来源', device.last_update_source]]],

@@ -39,8 +39,8 @@ function report_runtime_payload(array $data): array
     $runtime = [];
     if ((!isset($data['client_arch']) || $data['client_arch'] === '') && isset($data['arch']) && is_string($data['arch'])) $data['client_arch'] = $data['arch'];
     $allowed = ['distribution' => ['desktop','mobile','sos','installed','portable','msi','appimage','linux_package','unknown'], 'install_mode' => ['installed','portable','live','unknown']];
-    $preserve = ['client_id','client_uuid','product','edition','build_number','source_commit','channel','platform','client_arch','executable_name','os_version'];
-    foreach (['platform', 'distribution', 'install_mode', 'client_arch', 'executable_name', 'product', 'edition', 'build_number', 'build_seq', 'source_commit', 'channel', 'client_id', 'client_uuid', 'os_version', 'last_update_check', 'last_update_status', 'last_update_error', 'last_update_source'] as $key) {
+    $preserve = ['client_id','client_uuid','product','edition','version','build_number','source_commit','channel','platform','client_arch','executable_name','os_version'];
+    foreach (['platform', 'distribution', 'install_mode', 'client_arch', 'executable_name', 'product', 'edition', 'version', 'build_number', 'build_seq', 'source_commit', 'channel', 'client_id', 'client_uuid', 'os_version', 'last_update_check', 'last_update_status', 'last_update_error', 'last_update_source'] as $key) {
         if ($key === 'build_seq' && array_key_exists($key, $data) && is_numeric($data[$key])) { $runtime[$key] = (int)$data[$key]; continue; }
         if (array_key_exists($key, $data) && is_string($data[$key]) && strlen($data[$key]) <= 256) {
             $value = trim($data[$key]);
@@ -53,7 +53,7 @@ function report_runtime_payload(array $data): array
 function release_identity(array $report, array $runtime): array
 {
     $pick = static function (array $keys) use ($report, $runtime) {
-        foreach ([$report, $runtime] as $source) foreach ($keys as $key) {
+        foreach ([$runtime, $report] as $source) foreach ($keys as $key) {
             if (!array_key_exists($key, $source)) continue;
             $value = $source[$key];
             if ($value === null || $value === '' || $value === []) continue;
@@ -475,7 +475,15 @@ function public_update_manifest(PDO $db, string $channel, ?string $targetVersion
 }
 function update_policy(PDO $db, string $id, string $uuid, string $channel): array
 {
-    return db_one($db, 'SELECT * FROM device_update_policies WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]) ?: ['id'=>$id,'uuid'=>$uuid,'mode'=>'notify','channel'=>$channel,'target_version'=>null,'target_build_seq'=>null,'auto_install'=>0,'policy_revision'=>0];
+    $policy = db_one($db, 'SELECT * FROM device_update_policies WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid])
+        ?: ['id'=>$id,'uuid'=>$uuid,'mode'=>'notify','channel'=>$channel,'target_version'=>null,'target_build_seq'=>null,'auto_install'=>0,'enable_check_update'=>0,'allow_auto_update'=>0,'policy_revision'=>0,'updated_at'=>0];
+    $policy['auto_install'] = (bool)($policy['auto_install'] ?? false);
+    $policy['enable_check_update'] = (bool)($policy['enable_check_update'] ?? false);
+    $policy['allow_auto_update'] = (bool)($policy['allow_auto_update'] ?? false);
+    $policy['policy_revision'] = (int)($policy['policy_revision'] ?? 0);
+    $policy['updated_at'] = (int)($policy['updated_at'] ?? 0);
+    if (isset($policy['target_build_seq'])) $policy['target_build_seq'] = (int)$policy['target_build_seq'];
+    return $policy;
 }
 function resolve_update_identity(PDO $db, string $id, string $uuid): array
 {
@@ -493,7 +501,7 @@ function update_check_response(PDO $db, array $data): array
     [$id, $uuid] = resolve_update_identity($db, $id, $uuid);
     $version = text_field($data, 'version', 32, '0.0.0'); $build = (int)($data['build_seq'] ?? 0); $channel = text_field($data, 'channel', 32, 'stable'); $policy = update_policy($db, $id, $uuid, $channel); $channel = (string)($policy['channel'] ?: $channel);
     $manifest = public_update_manifest($db, $channel, $policy['target_version'] ?? null, isset($policy['target_build_seq']) ? (int)$policy['target_build_seq'] : null, $data); $mode = update_mode((string)$policy['mode']);
-    $base = rtrim((string)(getenv('RUSTDESK_UPDATE_BASE_URL') ?: ''), '/'); $empty = ['update_available'=>false,'mode'=>$mode,'auto_install'=>(bool)$policy['auto_install'],'channel'=>$channel,'current_version'=>$version,'current_build_seq'=>$build,'policy_revision'=>(int)$policy['policy_revision']];
+    $base = rtrim((string)(getenv('RUSTDESK_UPDATE_BASE_URL') ?: ''), '/'); $empty = ['update_available'=>false,'mode'=>$mode,'auto_install'=>(bool)$policy['auto_install'],'enable_check_update'=>(bool)$policy['enable_check_update'],'allow_auto_update'=>(bool)$policy['allow_auto_update'],'channel'=>$channel,'current_version'=>$version,'current_build_seq'=>$build,'policy_revision'=>(int)$policy['policy_revision']];
     if (!$manifest) return $empty;
     foreach (['product','edition'] as $field) if (isset($manifest[$field]) && text_field($data, $field, 64) !== (string)$manifest[$field]
         && !($field === 'edition' && (string)$manifest[$field] === 'multi')) return $empty;
@@ -501,6 +509,51 @@ function update_check_response(PDO $db, array $data): array
     $url = '';
     foreach (update_target_candidates($data) as $key) if (isset($manifest['targets'][$key]['primary'])) { $url=(string)$manifest['targets'][$key]['primary']; break; }
     return array_merge($empty, ['update_available'=>true,'target_version'=>$targetVersion,'target_build_seq'=>$targetBuild,'url'=>$url,'manifest_url'=>$base.'/rd/update/v1/manifest/'.rawurlencode($channel).'.json','manifest'=>$manifest]);
+}
+function update_policy_stream(PDO $db): never
+{
+    $id = text_field($_GET, 'client_id', 128, text_field($_GET, 'id', 128));
+    $uuid = text_field($_GET, 'client_uuid', 256, text_field($_GET, 'uuid', 256));
+    if ($id === '' || $uuid === '') fail(422, '缺少客户端 ID 或 UUID');
+    [$id, $uuid] = resolve_update_identity($db, $id, $uuid);
+    $lastEventId = trim((string)($_SERVER['HTTP_LAST_EVENT_ID'] ?? ($_GET['after_revision'] ?? '')));
+    if ($lastEventId !== '' && !ctype_digit($lastEventId)) fail(422, 'Last-Event-ID 必须是非负整数');
+    $afterRevision = $lastEventId === '' ? -1 : (int)$lastEventId;
+    $channel = text_field($_GET, 'channel', 32, 'stable');
+    if (!in_array($channel, ['stable','beta'], true)) fail(422, '更新通道无效');
+
+    header('Content-Type: text/event-stream; charset=utf-8');
+    header('Cache-Control: no-cache');
+    header('X-Accel-Buffering: no');
+    echo "retry: 1000\n\n";
+    @ob_flush(); flush();
+    $deadline = microtime(true) + 15.0;
+    $nextHeartbeat = microtime(true) + 2.0;
+    do {
+        $policy = update_policy($db, $id, $uuid, $channel);
+        if ((int)$policy['policy_revision'] > $afterRevision) {
+            $payload = [
+                'client_id'=>$id,'client_uuid'=>$uuid,'policy_revision'=>(int)$policy['policy_revision'],
+                'enable_check_update'=>(bool)$policy['enable_check_update'],'allow_auto_update'=>(bool)$policy['allow_auto_update'],
+                'mode'=>(string)$policy['mode'],'channel'=>(string)$policy['channel'],
+                'target_version'=>$policy['target_version'] ?? null,'target_build_seq'=>$policy['target_build_seq'] ?? null,
+                'updated_at'=>(int)$policy['updated_at'],
+            ];
+            echo 'id: '.$policy['policy_revision']."\n";
+            echo "event: update-policy\n";
+            echo 'data: '.json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n\n";
+            @ob_flush(); flush();
+            exit;
+        }
+        if (microtime(true) >= $nextHeartbeat) {
+            echo ": heartbeat\n\n";
+            @ob_flush(); flush();
+            $nextHeartbeat = microtime(true) + 2.0;
+        }
+        if (connection_aborted()) exit;
+        usleep(250000);
+    } while (microtime(true) < $deadline);
+    exit;
 }
 function publish_token_auth(): void
 {
@@ -1099,7 +1152,7 @@ function enrich_admin_address_book_peer(PDO $db, array $peer): array
         'username'=>(string)($report['username'] ?? $deploy['device_username'] ?? $peer['username'] ?? ''),
         'platform'=>$release['platform'] !== '' ? $release['platform'] : (string)($report['platform'] ?? $report['os'] ?? $peer['platform'] ?? ''),
         'os'=>(string)($report['os'] ?? ''), 'os_version'=>(string)($release['os_version'] ?? $report['os_version'] ?? ''),
-        'version'=>$release['version'] !== '' ? $release['version'] : (string)($report['version'] ?? ''), 'version_text'=>(string)($report['version'] ?? ''),
+        'version'=>$release['version'] !== '' ? $release['version'] : (string)($report['version'] ?? ''), 'version_text'=>$release['version'],
         'distribution'=>$release['distribution'] !== '' ? $release['distribution'] : (string)($deploy['distribution'] ?? ''),
         'install_mode'=>$release['install_mode'] !== '' ? $release['install_mode'] : (string)($deploy['install_mode'] ?? ''),
         'build_number'=>(string)($release['build_number'] ?? ''), 'build_seq'=>(int)($release['build_seq'] ?? 0), 'channel'=>(string)($release['channel'] ?? ''), 'arch'=>(string)($release['arch'] ?? ''),
@@ -1174,6 +1227,7 @@ try {
     if (preg_match('#^/rd/update/v1/manifest/([A-Za-z0-9._~-]+)\.json$#', $path, $match)) {
         method('GET'); $manifest=public_update_manifest($db,$match[1]); if(!$manifest)fail(404,'更新清单不存在'); header('Cache-Control: public, max-age=60'); reply($manifest);
     }
+    if ($path === '/rd/update/v1/policy/stream') { method('GET'); update_policy_stream($db); }
     if ($path === '/rd/update/v1/check') { method('POST'); reply(update_check_response($db,json_body())); }
     if ($path === '/rd/update/v1/publish') { method('POST'); publish_token_auth(); reply(publish_update_manifest($db,json_body()),201); }
     if ($path === '/rd/update/v1/events') { method('POST'); record_update_event($db,json_body()); reply(['ok'=>true],201); }
@@ -1219,11 +1273,14 @@ try {
             $channel=text_field($_GET,'channel',32,'stable'); if(!in_array($channel,['stable','beta'],true))fail(422,'更新通道无效');
             reply(update_policy($db,$id,$uuid,$channel));
         }
-        method('PATCH'); csrf_check(); $d=json_body(); $uuid=text_field($d,'uuid',256); if($id===''||$uuid==='')fail(422,'设备 ID 和 UUID 不能为空'); $mode=update_mode(text_field($d,'mode',32,'notify')); $channel=text_field($d,'channel',32,'stable'); $existing=db_one($db,'SELECT policy_revision FROM device_update_policies WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]); $revision=((int)($existing['policy_revision']??0))+1;
+        method('PATCH'); csrf_check(); $d=json_body(); $uuid=text_field($d,'uuid',256); if($id===''||$uuid==='')fail(422,'设备 ID 和 UUID 不能为空'); $mode=update_mode(text_field($d,'mode',32,'notify')); $channel=text_field($d,'channel',32,'stable'); $existing=db_one($db,'SELECT * FROM device_update_policies WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]); $revision=((int)($existing['policy_revision']??0))+1;
         if(!in_array($channel,['stable','beta'],true))fail(422,'更新通道无效');
         if(array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null){ $build=$d['target_build_seq']; $valid=(is_int($build)&&$build>=0)||(is_string($build)&&ctype_digit($build)); if(!$valid)fail(422,'build_seq 必须是非负整数'); }
         if(array_key_exists('auto_install',$d)&&!is_bool($d['auto_install'])&&!in_array($d['auto_install'],[0,1,'0','1'],true))fail(422,'auto_install 必须是布尔值');
-        db_upsert($db,'device_update_policies',['id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'target_version'=>array_key_exists('target_version',$d)?text_field($d,'target_version',32):null,'target_build_seq'=>array_key_exists('target_build_seq',$d)?(int)$d['target_build_seq']:null,'auto_install'=>(int)($d['auto_install']??false),'policy_revision'=>$revision,'updated_by'=>(int)$actor['id'],'updated_at'=>time()],['id','uuid'],['mode','channel','target_version','target_build_seq','auto_install','policy_revision','updated_by','updated_at']); admin_event($db,(int)$actor['id'],'update_device_policy',0); reply(['ok'=>true,'id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'policy_revision'=>$revision]);
+        foreach(['enable_check_update','allow_auto_update'] as $field)if(array_key_exists($field,$d)&&!is_bool($d[$field])&&!in_array($d[$field],[0,1,'0','1'],true))fail(422,"$field 必须是布尔值");
+        $enableCheckUpdate=(int)(array_key_exists('enable_check_update',$d)?$d['enable_check_update']:($existing['enable_check_update']??false));
+        $allowAutoUpdate=(int)(array_key_exists('allow_auto_update',$d)?$d['allow_auto_update']:($existing['allow_auto_update']??false));
+        db_upsert($db,'device_update_policies',['id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'target_version'=>array_key_exists('target_version',$d)?text_field($d,'target_version',32):null,'target_build_seq'=>array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null?(int)$d['target_build_seq']:null,'auto_install'=>(int)($d['auto_install']??false),'enable_check_update'=>$enableCheckUpdate,'allow_auto_update'=>$allowAutoUpdate,'policy_revision'=>$revision,'updated_by'=>(int)$actor['id'],'updated_at'=>time()],['id','uuid'],['mode','channel','target_version','target_build_seq','auto_install','enable_check_update','allow_auto_update','policy_revision','updated_by','updated_at']); admin_event($db,(int)$actor['id'],'update_device_policy',0); reply(['ok'=>true]+update_policy($db,$id,$uuid,$channel));
     }
     if ($adminApi && preg_match('#^/admin/api/update/events(?:/([^/]+))?$#',$path,$match)) { admin_user($db); $id=isset($match[1])?rawurldecode($match[1]):''; $where=$id?' WHERE device_id=:id':''; reply(['data'=>db_all($db,'SELECT * FROM device_update_events'.$where.' ORDER BY started_at DESC LIMIT 200',$id?['id'=>$id]:[])]); }
     if ($adminApi && preg_match('#^/admin/api/users(?:/([1-9][0-9]*))?$#', $path, $match)) {
@@ -1604,7 +1661,7 @@ try {
                     'last_update_check'=>$runtime['last_update_check']??'','last_update_status'=>$runtime['last_update_status']??'','last_update_error'=>$runtime['last_update_error']??'','last_update_source'=>$runtime['last_update_source']??'',
                     'distribution'=>$release['distribution'],'install_mode'=>$release['install_mode'],'client_arch'=>$release['arch'],'executable_name'=>$runtime['executable_name']??($report['executable_name']??''),
                     'public_ip'=>$publicIp,'private_ips'=>$network['private_ips']??[],'geo'=>$publicGeo,
-                    'version_text'=>$report['version']??'','heartbeat_version'=>decoded_payload($reportRow['heartbeat_payload']??null)['ver']??null,
+                    'version_text'=>$release['version'],'heartbeat_version'=>decoded_payload($reportRow['heartbeat_payload']??null)['ver']??null,
                     'heartbeat_payload'=>decoded_payload($reportRow['heartbeat_payload']??null),
                     'runtime_payload'=>$runtime,'network_payload'=>$network,
                     'last_seen'=>(int)$reportRow['last_seen'],'last_heartbeat'=>$lastHeartbeat,

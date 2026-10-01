@@ -413,6 +413,10 @@ test('client details edits a per-device update policy and persists after reload'
   const dialog = page.locator('#details-dialog');
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText('更新策略', { exact: true })).toBeVisible();
+  await expect(dialog.locator('#enable-check-update')).not.toBeChecked();
+  await expect(dialog.locator('#allow-auto-update')).not.toBeChecked();
+  await dialog.locator('#enable-check-update').check();
+  await dialog.locator('#allow-auto-update').check();
   await dialog.locator('#update-mode').selectOption('disabled');
   await dialog.locator('#update-channel').selectOption('beta');
   await dialog.locator('#update-version').fill('1.6.0');
@@ -425,6 +429,8 @@ test('client details edits a per-device update policy and persists after reload'
   await expect(dialog.locator('#update-channel')).toHaveValue('beta');
   await expect(dialog.locator('#update-version')).toHaveValue('1.6.0');
   await expect(dialog.locator('#update-build')).toHaveValue('2026100102');
+  await expect(dialog.locator('#enable-check-update')).toBeChecked();
+  await expect(dialog.locator('#allow-auto-update')).toBeChecked();
   await dialog.locator('#update-build').fill('bad');
   await dialog.getByRole('button', { name: '保存更新策略' }).click();
   await expect(dialog.locator('#update-policy-error')).toContainText('build_seq');
