@@ -498,6 +498,40 @@ class IntegrationTest(unittest.TestCase):
         _, heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {"id": "anonymous", "uuid": str(uuid.uuid4()), "conns": []})
         self.assertIsInstance(heartbeat, dict)
 
+    def test_05a_sqlite_login_waits_for_writer_and_uses_wal(self):
+        lock = sqlite3.connect(self.db, timeout=0)
+        self.assertEqual(lock.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+        lock.execute("BEGIN IMMEDIATE")
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                login = pool.submit(
+                    self.client.json,
+                    "POST",
+                    "/?s=/api/login",
+                    {
+                        "username": "admin",
+                        "password": "admin123",
+                        "id": "locked-login-device",
+                        "uuid": "locked-login-uuid",
+                    },
+                )
+                time.sleep(5.5)
+                lock.commit()
+                status, body, _ = login.result(timeout=12)
+        finally:
+            if lock.in_transaction:
+                lock.rollback()
+            lock.close()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["type"], "access_token")
+        db = sqlite3.connect(self.db)
+        token = db.execute(
+            "SELECT username,id,uuid FROM rustdesk_token WHERE access_token=?",
+            (body["access_token"],),
+        ).fetchone()
+        db.close()
+        self.assertEqual(token, ("admin", "locked-login-device", "locked-login-uuid"))
+
     def test_client_release_identity_is_visible_from_sysinfo_and_update_check(self):
         device_id = "release-" + uuid.uuid4().hex[:8]
         device_uuid = device_id + "-uuid"

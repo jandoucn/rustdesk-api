@@ -90,12 +90,21 @@ function database_path(?string $path=null): string {
 function configure_pdo(PDO $db): void {
     $db->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION); $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE,PDO::FETCH_ASSOC); $db->setAttribute(PDO::ATTR_EMULATE_PREPARES,$db->getAttribute(PDO::ATTR_DRIVER_NAME)==='mysql');
 }
+function sqlite_busy_error(Throwable $error): bool {
+    if(!$error instanceof PDOException)return false;
+    $code=(int)($error->errorInfo[1]??0);
+    return in_array($code,[5,6],true)||str_contains(strtolower($error->getMessage()),'database is locked')||str_contains(strtolower($error->getMessage()),'database table is locked');
+}
+function sqlite_retry_delay(int $attempt): void {usleep(min(400000,25000*(2**$attempt)));}
 function open_database(?string $path=null,?array $settings=null): PDO {
     $settings??=installation_config();
     if(isset($settings['database']))$GLOBALS['database_driver_override']=$settings['database'];
     if(database_driver($settings)==='sqlite'){
         $path=database_path($path??($settings['sqlite_path']??null)); $dir=dirname($path); if(!is_dir($dir)&&!mkdir($dir,0770,true)&&!is_dir($dir))throw new RuntimeException("cannot create database directory: $dir");
-        $db=new PDO('sqlite:'.$path); configure_pdo($db); $db->exec('PRAGMA foreign_keys=ON'); $db->exec('PRAGMA busy_timeout=5000'); @chmod($path,0600); migrate_database($db,$dir); return $db;
+        $db=new PDO('sqlite:'.$path); configure_pdo($db); $db->exec('PRAGMA busy_timeout=15000');
+        $mode=strtolower((string)$db->query('PRAGMA journal_mode')->fetchColumn());
+        for($attempt=0;$mode!=='wal';$attempt++){try{$mode=strtolower((string)$db->query('PRAGMA journal_mode=WAL')->fetchColumn());if($mode!=='wal')throw new RuntimeException("cannot enable SQLite WAL mode: $mode");}catch(Throwable $error){if($attempt>=4||!sqlite_busy_error($error))throw $error;sqlite_retry_delay($attempt);}}
+        $db->exec('PRAGMA synchronous=NORMAL');$db->exec('PRAGMA foreign_keys=ON');@chmod($path,0600);migrate_database($db,$dir);return $db;
     }
     $host=$settings['mysql_host']??(getenv('RUSTDESK_DB_HOST')?:'mysql'); $port=(int)($settings['mysql_port']??(getenv('RUSTDESK_DB_PORT')?:3306)); $name=$settings['mysql_database']??(getenv('RUSTDESK_DB_NAME')?:'rustdesk');
     if(!preg_match('/^[A-Za-z0-9_]+$/',$name))throw new RuntimeException('Invalid MySQL database name');
@@ -108,12 +117,26 @@ function open_database(?string $path=null,?array $settings=null): PDO {
     return $db;
 }
 function db_query(PDO $db,string $sql,array $params=[]): PDOStatement {
-    $s=$db->prepare($sql); foreach($params as $k=>$v){$n=is_int($k)?$k+1:':'.ltrim((string)$k,':');$t=is_int($v)?PDO::PARAM_INT:($v===null?PDO::PARAM_NULL:PDO::PARAM_STR);$s->bindValue($n,$v,$t);} $s->execute(); return $s;
+    for($attempt=0;;$attempt++){try{$s=$db->prepare($sql);foreach($params as $k=>$v){$n=is_int($k)?$k+1:':'.ltrim((string)$k,':');$t=is_int($v)?PDO::PARAM_INT:($v===null?PDO::PARAM_NULL:PDO::PARAM_STR);$s->bindValue($n,$v,$t);}$s->execute();return $s;}catch(Throwable $error){if($db->getAttribute(PDO::ATTR_DRIVER_NAME)!=='sqlite'||$attempt>=3||!sqlite_busy_error($error))throw $error;sqlite_retry_delay($attempt);}}
 }
 function db_one(PDO $db,string $sql,array $params=[]): ?array {$r=db_query($db,$sql,$params)->fetch();return $r===false?null:$r;}
 function db_all(PDO $db,string $sql,array $params=[]): array {return db_query($db,$sql,$params)->fetchAll();}
 function db_exec(PDO $db,string $sql,array $params=[]): void {db_query($db,$sql,$params);}
-function txn(PDO $db,callable $cb): mixed {$db->beginTransaction();try{$r=$cb($db);$db->commit();return $r;}catch(Throwable $e){if($db->inTransaction())$db->rollBack();throw $e;}}
+function txn(PDO $db,callable $cb): mixed {
+    $sqlite=$db->getAttribute(PDO::ATTR_DRIVER_NAME)==='sqlite';
+    for($attempt=0;;$attempt++){
+        try{
+            if($sqlite)$db->exec('BEGIN IMMEDIATE');else$db->beginTransaction();
+            $result=$cb($db);
+            if($sqlite)$db->exec('COMMIT');else$db->commit();
+            return $result;
+        }catch(Throwable $error){
+            try{if($db->inTransaction()){if($sqlite)$db->exec('ROLLBACK');else$db->rollBack();}}catch(Throwable){}
+            if(!$sqlite||$attempt>=3||!sqlite_busy_error($error))throw $error;
+            sqlite_retry_delay($attempt);
+        }
+    }
+}
 function has_administrator(PDO $db): bool
 {
     return (int)(db_one($db,'SELECT COUNT(*) AS n FROM rustdesk_users WHERE is_admin=1 AND enabled=1 AND delete_time=0')['n']??0)>0;
