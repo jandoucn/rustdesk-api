@@ -561,6 +561,33 @@ test('desktop release renders as installed and keeps UUID out of the inventory r
   await expect(row).not.toContainText('UUID');
 });
 
+test('device row sends one-shot check and install commands and shows command status', async ({ page, request }) => {
+  const deviceId = `update-command-${Date.now().toString(36)}`;
+  const uuid = `${deviceId}-uuid`;
+  await reportClient(request, deviceId);
+  await loginAdmin(page);
+  const buildSeq = Date.now();
+  await page.evaluate(async ({ adminPath, buildSeq }) => {
+    const session = await (await fetch(`${adminPath}/api/session`)).json();
+    const asset = { primary: `https://download.yan.life/rustdesk/stable/e2e-${buildSeq}/rustdesk.exe`, mirrors: [], size: 12, sha256: 'a'.repeat(64), signature: btoa('s'.repeat(64)), signature_key_id: 'yan-release-2026' };
+    const response = await fetch(`${adminPath}/api/update/releases`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': session.csrf }, body: JSON.stringify({ version: '9.9.9', build_seq: buildSeq, channel: 'stable', manifest: { product: 'rustdesk-yan', edition: 'custom', source_commit: 'e2e-update-command', targets: { 'windows-x86_64-exe-custom': asset } } }) });
+    if (!response.ok) throw new Error(await response.text());
+  }, { adminPath, buildSeq });
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
+  await page.getByRole('button', { name: '搜索' }).click();
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  await row.getByRole('button', { name: '立即检查更新' }).click();
+  await expect(page.locator('#status')).toContainText('检查命令已发送');
+  await row.getByRole('button', { name: '立即安装更新' }).click();
+  await expect(page.locator('#status')).toContainText('安装命令已发送');
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  await expect(page.locator('#details-dialog')).toContainText('最近更新命令');
+  await expect(page.locator('#details-dialog')).toContainText('等待客户端接收');
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+});
+
 test('inventory backfills GeoLite region and timezone for a stored public IP', async ({ page, request }) => {
   test.skip(!process.env.RUSTDESK_API_CONTAINER, 'requires the real MMDB in the API container');
   const deviceId = `geo-backfill-${Date.now().toString(36)}`;

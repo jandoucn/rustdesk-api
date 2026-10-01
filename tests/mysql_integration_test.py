@@ -8,7 +8,7 @@ import subprocess
 import time
 import unittest
 
-from tests.integration_test import HttpClient
+from tests.integration_test import HttpClient, device_auth_headers, device_public_key
 
 
 class MySQLIntegrationTest(unittest.TestCase):
@@ -127,6 +127,27 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.assertEqual(event["policy_revision"], 1)
         self.assertTrue(event["enable_check_update"])
         self.assertTrue(event["allow_auto_update"])
+
+    def test_21a_one_shot_update_command_round_trip_and_sql(self):
+        csrf = self.admin_login()
+        suffix = str(time.time_ns())
+        device_id, uuid_value = "mysql-command-" + suffix, "mysql-command-uuid-" + suffix
+        self.client.json("POST", "/api/heartbeat", {"id": device_id, "uuid": uuid_value, "conns": []})
+        public_key = device_public_key()
+        self.sql(f"INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES('{device_id}','{uuid_value}','{public_key}',1,'{{}}',UNIX_TIMESTAMP())")
+        self.sql("INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES('1.7.0',2026100107,'stable','{}',UNIX_TIMESTAMP(),1) ON DUPLICATE KEY UPDATE active=1")
+        endpoint = f"/ops-x9/api/update/commands/{device_id}"
+        _, created, _ = self.client.json("POST", endpoint, {"uuid": uuid_value, "action": "check", "target_version": "1.7.0", "target_build_seq": 2026100107}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertEqual(self.sql(f"SELECT device_id,uuid,action,status,target_version,target_build_seq FROM device_update_commands WHERE command_id='{created['command_id']}'"), [f"{device_id}\t{uuid_value}\tcheck\tpending\t1.7.0\t2026100107"])
+        _, stream, _ = self.client.request("GET", f"/rd/update/v1/policy/stream?client_id=RustDesk%20Yan&client_uuid={uuid_value}&after_revision=0", headers={"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, uuid_value)}, expected=(200,))
+        self.assertIn("event: update-command\n", stream)
+        self.assertIn(created["command_id"], stream)
+        self.assertIn(f"id: {created['command_id']}\n", stream)
+        report = {"client_id": "RustDesk Yan", "client_uuid": uuid_value, "command_id": created["command_id"], "command_action": "check", "status": "completed", "finished_at": int(time.time())}
+        self.client.json("POST", "/rd/update/v1/events", report, {"Content-Type": "application/json", **device_auth_headers("POST", "/rd/update/v1/events", device_id, uuid_value, report, created["command_id"])}, expected=(201,))
+        self.client.json("POST", "/rd/update/v1/events", report, {"Content-Type": "application/json", **device_auth_headers("POST", "/rd/update/v1/events", device_id, uuid_value, report, created["command_id"])}, expected=(201,))
+        self.assertEqual(self.sql(f"SELECT status FROM device_update_commands WHERE command_id='{created['command_id']}'"), ["completed"])
+        self.assertEqual(self.sql(f"SELECT COUNT(*) FROM device_update_events WHERE command_id='{created['command_id']}' AND status='completed'"), ["1"])
     @classmethod
     def setUpClass(cls):
         cls.client = HttpClient(os.environ.get("RUSTDESK_TEST_URL", "http://127.0.0.1:17000"))
@@ -167,7 +188,7 @@ class MySQLIntegrationTest(unittest.TestCase):
         )
         command = ["docker", "exec", self.api_container, "php", "-r", php]
         subprocess.check_call(command, env={**os.environ, "HOME": "/tmp/codex-home", "DOCKER_HOST": "unix:///Users/olly/.docker/run/docker.sock"})
-        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'", database), ["10"])
+        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'", database), ["12"])
         self.assertEqual(self.sql("SELECT id,uuid,pk,JSON_EXTRACT(payload,'$.future.keep') FROM device_deployments", database), ["LegacyID\tLegacyUUID\tlegacy-pk\t1"])
         self.assertEqual(self.sql("SELECT id,uuid,JSON_UNQUOTE(JSON_EXTRACT(payload,'$.hostname')),JSON_UNQUOTE(JSON_EXTRACT(heartbeat_payload,'$.ver')) FROM device_reports", database), ["LegacyID\tLegacyUUID\tlegacy-host\t9"])
         self.assertEqual(self.sql("SELECT mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update,policy_revision FROM device_update_policies WHERE id='LegacyID'", database), ["download\tbeta\t1.9.0\t99\t1\t0\t0\t7"])
@@ -229,11 +250,11 @@ class MySQLIntegrationTest(unittest.TestCase):
         return {"Authorization": "Bearer " + body["access_token"]}
 
     def test_01_public_and_custom_admin_path(self):
-        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'"), ["10"])
+        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'"), ["12"])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_reports' AND COLUMN_NAME IN ('runtime_payload','network_payload')"), ["2"])
         self.assertEqual(
             self.sql("SELECT COUNT(*),COUNT(DISTINCT TABLE_COLLATION),MIN(TABLE_COLLATION) FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()"),
-            ["21\t1\tutf8mb4_unicode_ci"],
+            ["23\t1\tutf8mb4_unicode_ci"],
         )
         for path in ("/", "/admin", "/unknown-page"):
             status, body, ctype = self.client.request("GET", path, expected=(200,))

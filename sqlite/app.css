@@ -205,7 +205,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .status-badge.online { border-color: #b9ddca; background: var(--success-soft); color: #176d47; }
 .status-badge.recent { border-color: #efd49f; background: var(--warning-soft); color: #89520d; }
 .status-badge.unreported { border-style: dashed; background: #fff; }
-.row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.row-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
 .empty-state { padding: 42px 20px; text-align: center; }
 .empty-state strong { display: block; margin-bottom: 5px; font-size: 15px; }
 .empty-state p { margin-bottom: 0; color: var(--muted); }

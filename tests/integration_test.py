@@ -32,6 +32,45 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SQLITE_DIR = ROOT / "sqlite"
 DEFAULT_RUNTIME = "/tmp/rustdesk-local-runtime/frankenphp"
+DEVICE_AUTH_SEED_HEX = "11" * 32
+
+
+def php_sodium(expression: str, env: dict[str, str] | None = None) -> str:
+    runtime = Path(os.environ.get("FRANKENPHP", DEFAULT_RUNTIME))
+    command = [str(runtime), "php-cli", "-r", expression] if runtime.name == "frankenphp" else [str(runtime), "-r", expression]
+    return subprocess.check_output(command, cwd=ROOT, env={**os.environ, **(env or {})}, text=True).strip()
+
+
+def device_public_key() -> str:
+    return php_sodium(
+        '$kp=sodium_crypto_sign_seed_keypair(hex2bin(getenv("SEED")));'
+        'echo base64_encode(sodium_crypto_sign_publickey($kp));',
+        {"SEED": DEVICE_AUTH_SEED_HEX},
+    )
+
+
+def device_auth_headers(method: str, canonical_path: str, client_id: str, client_uuid: str, payload=None, command_id: str = "", nonce: str | None = None, timestamp: int | None = None) -> dict[str, str]:
+    body = b"" if payload is None else json.dumps(payload).encode()
+    timestamp = int(time.time()) if timestamp is None else timestamp
+    nonce = nonce or uuid.uuid4().hex
+    public_key = device_public_key()
+    canonical = (
+        "rustdesk-update-auth-v1\n"
+        f"method={method.upper()}\npath={canonical_path}\nclient_id={client_id}\nclient_uuid={client_uuid}\n"
+        f"timestamp={timestamp}\nnonce={nonce}\ncommand_id={command_id}\nbody_sha256={hashlib.sha256(body).hexdigest()}\n"
+    )
+    signature = php_sodium(
+        '$kp=sodium_crypto_sign_seed_keypair(hex2bin(getenv("SEED")));'
+        'echo base64_encode(sodium_crypto_sign_detached(getenv("MESSAGE"),sodium_crypto_sign_secretkey($kp)));',
+        {"SEED": DEVICE_AUTH_SEED_HEX, "MESSAGE": canonical},
+    )
+    return {
+        "X-RustDesk-Device-ID": client_id,
+        "X-RustDesk-Device-Public-Key": public_key,
+        "X-RustDesk-Device-Timestamp": str(timestamp),
+        "X-RustDesk-Device-Nonce": nonce,
+        "X-RustDesk-Device-Signature": signature,
+    }
 
 
 def legacy_password(password: str) -> str:
@@ -286,7 +325,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(row, ("legacy", legacy_password("legacy123"), 1700000001, 0))
         self.assertEqual(peer, (2, "legacy-id", "Old alias", "prod,blue", "legacy-hash"))
         self.assertEqual(token, ("a" * 64, 0))
-        self.assertEqual(schema_version, "10")
+        self.assertEqual(schema_version, "12")
         self.assertTrue({"runtime_payload", "network_payload"}.issubset(columns))
         self.assertTrue({"enable_check_update", "allow_auto_update"}.issubset(policy_columns))
         auth = {"Authorization": "Bearer " + ("a" * 64)}
@@ -334,7 +373,7 @@ class IntegrationTest(unittest.TestCase):
         db.close()
         self.assertTrue({"enable_check_update", "allow_auto_update"}.issubset(columns))
         self.assertEqual(policy, ("download", "beta", "1.9.0", 99, 1, 0, 0, 7))
-        self.assertEqual(version, "10")
+        self.assertEqual(version, "12")
 
     def test_02_rustdesk_login_current_user_and_logout_revokes_token(self):
         status, body, _ = self.client.json("POST", "/?s=/api/login", {"username": "legacy", "password": "legacy123", "id": "legacy-id", "uuid": "legacy-uuid"})
@@ -627,7 +666,10 @@ class IntegrationTest(unittest.TestCase):
         request.pop("package_kind")
         self.assertFalse(self.client.json("POST", "/?s=/rd/update/v1/check", request)[1]["update_available"])
         request["package_kind"] = "exe"; request["build_seq"] = 2026093005
-        self.assertFalse(self.client.json("POST", "/?s=/rd/update/v1/check", request)[1]["update_available"])
+        _, current_release, _ = self.client.json("POST", "/?s=/rd/update/v1/check", request)
+        self.assertFalse(current_release["update_available"])
+        self.assertEqual((current_release["target_version"], current_release["target_build_seq"]), ("1.5.0", 2026093005))
+        self.assertNotIn("url", current_release)
         request["build_seq"] = 2026093004
         _, public_manifest, _ = self.client.json("GET", "/?s=/rd/update/v1/manifest/stable.json")
         self.assertEqual(public_manifest, manifest)
@@ -685,14 +727,15 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("text/event-stream", content_type)
         self.assertIn("event: update-policy\n", stream)
-        self.assertIn("id: 1\n", stream)
+        first_event_id = int(next(line[4:] for line in stream.splitlines() if line.startswith("id: ")))
         event = json.loads(next(line[6:] for line in stream.splitlines() if line.startswith("data: ")))
         self.assertEqual((event["client_id"], event["client_uuid"], event["policy_revision"]), (device_id, uuid, 1))
         self.assertTrue(event["enable_check_update"])
         self.assertTrue(event["allow_auto_update"])
         _, saved_again, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "target_version": None, "target_build_seq": None, "auto_install": False, "enable_check_update": False, "allow_auto_update": False}, {"X-CSRF-Token": csrf})
         self.assertEqual(saved_again["policy_revision"], 2)
-        _, resumed, _ = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}", headers={"Accept": "text/event-stream", "Last-Event-ID": "1"}, expected=(200,))
+        _, resumed, _ = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}", headers={"Accept": "text/event-stream", "Last-Event-ID": str(first_event_id)}, expected=(200,))
+        second_event_id = int(next(line[4:] for line in resumed.splitlines() if line.startswith("id: ")))
         resumed_event = json.loads(next(line[6:] for line in resumed.splitlines() if line.startswith("data: ")))
         self.assertEqual(resumed_event["policy_revision"], 2)
         self.assertFalse(resumed_event["enable_check_update"])
@@ -700,7 +743,7 @@ class IntegrationTest(unittest.TestCase):
         def wait_for_policy():
             request = urllib.request.Request(
                 self.url + f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}",
-                headers={"Accept": "text/event-stream", "Last-Event-ID": "2"},
+                headers={"Accept": "text/event-stream", "Last-Event-ID": str(second_event_id)},
             )
             with urllib.request.urlopen(request, timeout=6) as response:
                 return response.read().decode("utf-8", "replace")
@@ -723,6 +766,170 @@ class IntegrationTest(unittest.TestCase):
         status, error, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "target_build_seq": -1}, {"X-CSRF-Token": csrf}, expected=(422,))
         self.assertEqual(status, 422)
         self.assertIn("build_seq", error["error"])
+
+    def test_admin_one_shot_update_commands_stream_resume_and_status(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id, device_uuid = f"command-{suffix}", f"command-uuid-{suffix}"
+        other_id, other_uuid = f"command-other-{suffix}", f"command-other-uuid-{suffix}"
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_uuid, "conns": []})
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": other_id, "uuid": other_uuid, "conns": []})
+        for current_id, current_uuid in ((device_id, device_uuid), (other_id, other_uuid)):
+            self.client.json("POST", "/?s=/api/sysinfo", {"id": current_id, "uuid": current_uuid, "product": "rustdesk-yan", "edition": "custom", "platform": "windows", "arch": "x86_64", "package_kind": "exe"})
+        endpoint = f"/?s=/ops-x9/api/update/commands/{device_id}"
+        payload = {"uuid": device_uuid, "action": "install", "target_version": "0.0.1", "target_build_seq": 7, "expires_in": 3600}
+        anonymous = HttpClient(self.url)
+        self.assertEqual(anonymous.json("POST", endpoint, payload, expected=(401,))[0], 401)
+        self.assertEqual(self.client.json("POST", endpoint, payload, {"X-CSRF-Token": "bad"}, expected=(403,))[0], 403)
+        self.assertEqual(self.client.json("POST", endpoint, {**payload, "action": "restart"}, {"X-CSRF-Token": csrf}, expected=(422,))[0], 422)
+        self.assertEqual(self.client.json("POST", endpoint, {**payload, "uuid": "not-the-real-uuid"}, {"X-CSRF-Token": csrf}, expected=(404,))[0], 404)
+        self.assertEqual(self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "install"}, {"X-CSRF-Token": csrf}, expected=(409,))[0], 409)
+        db = sqlite3.connect(self.db)
+        compatible = {"product": "rustdesk-yan", "edition": "custom", "targets": {"windows-x86_64-exe-custom": {}}}
+        incompatible = {"product": "rustdesk-yan", "edition": "custom", "targets": {"linux-x86_64-appimage-custom": {}}}
+        for current_id, current_uuid in ((device_id, device_uuid), (other_id, other_uuid)):
+            db.execute("INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)", (current_id, current_uuid, device_public_key(), 1, "{}", int(time.time())))
+        db.execute("INSERT OR REPLACE INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,1)", ("0.0.1", 7, "stable", json.dumps(compatible), int(time.time())))
+        db.execute("INSERT OR REPLACE INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,1)", ("0.0.2", 8, "stable", json.dumps(incompatible), int(time.time())))
+        db.commit(); db.close()
+
+        _, created, _ = self.client.json("POST", endpoint, payload, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertRegex(created["command_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual((created["action"], created["status"], created["target_version"], int(created["target_build_seq"])), ("install", "pending", "0.0.1", 7))
+        db = sqlite3.connect(self.db)
+        stored = db.execute("SELECT device_id,uuid,action,target_version,target_build_seq,status,created_at,expires_at FROM device_update_commands WHERE command_id=?", (created["command_id"],)).fetchone()
+        self.assertEqual(stored[:6], (device_id, device_uuid, "install", "0.0.1", 7, "pending"))
+        self.assertGreater(stored[7], stored[6])
+        db.close()
+
+        _, stream, ctype = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id=RustDesk%20Yan&client_uuid={device_uuid}&after_revision=0", headers={"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid)}, expected=(200,))
+        self.assertIn("text/event-stream", ctype)
+        self.assertIn("event: update-command\n", stream)
+        self.assertIn(f"id: {created['command_id']}\n", stream)
+        event = json.loads(next(line[6:] for line in stream.splitlines() if line.startswith("data: ")))
+        self.assertEqual((event["command_id"], event["action"], event["client_id"], event["client_uuid"]), (created["command_id"], "install", device_id, device_uuid))
+        _, replayed, _ = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={device_uuid}&after_revision=0", headers={"Accept": "text/event-stream", "Last-Event-ID": created["command_id"], **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid)}, expected=(200,))
+        self.assertIn(f"id: {created['command_id']}\n", replayed)
+
+        _, other_stream, _ = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={other_id}&client_uuid={other_uuid}", headers={"Accept": "text/event-stream"}, expected=(200,))
+        self.assertNotIn(created["command_id"], other_stream)
+        _, latest, _ = self.client.json("POST", f"/?s=/ops-x9/api/update/commands/{other_id}", {"uuid": other_uuid, "action": "install"}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertEqual((latest["target_version"], int(latest["target_build_seq"])), ("0.0.1", 7))
+        _, latest_stream, _ = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={other_id}&client_uuid={other_uuid}&after_revision=0", headers={"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", other_id, other_uuid)}, expected=(200,))
+        latest_event = json.loads(next(line[6:] for line in latest_stream.splitlines() if line.startswith("data: ")))
+        self.assertEqual((latest_event["target_version"], latest_event["target_build_seq"]), ("0.0.1", 7))
+
+        accepted = {"client_id": "RustDesk Yan", "client_uuid": device_uuid, "command_id": created["command_id"], "command_action": "install", "status": "accepted"}
+        self.client.json("POST", "/?s=/rd/update/v1/events", accepted, {"Content-Type": "application/json", **device_auth_headers("POST", "/rd/update/v1/events", device_id, device_uuid, accepted, created["command_id"])}, expected=(201,))
+        wrong_action = {**accepted, "command_action": "check"}
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/events", wrong_action, {"Content-Type": "application/json", **device_auth_headers("POST", "/rd/update/v1/events", device_id, device_uuid, wrong_action, created["command_id"])}, expected=(422,))[0], 422)
+        report = {"client_id": "RustDesk Yan", "client_uuid": device_uuid, "command_id": created["command_id"], "command_action": "install", "status": "completed", "to_version": "0.0.1", "to_build_seq": 7, "finished_at": int(time.time())}
+        self.client.json("POST", "/?s=/rd/update/v1/events", report, {"Content-Type": "application/json", **device_auth_headers("POST", "/rd/update/v1/events", device_id, device_uuid, report, created["command_id"])}, expected=(201,))
+        self.client.json("POST", "/?s=/rd/update/v1/events", report, {"Content-Type": "application/json", **device_auth_headers("POST", "/rd/update/v1/events", device_id, device_uuid, report, created["command_id"])}, expected=(201,))
+        _, commands, _ = self.client.json("GET", f"{endpoint}?uuid={device_uuid}")
+        self.assertEqual(commands["data"][0]["status"], "completed")
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT status FROM device_update_commands WHERE command_id=?", (created["command_id"],)).fetchone(), ("completed",))
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM device_update_events WHERE command_id=?", (created["command_id"],)).fetchone()[0], 2)
+        db.execute("DELETE FROM update_releases WHERE build_seq IN (7,8) AND channel='stable'")
+        db.commit()
+        db.close()
+
+    def test_update_command_auth_target_lock_monotonic_state_and_stream_fairness(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id, device_uuid = f"secure-command-{suffix}", f"secure-command-uuid-{suffix}"
+        public_key = device_public_key()
+        check_payload = {
+            "client_id": "RustDesk Yan", "client_uuid": device_uuid, "product": "rustdesk-yan",
+            "edition": "custom", "version": "1.0.0", "build_seq": 1, "channel": "stable",
+            "platform": "windows", "arch": "x86_64", "package_kind": "exe",
+        }
+        target = {"primary": "https://download.yan.life/rustdesk/stable/locked.exe", "mirrors": [], "size": 12, "sha256": "a" * 64, "signature": "c" * 88, "signature_key_id": "yan-release-2026"}
+        newer = {**target, "primary": "https://download.yan.life/rustdesk/stable/newer.exe"}
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, public_key, 1, "{}", int(time.time())))
+        db.execute("INSERT INTO device_reports(id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, json.dumps(check_payload), int(time.time()), int(time.time()), "{}"))
+        db.execute("INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,1)", ("2.0.0", 20, "stable", json.dumps({"product": "rustdesk-yan", "edition": "custom", "version": "2.0.0", "build_seq": 20, "channel": "stable", "targets": {"windows-x86_64-exe-custom": target}}), int(time.time())))
+        db.commit(); db.close()
+        endpoint = f"/?s=/ops-x9/api/update/commands/{device_id}"
+        _, first, _ = self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "install"}, {"X-CSRF-Token": csrf}, expected=(201,))
+        _, second, _ = self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "check"}, {"X-CSRF-Token": csrf}, expected=(201,))
+
+        stream_path = f"/?s=/rd/update/v1/policy/stream&client_id=RustDesk%20Yan&client_uuid={device_uuid}"
+        _, unsigned_stream, _ = self.client.request("GET", stream_path, headers={"Accept": "text/event-stream"}, expected=(200,))
+        self.assertIn("event: update-policy\n", unsigned_stream)
+        self.assertNotIn("event: update-command\n", unsigned_stream)
+        stream_headers = {"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid)}
+        _, stream, _ = self.client.request("GET", stream_path, headers=stream_headers, expected=(200,))
+        self.assertIn("event: update-policy\n", stream)
+        self.assertIn(first["command_id"], stream)
+        self.assertIn(second["command_id"], stream)
+
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,1)", ("3.0.0", 30, "stable", json.dumps({"product": "rustdesk-yan", "edition": "custom", "version": "3.0.0", "build_seq": 30, "channel": "stable", "targets": {"windows-x86_64-exe-custom": newer}}), int(time.time())))
+        db.execute("INSERT INTO device_update_policies(id,uuid,mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update,policy_revision,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id,uuid) DO UPDATE SET target_version=excluded.target_version,target_build_seq=excluded.target_build_seq", (device_id, device_uuid, "auto_install", "stable", "3.0.0", 30, 1, 1, 1, 7, int(time.time())))
+        db.commit(); db.close()
+        check_headers = {"Content-Type": "application/json", "X-RustDesk-Update-Command-ID": first["command_id"], **device_auth_headers("POST", "/rd/update/v1/check", device_id, device_uuid, check_payload, first["command_id"])}
+        invalid_signature_headers = {**check_headers, "X-RustDesk-Device-Nonce": uuid.uuid4().hex, "X-RustDesk-Device-Signature": "A" * 86 + "=="}
+        self.client.json("POST", "/?s=/rd/update/v1/check", check_payload, invalid_signature_headers, expected=(401,))
+        expired_headers = {"Content-Type": "application/json", "X-RustDesk-Update-Command-ID": first["command_id"], **device_auth_headers("POST", "/rd/update/v1/check", device_id, device_uuid, check_payload, first["command_id"], timestamp=int(time.time()) - 301)}
+        self.client.json("POST", "/?s=/rd/update/v1/check", check_payload, expired_headers, expected=(401,))
+        _, ordinary, _ = self.client.json("POST", "/?s=/rd/update/v1/check", check_payload)
+        self.assertEqual((ordinary["target_version"], ordinary["target_build_seq"]), ("3.0.0", 30))
+        _, locked, _ = self.client.json("POST", "/?s=/rd/update/v1/check", check_payload, check_headers)
+        self.assertEqual((locked["target_version"], locked["target_build_seq"]), ("2.0.0", 20))
+        self.assertEqual(locked["manifest"]["targets"]["windows-x86_64-exe-custom"]["primary"], target["primary"])
+        self.assertEqual(self.client.json("POST", "/?s=/rd/update/v1/check", check_payload, check_headers, expected=(409,))[0], 409)
+
+        completed = {"client_id": "RustDesk Yan", "client_uuid": device_uuid, "command_id": first["command_id"], "command_action": "install", "status": "completed"}
+        completed_headers = {"Content-Type": "application/json", **device_auth_headers("POST", "/rd/update/v1/events", device_id, device_uuid, completed, first["command_id"])}
+        self.client.json("POST", "/?s=/rd/update/v1/events", completed, completed_headers, expected=(201,))
+        late = {**completed, "status": "started"}
+        late_headers = {"Content-Type": "application/json", **device_auth_headers("POST", "/rd/update/v1/events", device_id, device_uuid, late, first["command_id"])}
+        self.client.json("POST", "/?s=/rd/update/v1/events", late, late_headers, expected=(201,))
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT status FROM device_update_commands WHERE command_id=?", (first["command_id"],)).fetchone(), ("completed",))
+        db.execute("UPDATE device_update_commands SET status='accepted',expires_at=? WHERE command_id=?", (int(time.time()) - 1, second["command_id"]))
+        db.commit(); db.close()
+        accepted_headers = {"Content-Type": "application/json", "X-RustDesk-Update-Command-ID": second["command_id"], **device_auth_headers("POST", "/rd/update/v1/check", device_id, device_uuid, check_payload, second["command_id"])}
+        self.client.json("POST", "/?s=/rd/update/v1/check", check_payload, accepted_headers, expected=(200,))
+        fresh_stream_headers = {"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid)}
+        self.client.request("GET", stream_path, headers=fresh_stream_headers, expected=(200,))
+        db = sqlite3.connect(self.db)
+        db.execute("UPDATE device_update_commands SET status='deferred' WHERE command_id=?", (second["command_id"],))
+        db.commit(); db.close()
+        deferred_headers = {"Content-Type": "application/json", "X-RustDesk-Update-Command-ID": second["command_id"], **device_auth_headers("POST", "/rd/update/v1/check", device_id, device_uuid, check_payload, second["command_id"])}
+        self.client.json("POST", "/?s=/rd/update/v1/check", check_payload, deferred_headers, expected=(200,))
+        terminal_after_expiry = {"client_id": device_id, "client_uuid": device_uuid, "command_id": second["command_id"], "command_action": "check", "status": "completed"}
+        self.client.json("POST", "/?s=/rd/update/v1/events", terminal_after_expiry, {"Content-Type": "application/json", **device_auth_headers("POST", "/rd/update/v1/events", device_id, device_uuid, terminal_after_expiry, second["command_id"])}, expected=(201,))
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT status FROM device_update_commands WHERE command_id=?", (second["command_id"],)).fetchone(), ("completed",))
+        db.execute("DELETE FROM update_releases WHERE build_seq IN (20,30) AND channel='stable'")
+        db.commit()
+        db.close()
+
+    def test_one_shot_update_command_reaches_waiting_sse_within_seconds(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id, device_uuid = f"command-live-{suffix}", f"command-live-uuid-{suffix}"
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_uuid, "conns": []})
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, device_public_key(), 1, "{}", int(time.time())))
+        db.commit(); db.close()
+        def wait_for_command():
+            request = urllib.request.Request(self.url + f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={device_uuid}&after_revision=0", headers={"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid)})
+            with urllib.request.urlopen(request, timeout=6) as response:
+                return response.read().decode("utf-8", "replace")
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            waiting = pool.submit(wait_for_command)
+            time.sleep(0.5)
+            _, created, _ = self.client.json("POST", f"/?s=/ops-x9/api/update/commands/{device_id}", {"uuid": device_uuid, "action": "check"}, {"X-CSRF-Token": csrf}, expected=(201,))
+            stream = waiting.result(timeout=5)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn("event: update-command\n", stream)
+        self.assertIn(created["command_id"], stream)
 
     def test_06_admin_session_csrf_login_and_user_lifecycle(self):
         status, session, _ = self.client.json("GET", "/?s=/ops-x9/api/session")
