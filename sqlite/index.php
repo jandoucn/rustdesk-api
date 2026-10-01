@@ -57,6 +57,9 @@ function report_runtime_payload(array $data): array
             $runtime[$key] = isset($allowed[$key]) ? (in_array(strtolower($value), $allowed[$key], true) ? strtolower($value) : 'unknown') : $value;
         }
     }
+    foreach (['enable_check_update', 'allow_auto_update'] as $key) {
+        if (array_key_exists($key, $data) && is_bool($data[$key])) $runtime[$key] = $data[$key];
+    }
     return $runtime;
 }
 function release_identity(array $report, array $runtime): array
@@ -1367,6 +1370,8 @@ function enrich_admin_address_book_peer(PDO $db, array $peer): array
         'install_mode'=>$release['install_mode'] !== '' ? $release['install_mode'] : (string)($deploy['install_mode'] ?? ''),
         'build_number'=>(string)($release['build_number'] ?? ''), 'build_seq'=>(int)($release['build_seq'] ?? 0), 'channel'=>(string)($release['channel'] ?? ''), 'arch'=>(string)($release['arch'] ?? ''),
         'public_ip'=>$publicIp, 'private_ips'=>is_array($network['private_ips'] ?? null) ? $network['private_ips'] : [], 'geo'=>$geo,
+        'enable_check_update'=>array_key_exists('enable_check_update', $runtime) ? (bool)$runtime['enable_check_update'] : null,
+        'allow_auto_update'=>array_key_exists('allow_auto_update', $runtime) ? (bool)$runtime['allow_auto_update'] : null,
         'last_seen'=>(int)($reportRow['last_seen'] ?? 0), 'last_heartbeat'=>$lastHeartbeat, 'presence'=>device_presence($lastHeartbeat, time()),
         'deployed'=>$deploymentRow !== null, 'address_book_user_ids'=>[],
     ]);
@@ -1501,7 +1506,7 @@ try {
             $channel=text_field($_GET,'channel',32,'stable'); if(!in_array($channel,['stable','beta'],true))fail(422,'更新通道无效');
             reply(update_policy($db,$id,$uuid,$channel));
         }
-        method('PATCH'); csrf_check(); $d=json_body(); $uuid=text_field($d,'uuid',256); if($id===''||$uuid==='')fail(422,'设备 ID 和 UUID 不能为空'); $mode=update_mode(text_field($d,'mode',32,'notify')); $channel=text_field($d,'channel',32,'stable'); $existing=db_one($db,'SELECT * FROM device_update_policies WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]); $revision=((int)($existing['policy_revision']??0))+1;
+        method('PATCH'); csrf_check(); $d=json_body(); $uuid=text_field($d,'uuid',256); if($id===''||$uuid==='')fail(422,'设备 ID 和 UUID 不能为空'); $requestedMode=text_field($d,'mode',32,'notify'); $immediate=$requestedMode==='immediate'; $mode=update_mode($immediate?'auto_install':$requestedMode); $channel=text_field($d,'channel',32,'stable'); $existing=db_one($db,'SELECT * FROM device_update_policies WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]); $revision=((int)($existing['policy_revision']??0))+1;
         if(!in_array($channel,['stable','beta'],true))fail(422,'更新通道无效');
         if(array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null){ $build=$d['target_build_seq']; $valid=(is_int($build)&&$build>=0)||(is_string($build)&&ctype_digit($build)); if(!$valid)fail(422,'build_seq 必须是非负整数'); }
         if(array_key_exists('auto_install',$d)&&!is_bool($d['auto_install'])&&!in_array($d['auto_install'],[0,1,'0','1'],true))fail(422,'auto_install 必须是布尔值');
@@ -1510,10 +1515,14 @@ try {
         $allowAutoUpdate=(int)(array_key_exists('allow_auto_update',$d)?$d['allow_auto_update']:($existing['allow_auto_update']??false));
         $saved=[];
         txn($db,function()use($db,$id,$uuid,$mode,$channel,$d,$revision,$actor,$enableCheckUpdate,$allowAutoUpdate,&$saved){
-            db_upsert($db,'device_update_policies',['id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'target_version'=>array_key_exists('target_version',$d)?text_field($d,'target_version',32):null,'target_build_seq'=>array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null?(int)$d['target_build_seq']:null,'auto_install'=>(int)($d['auto_install']??false),'enable_check_update'=>$enableCheckUpdate,'allow_auto_update'=>$allowAutoUpdate,'policy_revision'=>$revision,'updated_by'=>(int)$actor['id'],'updated_at'=>time()],['id','uuid'],['mode','channel','target_version','target_build_seq','auto_install','enable_check_update','allow_auto_update','policy_revision','updated_by','updated_at']);
+            db_upsert($db,'device_update_policies',['id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'target_version'=>array_key_exists('target_version',$d)?text_field($d,'target_version',32):null,'target_build_seq'=>array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null?(int)$d['target_build_seq']:null,'auto_install'=>(int)($d['auto_install']??false)||($mode==='auto_install'?1:0),'enable_check_update'=>$enableCheckUpdate,'allow_auto_update'=>$allowAutoUpdate,'policy_revision'=>$revision,'updated_by'=>(int)$actor['id'],'updated_at'=>time()],['id','uuid'],['mode','channel','target_version','target_build_seq','auto_install','enable_check_update','allow_auto_update','policy_revision','updated_by','updated_at']);
             $saved=update_policy($db,$id,$uuid,$channel); admin_event($db,(int)$actor['id'],'update_device_policy',0);
         });
-        reply(['ok'=>true]+$saved);
+        $command=null;
+        if($immediate){
+            $command=create_update_command($db,$actor,$id,['uuid'=>$uuid,'action'=>'install','target_version'=>array_key_exists('target_version',$d)?$d['target_version']??null:null,'target_build_seq'=>array_key_exists('target_build_seq',$d)?$d['target_build_seq']??null:null]);
+        }
+        reply(['ok'=>true]+$saved+($command!==null?['immediate_command'=>$command,'message'=>'更新策略已保存，已下发立即更新命令']:[]));
     }
     if ($adminApi && preg_match('#^/admin/api/update/events(?:/([^/]+))?$#',$path,$match)) { admin_user($db); $id=isset($match[1])?rawurldecode($match[1]):''; $where=$id?' WHERE device_id=:id':''; reply(['data'=>db_all($db,'SELECT * FROM device_update_events'.$where.' ORDER BY started_at DESC LIMIT 200',$id?['id'=>$id]:[])]); }
     if ($adminApi && preg_match('#^/admin/api/users(?:/([1-9][0-9]*))?$#', $path, $match)) {

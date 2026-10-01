@@ -375,6 +375,46 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(policy, ("download", "beta", "1.9.0", 99, 1, 0, 0, 7))
         self.assertEqual(version, "12")
 
+    def test_01c_v10_update_events_migrate_before_command_index(self):
+        db_path = self.temp / "events-v10.db"
+        db = sqlite3.connect(db_path)
+        db.executescript(
+            """
+            CREATE TABLE app_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            INSERT INTO app_meta VALUES ('schema_version','10');
+            CREATE TABLE rustdesk_users (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL,password TEXT NOT NULL,
+              create_time INTEGER NOT NULL DEFAULT 0,delete_time INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE device_update_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT NOT NULL,uuid TEXT NOT NULL,
+              from_version TEXT,to_version TEXT,from_build_seq INTEGER,to_build_seq INTEGER,
+              status TEXT NOT NULL,source TEXT,error_code TEXT,started_at INTEGER NOT NULL,finished_at INTEGER
+            );
+            INSERT INTO device_update_events (
+              device_id,uuid,from_version,to_version,status,source,started_at
+            ) VALUES ('legacy-device','legacy-uuid','1.0.0','1.1.0','completed','client',1700000000);
+            """
+        )
+        db.commit()
+        db.close()
+        script = self.temp / "migrate-events-v10.php"
+        script.write_text("<?php require $argv[1].'/lib.php'; open_database($argv[2]);", encoding="utf-8")
+        runtime = Path(self.runtime or os.environ.get("FRANKENPHP", DEFAULT_RUNTIME))
+        command = [str(runtime), "php-cli", str(script), str(SQLITE_DIR), str(db_path)] if runtime.name == "frankenphp" else [str(runtime), str(script), str(SQLITE_DIR), str(db_path)]
+        result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        db = sqlite3.connect(db_path)
+        columns = {row[1] for row in db.execute("PRAGMA table_info(device_update_events)")}
+        indexes = {row[1] for row in db.execute("PRAGMA index_list(device_update_events)")}
+        event = db.execute("SELECT device_id,uuid,status,command_id FROM device_update_events").fetchone()
+        version = db.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0]
+        db.close()
+        self.assertIn("command_id", columns)
+        self.assertIn("device_update_event_command_status", indexes)
+        self.assertEqual(event, ("legacy-device", "legacy-uuid", "completed", None))
+        self.assertEqual(version, "12")
+
     def test_02_rustdesk_login_current_user_and_logout_revokes_token(self):
         status, body, _ = self.client.json("POST", "/?s=/api/login", {"username": "legacy", "password": "legacy123", "id": "legacy-id", "uuid": "legacy-uuid"})
         self.assertEqual(status, 200)
@@ -444,13 +484,15 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(json.loads(empty["data"]), {"tags": [], "peers": []})
 
     def test_05_sysinfo_and_anonymous_heartbeat(self):
-        status, text, ctype = self.client.request("POST", "/?s=/api/sysinfo", {"id": "new-id", "uuid": "new-uuid", "version": "1.5.0", "hostname": "host", "os": "linux", "cpu": "x", "memory": "1G", "platform": "linux", "distribution": "portable", "install_mode": "portable", "network": {"private_ips": ["192.168.1.20", "fd12:3456:789a::20"]}}, expected=(200,))
+        status, text, ctype = self.client.request("POST", "/?s=/api/sysinfo", {"id": "new-id", "uuid": "new-uuid", "version": "1.5.0", "hostname": "host", "os": "linux", "cpu": "x", "memory": "1G", "platform": "linux", "distribution": "portable", "install_mode": "portable", "enable_check_update": True, "allow_auto_update": False, "network": {"private_ips": ["192.168.1.20", "fd12:3456:789a::20"]}}, expected=(200,))
         self.assertEqual(status, 200)
         self.assertTrue("text/plain" in ctype)
         self.assertIn("SYSINFO", text)
         db = sqlite3.connect(self.db)
         runtime, network = db.execute("SELECT runtime_payload,network_payload FROM device_reports WHERE id='new-id'").fetchone()
         self.assertEqual(json.loads(runtime)["distribution"], "portable")
+        self.assertTrue(json.loads(runtime)["enable_check_update"])
+        self.assertFalse(json.loads(runtime)["allow_auto_update"])
         self.assertEqual(json.loads(network)["private_ips"], ["192.168.1.20", "fd12:3456:789a::20"])
         db.close()
         _, heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {"id": "anonymous", "uuid": str(uuid.uuid4()), "conns": []})

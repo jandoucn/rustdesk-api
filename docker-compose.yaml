@@ -2,7 +2,7 @@ name: rustdesk-api
 
 services:
   api:
-    image: crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:latest
+    image: ${RUSTDESK_API_IMAGE:-crpi-7xxhnenx29e9prnb.cn-hongkong.personal.cr.aliyuncs.com/ollydocker/rustdesk-api:latest}
     pull_policy: always
     container_name: rustdesk-api
     restart: unless-stopped
