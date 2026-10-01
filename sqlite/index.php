@@ -477,11 +477,20 @@ function update_policy(PDO $db, string $id, string $uuid, string $channel): arra
 {
     return db_one($db, 'SELECT * FROM device_update_policies WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]) ?: ['id'=>$id,'uuid'=>$uuid,'mode'=>'notify','channel'=>$channel,'target_version'=>null,'target_build_seq'=>null,'auto_install'=>0,'policy_revision'=>0];
 }
+function resolve_update_identity(PDO $db, string $id, string $uuid): array
+{
+    $exact = db_one($db, 'SELECT id,uuid FROM device_reports WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
+    if ($exact) return [(string)$exact['id'], (string)$exact['uuid']];
+    $matches = db_all($db, 'SELECT id,uuid FROM device_reports WHERE uuid=:uuid LIMIT 2', ['uuid'=>$uuid]);
+    if (count($matches) === 1) return [(string)$matches[0]['id'], (string)$matches[0]['uuid']];
+    return [$id, $uuid];
+}
 function update_check_response(PDO $db, array $data): array
 {
     $id = text_field($data, 'client_id', 128, text_field($data, 'id', 128)); $uuid = text_field($data, 'client_uuid', 256, text_field($data, 'uuid', 256));
     if ($id === '' || $uuid === '') fail(422, '缺少客户端 ID 或 UUID');
     remember_release_identity($db, $data);
+    [$id, $uuid] = resolve_update_identity($db, $id, $uuid);
     $version = text_field($data, 'version', 32, '0.0.0'); $build = (int)($data['build_seq'] ?? 0); $channel = text_field($data, 'channel', 32, 'stable'); $policy = update_policy($db, $id, $uuid, $channel); $channel = (string)($policy['channel'] ?: $channel);
     $manifest = public_update_manifest($db, $channel, $policy['target_version'] ?? null, isset($policy['target_build_seq']) ? (int)$policy['target_build_seq'] : null, $data); $mode = update_mode((string)$policy['mode']);
     $base = rtrim((string)(getenv('RUSTDESK_UPDATE_BASE_URL') ?: ''), '/'); $empty = ['update_available'=>false,'mode'=>$mode,'auto_install'=>(bool)$policy['auto_install'],'channel'=>$channel,'current_version'=>$version,'current_build_seq'=>$build,'policy_revision'=>(int)$policy['policy_revision']];
@@ -591,6 +600,7 @@ function record_update_event(PDO $db, array $data): void
 {
     $id=text_field($data,'client_id',128,text_field($data,'id',128)); $uuid=text_field($data,'client_uuid',256,text_field($data,'uuid',256)); $status=text_field($data,'status',32);
     if($id===''||$uuid===''||!in_array($status,['started','downloaded','installed','failed','deferred','rolled_back','rollback_failed'],true))fail(422,'升级事件参数错误');
+    [$id,$uuid]=resolve_update_identity($db,$id,$uuid);
     db_exec($db,'INSERT INTO device_update_events(device_id,uuid,from_version,to_version,from_build_seq,to_build_seq,status,source,error_code,started_at,finished_at) VALUES(:id,:uuid,:fv,:tv,:fb,:tb,:status,:source,:error,:started,:finished)',['id'=>$id,'uuid'=>$uuid,'fv'=>text_field($data,'from_version',32)?:null,'tv'=>text_field($data,'to_version',32)?:null,'fb'=>array_key_exists('from_build_seq',$data)?(int)$data['from_build_seq']:null,'tb'=>array_key_exists('to_build_seq',$data)?(int)$data['to_build_seq']:null,'status'=>$status,'source'=>text_field($data,'source',64)?:null,'error'=>text_field($data,'error_code',128)?:null,'started'=>(int)($data['started_at']??time()),'finished'=>array_key_exists('finished_at',$data)?(int)$data['finished_at']:null]);
 }
 function sync_admin_device_alias(PDO $db, array $actor, string $id, string $uuid, string $alias): void

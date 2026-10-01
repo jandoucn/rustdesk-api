@@ -657,6 +657,60 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.assertEqual(self.sql("SELECT status,COALESCE(error_code,'') FROM device_update_events WHERE device_id='mysql-update-device' ORDER BY id"), ["installed\t", "deferred\tuser_deferred", "rollback_failed\trestore_failed"])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM update_releases WHERE channel='stable' AND build_seq=2026100101"), ["1"])
 
+    def test_19a_update_identity_resolves_reported_device_by_uuid(self):
+        csrf = self.admin_login()
+        suffix = str(time.time_ns())
+        device_id = "mysql-update-real-" + suffix
+        device_uuid = "mysql-update-uuid-" + suffix
+        self.client.json("POST", "/api/heartbeat", {
+            "id": device_id, "uuid": device_uuid, "ver": 1, "conns": [],
+        })
+        self.client.json(
+            "PATCH",
+            f"/ops-x9/api/update/policies/{device_id}",
+            {"uuid": device_uuid, "mode": "auto_install", "channel": "stable", "auto_install": True},
+            {"X-CSRF-Token": csrf},
+        )
+
+        _, check, _ = self.client.json("POST", "/rd/update/v1/check", {
+            "client_id": "RustDesk Yan", "client_uuid": device_uuid,
+            "version": "1.5.0", "build_seq": 1, "channel": "stable",
+        })
+        self.assertEqual(check["mode"], "auto_install")
+        self.assertTrue(check["auto_install"])
+        self.assertEqual(check["policy_revision"], 1)
+
+        self.client.json("POST", "/rd/update/v1/events", {
+            "client_id": "RustDesk Yan", "client_uuid": device_uuid,
+            "status": "installed", "to_build_seq": 2026100101,
+        }, expected=(201,))
+        self.assertEqual(
+            self.sql(
+                "SELECT device_id,uuid,status FROM device_update_events "
+                f"WHERE uuid='{device_uuid}'"
+            ),
+            [f"{device_id}\t{device_uuid}\tinstalled"],
+        )
+
+        self.client.json("POST", "/api/heartbeat", {
+            "id": "mysql-update-duplicate-" + suffix,
+            "uuid": device_uuid,
+            "ver": 1,
+            "conns": [],
+        })
+        _, exact, _ = self.client.json("POST", "/rd/update/v1/check", {
+            "client_id": device_id, "client_uuid": device_uuid,
+            "version": "1.5.0", "build_seq": 1, "channel": "stable",
+        })
+        self.assertEqual(exact["mode"], "auto_install")
+        self.assertEqual(exact["policy_revision"], 1)
+        _, ambiguous, _ = self.client.json("POST", "/rd/update/v1/check", {
+            "client_id": "RustDesk Alias", "client_uuid": device_uuid,
+            "version": "1.5.0", "build_seq": 1, "channel": "stable",
+        })
+        self.assertEqual(ambiguous["mode"], "notify")
+        self.assertEqual(ambiguous["policy_revision"], 0)
+
     def test_19b_machine_publish_and_platform_selection(self):
         tag = "v1.5.0-build-2026.09.30-01"
         target = {"primary": f"https://download.yan.life/rustdesk/stable/{tag}/rustdesk-1.5.0-standard-windows-x86_64.exe", "mirrors": [], "size": 12, "sha256": "a" * 64, "signature": base64.b64encode(b"s" * 64).decode(), "signature_key_id": "yan-release-2026"}
