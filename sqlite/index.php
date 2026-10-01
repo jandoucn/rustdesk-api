@@ -57,8 +57,11 @@ function report_runtime_payload(array $data): array
             $runtime[$key] = isset($allowed[$key]) ? (in_array(strtolower($value), $allowed[$key], true) ? strtolower($value) : 'unknown') : $value;
         }
     }
-    foreach (['enable_check_update', 'allow_auto_update'] as $key) {
+    foreach (['enable_check_update', 'allow_auto_update', 'enable_scheduled_update'] as $key) {
         if (array_key_exists($key, $data) && is_bool($data[$key])) $runtime[$key] = $data[$key];
+    }
+    if (array_key_exists('scheduled_update_interval_hours', $data) && is_numeric($data['scheduled_update_interval_hours'])) {
+        $hours=(int)$data['scheduled_update_interval_hours']; if($hours>=1&&$hours<=168)$runtime['scheduled_update_interval_hours']=$hours;
     }
     return $runtime;
 }
@@ -506,10 +509,12 @@ function public_update_manifest(PDO $db, string $channel, ?string $targetVersion
 function update_policy(PDO $db, string $id, string $uuid, string $channel): array
 {
     $policy = db_one($db, 'SELECT * FROM device_update_policies WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid])
-        ?: ['id'=>$id,'uuid'=>$uuid,'mode'=>'notify','channel'=>$channel,'target_version'=>null,'target_build_seq'=>null,'auto_install'=>0,'enable_check_update'=>0,'allow_auto_update'=>0,'policy_revision'=>0,'updated_at'=>0];
+        ?: ['id'=>$id,'uuid'=>$uuid,'mode'=>'notify','channel'=>$channel,'target_version'=>null,'target_build_seq'=>null,'auto_install'=>0,'enable_check_update'=>0,'allow_auto_update'=>0,'enable_scheduled_update'=>0,'scheduled_update_interval_hours'=>5,'policy_revision'=>0,'updated_at'=>0];
     $policy['auto_install'] = (bool)($policy['auto_install'] ?? false);
     $policy['enable_check_update'] = (bool)($policy['enable_check_update'] ?? false);
     $policy['allow_auto_update'] = (bool)($policy['allow_auto_update'] ?? false);
+    $policy['enable_scheduled_update'] = (bool)($policy['enable_scheduled_update'] ?? false);
+    $policy['scheduled_update_interval_hours'] = (int)($policy['scheduled_update_interval_hours'] ?? 5);
     $policy['policy_revision'] = (int)($policy['policy_revision'] ?? 0);
     $policy['updated_at'] = (int)($policy['updated_at'] ?? 0);
     if (isset($policy['target_build_seq'])) $policy['target_build_seq'] = (int)$policy['target_build_seq'];
@@ -520,15 +525,65 @@ function update_policy_payload(array $policy, string $id, string $uuid): array
     return [
         'client_id'=>$id,'client_uuid'=>$uuid,'policy_revision'=>(int)$policy['policy_revision'],
         'enable_check_update'=>(bool)$policy['enable_check_update'],'allow_auto_update'=>(bool)$policy['allow_auto_update'],
+        'enable_scheduled_update'=>(bool)$policy['enable_scheduled_update'],'scheduled_update_interval_hours'=>(int)$policy['scheduled_update_interval_hours'],
         'mode'=>(string)$policy['mode'],'channel'=>(string)$policy['channel'],
         'target_version'=>$policy['target_version'] ?? null,'target_build_seq'=>$policy['target_build_seq'] ?? null,
         'updated_at'=>(int)$policy['updated_at'],
     ];
 }
+function update_policy_boolean(array $data, string $field, bool $default): bool
+{
+    if (!array_key_exists($field, $data)) return $default;
+    if (!is_bool($data[$field]) && !in_array($data[$field], [0,1,'0','1'], true)) fail(422, "$field 必须是布尔值");
+    return (bool)$data[$field];
+}
+function scheduled_update_interval(array $data, int $default): int
+{
+    if (!array_key_exists('scheduled_update_interval_hours', $data)) return $default;
+    $value = $data['scheduled_update_interval_hours'];
+    if (!((is_int($value) && $value >= 1 && $value <= 168) || (is_string($value) && ctype_digit($value) && (int)$value >= 1 && (int)$value <= 168))) fail(422, 'scheduled_update_interval_hours 必须在 1 到 168 小时之间');
+    return (int)$value;
+}
+function update_batch_devices(PDO $db, array $data): array
+{
+    if (($data['all'] ?? false) === true) return db_all($db, 'SELECT id,uuid FROM device_reports UNION SELECT id,uuid FROM device_deployments ORDER BY id,uuid');
+    $devices = $data['devices'] ?? null;
+    if (!is_array($devices) || !$devices || count($devices) > 1000) fail(422, 'devices 必须包含 1 到 1000 个客户端');
+    $resolved = [];
+    foreach ($devices as $device) {
+        if (!is_array($device)) fail(422, '客户端身份格式错误');
+        $id = text_field($device, 'id', 128, text_field($device, 'client_id', 128));
+        $uuid = text_field($device, 'uuid', 256, text_field($device, 'client_uuid', 256));
+        if ($id === '' || $uuid === '') fail(422, '设备 ID 和 UUID 不能为空');
+        [$id, $uuid] = device_update_identity($db, $id, $uuid);
+        $resolved[$id."\0".$uuid] = ['id'=>$id,'uuid'=>$uuid];
+    }
+    return array_values($resolved);
+}
+function patch_scheduled_update_policy(PDO $db, array $actor, string $id, string $uuid, array $data): array
+{
+    $existing = db_one($db, 'SELECT * FROM device_update_policies WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
+    $enabled = update_policy_boolean($data, 'enable_scheduled_update', (bool)($existing['enable_scheduled_update'] ?? false));
+    $interval = scheduled_update_interval($data, (int)($existing['scheduled_update_interval_hours'] ?? 5));
+    if ($existing && (bool)($existing['enable_scheduled_update'] ?? false) === $enabled
+        && (int)($existing['scheduled_update_interval_hours'] ?? 5) === $interval) {
+        return update_policy($db, $id, $uuid, (string)($existing['channel'] ?? 'stable'));
+    }
+    $revision = ((int)($existing['policy_revision'] ?? 0)) + 1;
+    db_upsert($db, 'device_update_policies', [
+        'id'=>$id,'uuid'=>$uuid,'mode'=>$existing['mode'] ?? 'notify','channel'=>$existing['channel'] ?? 'stable',
+        'target_version'=>$existing['target_version'] ?? null,'target_build_seq'=>$existing['target_build_seq'] ?? null,
+        'auto_install'=>(int)($existing['auto_install'] ?? false),'enable_check_update'=>(int)($existing['enable_check_update'] ?? false),
+        'allow_auto_update'=>(int)($existing['allow_auto_update'] ?? false),'enable_scheduled_update'=>(int)$enabled,
+        'scheduled_update_interval_hours'=>$interval,'policy_revision'=>$revision,'updated_by'=>(int)$actor['id'],'updated_at'=>time(),
+    ], ['id','uuid'], ['mode','channel','target_version','target_build_seq','auto_install','enable_check_update','allow_auto_update','enable_scheduled_update','scheduled_update_interval_hours','policy_revision','updated_by','updated_at']);
+    return update_policy($db, $id, $uuid, (string)($existing['channel'] ?? 'stable'));
+}
 function resolve_update_identity(PDO $db, string $id, string $uuid): array
 {
     $exact = db_one($db, 'SELECT id,uuid FROM device_reports WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
     if ($exact) return [(string)$exact['id'], (string)$exact['uuid']];
+    if ($id !== 'RustDesk Yan') return [$id, $uuid];
     $matches = db_all($db, 'SELECT id,uuid FROM device_reports WHERE uuid=:uuid LIMIT 2', ['uuid'=>$uuid]);
     if (count($matches) === 1) return [(string)$matches[0]['id'], (string)$matches[0]['uuid']];
     return [$id, $uuid];
@@ -676,7 +731,7 @@ function update_check_response(PDO $db, array $data, ?array $command = null): ar
         $manifest = public_update_manifest($db, $channel, $policy['target_version'] ?? null, isset($policy['target_build_seq']) ? (int)$policy['target_build_seq'] : null, $data);
     }
     $mode = update_mode((string)$policy['mode']);
-    $base = rtrim((string)(getenv('RUSTDESK_UPDATE_BASE_URL') ?: ''), '/'); $empty = ['update_available'=>false,'mode'=>$mode,'auto_install'=>(bool)$policy['auto_install'],'enable_check_update'=>(bool)$policy['enable_check_update'],'allow_auto_update'=>(bool)$policy['allow_auto_update'],'channel'=>$channel,'current_version'=>$version,'current_build_seq'=>$build,'policy_revision'=>(int)$policy['policy_revision']];
+    $base = rtrim((string)(getenv('RUSTDESK_UPDATE_BASE_URL') ?: ''), '/'); $empty = ['update_available'=>false,'mode'=>$mode,'auto_install'=>(bool)$policy['auto_install'],'enable_check_update'=>(bool)$policy['enable_check_update'],'allow_auto_update'=>(bool)$policy['allow_auto_update'],'enable_scheduled_update'=>(bool)$policy['enable_scheduled_update'],'scheduled_update_interval_hours'=>(int)$policy['scheduled_update_interval_hours'],'channel'=>$channel,'current_version'=>$version,'current_build_seq'=>$build,'policy_revision'=>(int)$policy['policy_revision']];
     if (!$manifest) return $empty;
     foreach (['product','edition'] as $field) if (isset($manifest[$field]) && text_field($data, $field, 64) !== (string)$manifest[$field]
         && !($field === 'edition' && (string)$manifest[$field] === 'multi')) return $empty;
@@ -798,7 +853,26 @@ function canonical_update_manifest_json(array $manifest): string
     };
     return json_encode($normalize($manifest), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
 }
-function publish_update_manifest(PDO $db, array $manifest): array
+function enqueue_release_checks(PDO $db, array $manifest, int $updatedBy): int
+{
+    $created = 0; $now = time();
+    $devices = db_all($db, 'SELECT id,uuid FROM device_reports UNION SELECT id,uuid FROM device_deployments');
+    foreach ($devices as $device) {
+        $id=(string)$device['id']; $uuid=(string)$device['uuid']; $client=update_command_client($db,$id,$uuid);
+        $policy=update_policy($db,$id,$uuid,'stable');
+        if ((string)$policy['channel'] !== (string)$manifest['channel'] || !manifest_supports_client($manifest,$client)) continue;
+        $current=['version'=>text_field($client,'version',32,'0.0.0'),'build_seq'=>(int)($client['build_seq']??0)];
+        if (compare_release($manifest,$current) <= 0) continue;
+        $duplicate=db_one($db,"SELECT command_id FROM device_update_commands WHERE device_id=:id AND uuid=:uuid AND action='check' AND target_version=:version AND target_build_seq=:build AND status IN ('pending','accepted','received','checking','started','deferred') LIMIT 1",['id'=>$id,'uuid'=>$uuid,'version'=>$manifest['version'],'build'=>(int)$manifest['build_seq']]);
+        if ($duplicate) continue;
+        db_exec($db,"INSERT INTO device_update_commands(command_id,device_id,uuid,action,channel,target_version,target_build_seq,status,last_error,created_at,expires_at,updated_at,updated_by) VALUES(:command,:id,:uuid,'check',:channel,:version,:build,'pending',NULL,:created,:expires,:updated,:actor)",[
+            'command'=>bin2hex(random_bytes(16)),'id'=>$id,'uuid'=>$uuid,'channel'=>$manifest['channel'],'version'=>$manifest['version'],'build'=>(int)$manifest['build_seq'],'created'=>$now,'expires'=>$now+86400,'updated'=>$now,'actor'=>$updatedBy,
+        ]);
+        $created++;
+    }
+    return $created;
+}
+function publish_update_manifest(PDO $db, array $manifest, int $updatedBy = 0): array
 {
     $manifest = validate_update_manifest($manifest);
     $version=(string)$manifest['version']; $build=(int)$manifest['build_seq']; $channel=(string)$manifest['channel'];
@@ -819,13 +893,14 @@ function publish_update_manifest(PDO $db, array $manifest): array
                 if (canonical_update_manifest_json(decoded_payload($row['manifest'])) !== $encoded) fail(409, '相同 build_seq 已发布不同清单');
             }
             $commit();
-            return ['ok'=>true,'version'=>$version,'build_seq'=>$build,'channel'=>$channel,'idempotent'=>true];
+            return ['ok'=>true,'version'=>$version,'build_seq'=>$build,'channel'=>$channel,'idempotent'=>true,'notified_clients'=>0];
         }
         $latest = db_one($db, 'SELECT build_seq FROM update_releases WHERE channel=:channel ORDER BY build_seq DESC LIMIT 1'.$lock, ['channel'=>$channel]);
         if ($latest && (int)$latest['build_seq'] > $build) fail(409, 'build_seq 低于已发布清单');
         db_exec($db, 'INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(:version,:build,:channel,:manifest,:published_at,1)', ['version'=>$version,'build'=>$build,'channel'=>$channel,'manifest'=>$encoded,'published_at'=>time()]);
+        $notifiedClients=enqueue_release_checks($db,$manifest,$updatedBy);
         $commit();
-        return ['ok'=>true,'version'=>$version,'build_seq'=>$build,'channel'=>$channel];
+        return ['ok'=>true,'version'=>$version,'build_seq'=>$build,'channel'=>$channel,'notified_clients'=>$notifiedClients];
     } catch (Throwable $error) {
         try {
             $rollback();
@@ -1372,6 +1447,8 @@ function enrich_admin_address_book_peer(PDO $db, array $peer): array
         'public_ip'=>$publicIp, 'private_ips'=>is_array($network['private_ips'] ?? null) ? $network['private_ips'] : [], 'geo'=>$geo,
         'enable_check_update'=>array_key_exists('enable_check_update', $runtime) ? (bool)$runtime['enable_check_update'] : null,
         'allow_auto_update'=>array_key_exists('allow_auto_update', $runtime) ? (bool)$runtime['allow_auto_update'] : null,
+        'enable_scheduled_update'=>array_key_exists('enable_scheduled_update', $runtime) ? (bool)$runtime['enable_scheduled_update'] : null,
+        'scheduled_update_interval_hours'=>isset($runtime['scheduled_update_interval_hours']) ? (int)$runtime['scheduled_update_interval_hours'] : null,
         'last_seen'=>(int)($reportRow['last_seen'] ?? 0), 'last_heartbeat'=>$lastHeartbeat, 'presence'=>device_presence($lastHeartbeat, time()),
         'deployed'=>$deploymentRow !== null, 'address_book_user_ids'=>[],
     ]);
@@ -1486,7 +1563,16 @@ try {
         $actor=admin_user($db);
         if($_SERVER['REQUEST_METHOD']==='GET'){ $rows=db_all($db,'SELECT version,build_seq,channel,published_at,active FROM update_releases ORDER BY published_at DESC'); reply(['data'=>array_map(static fn($row)=>['version'=>$row['version'],'build_seq'=>(int)$row['build_seq'],'channel'=>$row['channel'],'published_at'=>(int)$row['published_at'],'active'=>(bool)$row['active']],$rows)]); }
         method('POST'); csrf_check(); $d=json_body(); if(!isset($d['manifest'])||!is_array($d['manifest']))fail(422,'manifest 必须是 JSON 对象'); $manifest=$d['manifest']; $manifest['version']=text_field($d,'version',32); $manifest['build_seq']=$d['build_seq']??0; $manifest['channel']=text_field($d,'channel',32,'stable');
-        $published=publish_update_manifest($db,$manifest); admin_event($db,(int)$actor['id'],'publish_update',0); reply($published,201);
+        $published=publish_update_manifest($db,$manifest,(int)$actor['id']); admin_event($db,(int)$actor['id'],'publish_update',0); reply($published,201);
+    }
+    if ($adminApi && $path === '/admin/api/update/commands/batch') {
+        $actor=admin_user($db); method('POST'); csrf_check(); $d=json_body(); $action=text_field($d,'action',16); if(!in_array($action,['check','install'],true))fail(422,'action 必须是 check 或 install'); $devices=update_batch_devices($db,$d);
+        $created=[]; $errors=[];
+        foreach($devices as $device){
+            try{$created[]=create_update_command($db,$actor,(string)$device['id'],['uuid'=>$device['uuid'],'action'=>$action,'expires_in'=>$d['expires_in']??3600]);}
+            catch(RequestError $error){$errors[]=['id'=>$device['id'],'uuid'=>$device['uuid'],'error'=>$error->getMessage()];}
+        }
+        reply(['ok'=>count($errors)===0,'created'=>count($created),'failed'=>count($errors),'commands'=>$created,'errors'=>$errors],201);
     }
     if ($adminApi && preg_match('#^/admin/api/update/commands/([^/]+)$#',$path,$match)) {
         $actor=admin_user($db); $id=rawurldecode($match[1]);
@@ -1497,6 +1583,16 @@ try {
             reply(['data'=>array_map('public_update_command',$rows)]);
         }
         method('POST'); csrf_check(); reply(create_update_command($db,$actor,$id,json_body()),201);
+    }
+    if ($adminApi && $path === '/admin/api/update/policies/batch') {
+        $actor=admin_user($db); method('PATCH'); csrf_check(); $d=json_body();
+        update_policy_boolean($d,'enable_scheduled_update',false); scheduled_update_interval($d,5);
+        $devices=update_batch_devices($db,$d); $saved=[];
+        txn($db,function()use($db,$actor,$devices,$d,&$saved){
+            foreach($devices as $device)$saved[]=patch_scheduled_update_policy($db,$actor,(string)$device['id'],(string)$device['uuid'],$d);
+            admin_event($db,(int)$actor['id'],'update_scheduled_policy_batch',0);
+        });
+        reply(['ok'=>true,'updated'=>count($saved),'policies'=>$saved]);
     }
     if ($adminApi && preg_match('#^/admin/api/update/policies(?:/([^/]+))?$#',$path,$match)) {
         $actor=admin_user($db); $id=isset($match[1])?rawurldecode($match[1]):'';
@@ -1510,12 +1606,14 @@ try {
         if(!in_array($channel,['stable','beta'],true))fail(422,'更新通道无效');
         if(array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null){ $build=$d['target_build_seq']; $valid=(is_int($build)&&$build>=0)||(is_string($build)&&ctype_digit($build)); if(!$valid)fail(422,'build_seq 必须是非负整数'); }
         if(array_key_exists('auto_install',$d)&&!is_bool($d['auto_install'])&&!in_array($d['auto_install'],[0,1,'0','1'],true))fail(422,'auto_install 必须是布尔值');
-        foreach(['enable_check_update','allow_auto_update'] as $field)if(array_key_exists($field,$d)&&!is_bool($d[$field])&&!in_array($d[$field],[0,1,'0','1'],true))fail(422,"$field 必须是布尔值");
+        foreach(['enable_check_update','allow_auto_update','enable_scheduled_update'] as $field)if(array_key_exists($field,$d)&&!is_bool($d[$field])&&!in_array($d[$field],[0,1,'0','1'],true))fail(422,"$field 必须是布尔值");
         $enableCheckUpdate=(int)(array_key_exists('enable_check_update',$d)?$d['enable_check_update']:($existing['enable_check_update']??false));
         $allowAutoUpdate=(int)(array_key_exists('allow_auto_update',$d)?$d['allow_auto_update']:($existing['allow_auto_update']??false));
+        $enableScheduledUpdate=(int)update_policy_boolean($d,'enable_scheduled_update',(bool)($existing['enable_scheduled_update']??false));
+        $scheduledInterval=scheduled_update_interval($d,(int)($existing['scheduled_update_interval_hours']??5));
         $saved=[];
-        txn($db,function()use($db,$id,$uuid,$mode,$channel,$d,$revision,$actor,$enableCheckUpdate,$allowAutoUpdate,&$saved){
-            db_upsert($db,'device_update_policies',['id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'target_version'=>array_key_exists('target_version',$d)?text_field($d,'target_version',32):null,'target_build_seq'=>array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null?(int)$d['target_build_seq']:null,'auto_install'=>(int)($d['auto_install']??false)||($mode==='auto_install'?1:0),'enable_check_update'=>$enableCheckUpdate,'allow_auto_update'=>$allowAutoUpdate,'policy_revision'=>$revision,'updated_by'=>(int)$actor['id'],'updated_at'=>time()],['id','uuid'],['mode','channel','target_version','target_build_seq','auto_install','enable_check_update','allow_auto_update','policy_revision','updated_by','updated_at']);
+        txn($db,function()use($db,$id,$uuid,$mode,$channel,$d,$revision,$actor,$enableCheckUpdate,$allowAutoUpdate,$enableScheduledUpdate,$scheduledInterval,&$saved){
+            db_upsert($db,'device_update_policies',['id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'target_version'=>array_key_exists('target_version',$d)?text_field($d,'target_version',32):null,'target_build_seq'=>array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null?(int)$d['target_build_seq']:null,'auto_install'=>(int)($d['auto_install']??false)||($mode==='auto_install'?1:0),'enable_check_update'=>$enableCheckUpdate,'allow_auto_update'=>$allowAutoUpdate,'enable_scheduled_update'=>$enableScheduledUpdate,'scheduled_update_interval_hours'=>$scheduledInterval,'policy_revision'=>$revision,'updated_by'=>(int)$actor['id'],'updated_at'=>time()],['id','uuid'],['mode','channel','target_version','target_build_seq','auto_install','enable_check_update','allow_auto_update','enable_scheduled_update','scheduled_update_interval_hours','policy_revision','updated_by','updated_at']);
             $saved=update_policy($db,$id,$uuid,$channel); admin_event($db,(int)$actor['id'],'update_device_policy',0);
         });
         $command=null;

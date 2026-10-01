@@ -112,21 +112,29 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.assertEqual(initial["mode"], "notify")
         self.assertFalse(initial["enable_check_update"])
         self.assertFalse(initial["allow_auto_update"])
-        _, saved, _ = self.client.json("PATCH", f"/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "disabled", "channel": "stable", "target_version": None, "target_build_seq": None, "auto_install": False, "enable_check_update": True, "allow_auto_update": True}, {"X-CSRF-Token": csrf})
+        self.assertFalse(initial["enable_scheduled_update"])
+        self.assertEqual(initial["scheduled_update_interval_hours"], 5)
+        _, saved, _ = self.client.json("PATCH", f"/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "disabled", "channel": "stable", "target_version": None, "target_build_seq": None, "auto_install": False, "enable_check_update": True, "allow_auto_update": True, "enable_scheduled_update": True, "scheduled_update_interval_hours": 24}, {"X-CSRF-Token": csrf})
         self.assertEqual(saved["mode"], "disabled")
         self.assertTrue(saved["enable_check_update"])
         self.assertTrue(saved["allow_auto_update"])
+        self.assertTrue(saved["enable_scheduled_update"])
+        self.assertEqual(saved["scheduled_update_interval_hours"], 24)
         _, persisted, _ = self.client.json("GET", f"/ops-x9/api/update/policies/{device_id}?uuid={uuid}")
         self.assertEqual(persisted["mode"], "disabled")
         self.assertTrue(persisted["enable_check_update"])
         self.assertTrue(persisted["allow_auto_update"])
-        self.assertEqual(self.sql(f"SELECT mode,channel,auto_install,enable_check_update,allow_auto_update FROM device_update_policies WHERE id='{device_id}' AND uuid='{uuid}'"), ["disabled\tstable\t0\t1\t1"])
+        self.assertTrue(persisted["enable_scheduled_update"])
+        self.assertEqual(persisted["scheduled_update_interval_hours"], 24)
+        self.assertEqual(self.sql(f"SELECT mode,channel,auto_install,enable_check_update,allow_auto_update,enable_scheduled_update,scheduled_update_interval_hours FROM device_update_policies WHERE id='{device_id}' AND uuid='{uuid}'"), ["disabled\tstable\t0\t1\t1\t1\t24"])
         _, stream, content_type = self.client.request("GET", f"/rd/update/v1/policy/stream?client_id={device_id}&client_uuid={uuid}", headers={"Accept": "text/event-stream"}, expected=(200,))
         self.assertIn("text/event-stream", content_type)
         event = json.loads(next(line[6:] for line in stream.splitlines() if line.startswith("data: ")))
         self.assertEqual(event["policy_revision"], 1)
         self.assertTrue(event["enable_check_update"])
         self.assertTrue(event["allow_auto_update"])
+        self.assertTrue(event["enable_scheduled_update"])
+        self.assertEqual(event["scheduled_update_interval_hours"], 24)
 
     def test_21a_one_shot_update_command_round_trip_and_sql(self):
         csrf = self.admin_login()
@@ -148,6 +156,19 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.client.json("POST", "/rd/update/v1/events", report, {"Content-Type": "application/json", **device_auth_headers("POST", "/rd/update/v1/events", device_id, uuid_value, report, created["command_id"])}, expected=(201,))
         self.assertEqual(self.sql(f"SELECT status FROM device_update_commands WHERE command_id='{created['command_id']}'"), ["completed"])
         self.assertEqual(self.sql(f"SELECT COUNT(*) FROM device_update_events WHERE command_id='{created['command_id']}' AND status='completed'"), ["1"])
+
+    def test_21b_bulk_scheduled_policy_and_check_commands(self):
+        csrf = self.admin_login()
+        suffix = str(time.time_ns())
+        devices = [{"id": f"mysql-bulk-update-{suffix}-{index}", "uuid": f"mysql-bulk-update-uuid-{suffix}-{index}"} for index in range(2)]
+        for device in devices:
+            self.client.json("POST", "/api/heartbeat", {**device, "conns": []})
+        _, saved, _ = self.client.json("PATCH", "/ops-x9/api/update/policies/batch", {"devices": devices, "enable_scheduled_update": True, "scheduled_update_interval_hours": 9}, {"X-CSRF-Token": csrf})
+        self.assertEqual(saved["updated"], 2)
+        self.assertEqual(self.sql(f"SELECT id,enable_scheduled_update,scheduled_update_interval_hours FROM device_update_policies WHERE id LIKE 'mysql-bulk-update-{suffix}-%' ORDER BY id"), [f"{devices[0]['id']}\t1\t9", f"{devices[1]['id']}\t1\t9"])
+        _, commands, _ = self.client.json("POST", "/ops-x9/api/update/commands/batch", {"devices": devices, "action": "check"}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertEqual((commands["created"], commands["failed"]), (2, 0))
+        self.assertEqual(self.sql(f"SELECT device_id,uuid,action,status FROM device_update_commands WHERE device_id LIKE 'mysql-bulk-update-{suffix}-%' ORDER BY device_id"), [f"{devices[0]['id']}\t{devices[0]['uuid']}\tcheck\tpending", f"{devices[1]['id']}\t{devices[1]['uuid']}\tcheck\tpending"])
     @classmethod
     def setUpClass(cls):
         cls.client = HttpClient(os.environ.get("RUSTDESK_TEST_URL", "http://127.0.0.1:17000"))
@@ -188,10 +209,10 @@ class MySQLIntegrationTest(unittest.TestCase):
         )
         command = ["docker", "exec", self.api_container, "php", "-r", php]
         subprocess.check_call(command, env={**os.environ, "HOME": "/tmp/codex-home", "DOCKER_HOST": "unix:///Users/olly/.docker/run/docker.sock"})
-        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'", database), ["12"])
+        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'", database), ["13"])
         self.assertEqual(self.sql("SELECT id,uuid,pk,JSON_EXTRACT(payload,'$.future.keep') FROM device_deployments", database), ["LegacyID\tLegacyUUID\tlegacy-pk\t1"])
         self.assertEqual(self.sql("SELECT id,uuid,JSON_UNQUOTE(JSON_EXTRACT(payload,'$.hostname')),JSON_UNQUOTE(JSON_EXTRACT(heartbeat_payload,'$.ver')) FROM device_reports", database), ["LegacyID\tLegacyUUID\tlegacy-host\t9"])
-        self.assertEqual(self.sql("SELECT mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update,policy_revision FROM device_update_policies WHERE id='LegacyID'", database), ["download\tbeta\t1.9.0\t99\t1\t0\t0\t7"])
+        self.assertEqual(self.sql("SELECT mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update,enable_scheduled_update,scheduled_update_interval_hours,policy_revision FROM device_update_policies WHERE id='LegacyID'", database), ["download\tbeta\t1.9.0\t99\t1\t0\t0\t0\t5\t7"])
         self.assertEqual(self.sql("SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION),GROUP_CONCAT(COLLATION_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_deployments' AND COLUMN_NAME IN ('id','uuid')", database), ["id,uuid\tutf8mb4_bin,utf8mb4_bin"])
         self.assertEqual(self.sql("SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY ORDINAL_POSITION) FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_deployments' AND CONSTRAINT_NAME='PRIMARY'", database), ["id,uuid"])
 
@@ -250,7 +271,7 @@ class MySQLIntegrationTest(unittest.TestCase):
         return {"Authorization": "Bearer " + body["access_token"]}
 
     def test_01_public_and_custom_admin_path(self):
-        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'"), ["12"])
+        self.assertEqual(self.sql("SELECT value FROM app_meta WHERE `key`='schema_version'"), ["13"])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='device_reports' AND COLUMN_NAME IN ('runtime_payload','network_payload')"), ["2"])
         self.assertEqual(
             self.sql("SELECT COUNT(*),COUNT(DISTINCT TABLE_COLLATION),MIN(TABLE_COLLATION) FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()"),

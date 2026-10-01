@@ -325,9 +325,9 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(row, ("legacy", legacy_password("legacy123"), 1700000001, 0))
         self.assertEqual(peer, (2, "legacy-id", "Old alias", "prod,blue", "legacy-hash"))
         self.assertEqual(token, ("a" * 64, 0))
-        self.assertEqual(schema_version, "12")
+        self.assertEqual(schema_version, "13")
         self.assertTrue({"runtime_payload", "network_payload"}.issubset(columns))
-        self.assertTrue({"enable_check_update", "allow_auto_update"}.issubset(policy_columns))
+        self.assertTrue({"enable_check_update", "allow_auto_update", "enable_scheduled_update", "scheduled_update_interval_hours"}.issubset(policy_columns))
         auth = {"Authorization": "Bearer " + ("a" * 64)}
         _, current, _ = self.client.json("POST", "/?s=/api/currentUser", {"id": "legacy-id", "uuid": "legacy-uuid"}, auth)
         self.assertEqual(current.get("name"), "legacy")
@@ -368,12 +368,12 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         db = sqlite3.connect(db_path)
         columns = {row[1] for row in db.execute("PRAGMA table_info(device_update_policies)")}
-        policy = db.execute("SELECT mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update,policy_revision FROM device_update_policies WHERE id='legacy-policy'").fetchone()
+        policy = db.execute("SELECT mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update,enable_scheduled_update,scheduled_update_interval_hours,policy_revision FROM device_update_policies WHERE id='legacy-policy'").fetchone()
         version = db.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0]
         db.close()
-        self.assertTrue({"enable_check_update", "allow_auto_update"}.issubset(columns))
-        self.assertEqual(policy, ("download", "beta", "1.9.0", 99, 1, 0, 0, 7))
-        self.assertEqual(version, "12")
+        self.assertTrue({"enable_check_update", "allow_auto_update", "enable_scheduled_update", "scheduled_update_interval_hours"}.issubset(columns))
+        self.assertEqual(policy, ("download", "beta", "1.9.0", 99, 1, 0, 0, 0, 5, 7))
+        self.assertEqual(version, "13")
 
     def test_01c_v10_update_events_migrate_before_command_index(self):
         db_path = self.temp / "events-v10.db"
@@ -413,7 +413,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertIn("command_id", columns)
         self.assertIn("device_update_event_command_status", indexes)
         self.assertEqual(event, ("legacy-device", "legacy-uuid", "completed", None))
-        self.assertEqual(version, "12")
+        self.assertEqual(version, "13")
 
     def test_02_rustdesk_login_current_user_and_logout_revokes_token(self):
         status, body, _ = self.client.json("POST", "/?s=/api/login", {"username": "legacy", "password": "legacy123", "id": "legacy-id", "uuid": "legacy-uuid"})
@@ -583,6 +583,8 @@ class IntegrationTest(unittest.TestCase):
 
     def test_update_manifest_check_and_event_round_trip(self):
         csrf = self.admin_csrf()
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": "update-publish-device", "uuid": "update-publish-uuid", "conns": []})
+        self.client.json("POST", "/?s=/api/sysinfo", {"id": "update-publish-device", "uuid": "update-publish-uuid", "product": "rustdesk-yan", "edition": "custom", "platform": "windows", "arch": "x86_64", "package_kind": "exe"})
         target = {
             "primary": "https://download.yan.life/rustdesk/stable/v1.5.0-build-2026.10.01-01/rustdesk-1.5.0-custom-windows-x86_64.exe",
             "mirrors": [], "size": 12, "sha256": "b" * 64,
@@ -592,6 +594,7 @@ class IntegrationTest(unittest.TestCase):
         payload = {"version": "1.5.0", "build_seq": 2026100101, "channel": "stable", "manifest": manifest}
         _, published, _ = self.client.json("POST", "/?s=/ops-x9/api/update/releases", payload, {"X-CSRF-Token": csrf}, expected=(201,))
         self.assertEqual(published["build_seq"], 2026100101)
+        self.assertGreaterEqual(published["notified_clients"], 1)
         self.assertTrue(self.client.json("POST", "/?s=/ops-x9/api/update/releases", payload, {"X-CSRF-Token": csrf}, expected=(201,))[1]["idempotent"])
         conflict = json.loads(json.dumps(payload)); conflict["manifest"]["source_commit"] = "different-admin-commit"
         self.client.json("POST", "/?s=/ops-x9/api/update/releases", conflict, {"X-CSRF-Token": csrf}, expected=(409,))
@@ -609,6 +612,7 @@ class IntegrationTest(unittest.TestCase):
         db = sqlite3.connect(self.db)
         self.assertEqual(db.execute("SELECT status,error_code FROM device_update_events WHERE device_id='update-device' ORDER BY id").fetchall(), [("installed", None), ("deferred", "user_deferred"), ("rollback_failed", "restore_failed")])
         self.assertEqual(db.execute("SELECT COUNT(*) FROM update_releases WHERE channel='stable' AND build_seq=2026100101").fetchone()[0], 1)
+        self.assertEqual(db.execute("SELECT action,target_version,target_build_seq,status FROM device_update_commands WHERE device_id='update-publish-device' AND uuid='update-publish-uuid'").fetchall(), [("check", "1.5.0", 2026100101, "pending")])
         db.close()
 
     def test_update_identity_resolves_reported_device_by_uuid(self):
@@ -712,6 +716,8 @@ class IntegrationTest(unittest.TestCase):
         self.assertFalse(current_release["update_available"])
         self.assertEqual((current_release["target_version"], current_release["target_build_seq"]), ("1.5.0", 2026093005))
         self.assertNotIn("url", current_release)
+        self.assertNotIn("manifest_url", current_release)
+        self.assertNotIn("manifest", current_release)
         request["build_seq"] = 2026093004
         _, public_manifest, _ = self.client.json("GET", "/?s=/rd/update/v1/manifest/stable.json")
         self.assertEqual(public_manifest, manifest)
@@ -754,16 +760,22 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(initial["mode"], "notify")
         self.assertFalse(initial["enable_check_update"])
         self.assertFalse(initial["allow_auto_update"])
-        _, saved, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "auto_install", "channel": "beta", "target_version": "1.6.0", "target_build_seq": 2026100102, "auto_install": True, "enable_check_update": True, "allow_auto_update": True}, {"X-CSRF-Token": csrf})
+        self.assertFalse(initial["enable_scheduled_update"])
+        self.assertEqual(initial["scheduled_update_interval_hours"], 5)
+        _, saved, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "auto_install", "channel": "beta", "target_version": "1.6.0", "target_build_seq": 2026100102, "auto_install": True, "enable_check_update": True, "allow_auto_update": True, "enable_scheduled_update": True, "scheduled_update_interval_hours": 12}, {"X-CSRF-Token": csrf})
         self.assertEqual(saved["mode"], "auto_install")
         self.assertTrue(saved["enable_check_update"])
         self.assertTrue(saved["allow_auto_update"])
+        self.assertTrue(saved["enable_scheduled_update"])
+        self.assertEqual(saved["scheduled_update_interval_hours"], 12)
         _, persisted, _ = self.client.json("GET", f"/?s=/ops-x9/api/update/policies/{device_id}?uuid={uuid}&channel=stable")
         self.assertEqual((persisted["mode"], persisted["channel"], persisted["target_version"], int(persisted["target_build_seq"])), ("auto_install", "beta", "1.6.0", 2026100102))
         self.assertTrue(persisted["enable_check_update"])
         self.assertTrue(persisted["allow_auto_update"])
+        self.assertTrue(persisted["enable_scheduled_update"])
+        self.assertEqual(persisted["scheduled_update_interval_hours"], 12)
         db = sqlite3.connect(self.db)
-        self.assertEqual(db.execute("SELECT mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update FROM device_update_policies WHERE id=? AND uuid=?", (device_id, uuid)).fetchone(), ("auto_install", "beta", "1.6.0", 2026100102, 1, 1, 1))
+        self.assertEqual(db.execute("SELECT mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update,enable_scheduled_update,scheduled_update_interval_hours FROM device_update_policies WHERE id=? AND uuid=?", (device_id, uuid)).fetchone(), ("auto_install", "beta", "1.6.0", 2026100102, 1, 1, 1, 1, 12))
         db.close()
         status, stream, content_type = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}", headers={"Accept": "text/event-stream"}, expected=(200,))
         self.assertEqual(status, 200)
@@ -774,7 +786,9 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual((event["client_id"], event["client_uuid"], event["policy_revision"]), (device_id, uuid, 1))
         self.assertTrue(event["enable_check_update"])
         self.assertTrue(event["allow_auto_update"])
-        _, saved_again, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "target_version": None, "target_build_seq": None, "auto_install": False, "enable_check_update": False, "allow_auto_update": False}, {"X-CSRF-Token": csrf})
+        self.assertTrue(event["enable_scheduled_update"])
+        self.assertEqual(event["scheduled_update_interval_hours"], 12)
+        _, saved_again, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "target_version": None, "target_build_seq": None, "auto_install": False, "enable_check_update": False, "allow_auto_update": False, "enable_scheduled_update": False, "scheduled_update_interval_hours": 5}, {"X-CSRF-Token": csrf})
         self.assertEqual(saved_again["policy_revision"], 2)
         _, resumed, _ = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}", headers={"Accept": "text/event-stream", "Last-Event-ID": str(first_event_id)}, expected=(200,))
         second_event_id = int(next(line[4:] for line in resumed.splitlines() if line.startswith("id: ")))
@@ -782,6 +796,8 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(resumed_event["policy_revision"], 2)
         self.assertFalse(resumed_event["enable_check_update"])
         self.assertFalse(resumed_event["allow_auto_update"])
+        self.assertFalse(resumed_event["enable_scheduled_update"])
+        self.assertEqual(resumed_event["scheduled_update_interval_hours"], 5)
         def wait_for_policy():
             request = urllib.request.Request(
                 self.url + f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}",
@@ -805,9 +821,54 @@ class IntegrationTest(unittest.TestCase):
         status, error, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "target_build_seq": "not-a-number"}, {"X-CSRF-Token": csrf}, expected=(422,))
         self.assertEqual(status, 422)
         self.assertIn("build_seq", error["error"])
+        self.assertEqual(self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "scheduled_update_interval_hours": 0}, {"X-CSRF-Token": csrf}, expected=(422,))[0], 422)
+        self.assertEqual(self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "scheduled_update_interval_hours": 169}, {"X-CSRF-Token": csrf}, expected=(422,))[0], 422)
         status, error, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "target_build_seq": -1}, {"X-CSRF-Token": csrf}, expected=(422,))
         self.assertEqual(status, 422)
         self.assertIn("build_seq", error["error"])
+
+    def test_admin_bulk_update_commands_and_scheduled_policy(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        devices = [{"id": f"bulk-update-{suffix}-{index}", "uuid": f"bulk-update-uuid-{suffix}-{index}"} for index in range(3)]
+        for device in devices:
+            self.client.json("POST", "/?s=/api/heartbeat", {**device, "conns": []})
+            self.client.json("POST", "/?s=/api/sysinfo", {**device, "product": "rustdesk-yan", "edition": "custom", "platform": "windows", "arch": "x86_64", "package_kind": "exe"})
+
+        endpoint = "/?s=/ops-x9/api/update/policies/batch"
+        _, saved, _ = self.client.json("PATCH", endpoint, {
+            "devices": devices[:2], "enable_scheduled_update": True, "scheduled_update_interval_hours": 8,
+        }, {"X-CSRF-Token": csrf})
+        self.assertEqual(saved["updated"], 2)
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT id,enable_scheduled_update,scheduled_update_interval_hours FROM device_update_policies WHERE id LIKE ? ORDER BY id", (f"bulk-update-{suffix}-%",)).fetchall(), [(devices[0]["id"], 1, 8), (devices[1]["id"], 1, 8)])
+        db.close()
+
+        _, repeated, _ = self.client.json("PATCH", endpoint, {
+            "devices": devices[:2], "enable_scheduled_update": True, "scheduled_update_interval_hours": 8,
+        }, {"X-CSRF-Token": csrf})
+        self.assertEqual(repeated["updated"], 2)
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT policy_revision FROM device_update_policies WHERE id=?", (devices[0]["id"],)).fetchone()[0], 1)
+        db.close()
+
+        _, all_saved, _ = self.client.json("PATCH", endpoint, {
+            "all": True, "enable_scheduled_update": False, "scheduled_update_interval_hours": 5,
+        }, {"X-CSRF-Token": csrf})
+        self.assertGreaterEqual(all_saved["updated"], 3)
+
+        _, commands, _ = self.client.json("POST", "/?s=/ops-x9/api/update/commands/batch", {
+            "devices": devices[:2], "action": "check",
+        }, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertEqual(commands["created"], 2)
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT device_id,uuid,action,status FROM device_update_commands WHERE device_id LIKE ? ORDER BY device_id", (f"bulk-update-{suffix}-%",)).fetchall(), [(devices[0]["id"], devices[0]["uuid"], "check", "pending"), (devices[1]["id"], devices[1]["uuid"], "check", "pending")])
+        db.close()
+
+        unknown = {"id": "not-a-device", "uuid": devices[0]["uuid"]}
+        self.assertEqual(self.client.json("POST", "/?s=/ops-x9/api/update/commands/batch", {
+            "devices": [unknown], "action": "check",
+        }, {"X-CSRF-Token": csrf}, expected=(404,))[0], 404)
 
     def test_admin_one_shot_update_commands_stream_resume_and_status(self):
         csrf = self.admin_csrf()

@@ -74,6 +74,22 @@ Unknown fields, tags, peer metadata and other address-book entries must be prese
 - Removes report and deployment records for the selected `(id, uuid)` only.
 - A legacy request without `uuid` is accepted only when the ID resolves to exactly one UUID; ambiguous IDs return `409`.
 
+## Update-control contract
+
+Every update identity uses the reported raw `client_id` plus the device's real UUID. Exact identity wins. The legacy `client_id=RustDesk Yan` compatibility path may resolve only when that UUID identifies exactly one reported device.
+
+The policy response, update-check response and `update-policy` SSE event expose:
+
+- `enable_check_update` and `allow_auto_update`;
+- `enable_scheduled_update`, default `false`;
+- `scheduled_update_interval_hours`, default `5`, accepted range `1..168`.
+
+`PATCH ${RUSTDESK_ADMIN_PATH}/api/update/policies/{id}` changes one device. `PATCH ${RUSTDESK_ADMIN_PATH}/api/update/policies/batch` accepts either `devices: [{id,uuid}]` or `all: true` for scheduled-check policy changes. Every changed device increments its `policy_revision`, so a connected SSE client receives the change within the current stream polling window.
+
+`POST ${RUSTDESK_ADMIN_PATH}/api/update/commands/{id}` and `/api/update/commands/batch` accept `action: check|install`. `check` asks the client to check and present its normal confirmation flow; `install` is the server-forced install command. Publishing a new manifest creates one deduplicated, version-locked `check` command for each compatible known client. An idempotent repeat publication creates no duplicate commands.
+
+When a client already has the matching or a newer release, `/rd/update/v1/check` still returns `target_version` and `target_build_seq` for display, but omits `url`, `manifest_url` and `manifest` installation payloads.
+
 ## UI contract
 
 - Dense operations layout with shared navigation and a compact statistics strip.
