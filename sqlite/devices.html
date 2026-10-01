@@ -42,6 +42,7 @@
         <section class="panel" aria-label="客户端列表">
           <div class="toolbar">
             <button id="address-book-action" class="button primary" type="button" disabled>加入通讯录</button>
+            <button id="batch-remove-devices" class="button danger" type="button" disabled>批量移除</button>
             <button id="batch-check-update" class="button" type="button" disabled>检查所选更新</button>
             <button id="batch-install-update" class="button" type="button" disabled>强制更新所选</button>
             <div class="field grow">
@@ -102,30 +103,36 @@
   <dialog id="details-dialog" aria-labelledby="details-title">
     <div class="dialog-form">
       <div class="dialog-head"><h3 id="details-title">客户端详情</h3><p id="details-device"></p></div>
-      <div id="details-body" class="details-grid"></div>
-      <section class="details-section update-policy-section" aria-labelledby="update-policy-title">
-        <h4 id="update-policy-title">更新策略</h4>
-        <p class="muted">仅影响当前客户端，不需要重新打包客户端。保存后客户端会通过实时策略流接收变更。</p>
-        <div class="toolbar-switches">
-          <label class="check" for="enable-check-update"><input id="enable-check-update" type="checkbox">启动时检查软件更新</label>
-          <label class="check" for="allow-auto-update"><input id="allow-auto-update" type="checkbox">自动更新</label>
-          <label class="check" for="enable-scheduled-update"><input id="enable-scheduled-update" type="checkbox">定时检查更新</label>
-        </div>
-        <div class="policy-controls">
-          <div class="field"><label for="update-mode">更新方式</label><select id="update-mode" class="select"><option value="notify">仅提示</option><option value="download">自动下载</option><option value="auto_install">自动安装</option><option value="disabled">关闭更新</option><option value="immediate">立即更新（保存后下发）</option></select></div>
-          <div class="field"><label for="update-channel">更新通道</label><select id="update-channel" class="select"><option value="stable">stable</option><option value="beta">beta</option></select></div>
-          <div class="field"><label for="update-version">指定版本（可选）</label><input id="update-version" class="input" maxlength="32" placeholder="例如 1.5.0" autocomplete="off"></div>
-          <div class="field"><label for="update-build">指定 build_seq（可选）</label><input id="update-build" class="input" inputmode="numeric" pattern="[0-9]*" placeholder="例如 2026100101" autocomplete="off"></div>
-          <div class="field"><label for="scheduled-update-hours">定时检查间隔（小时）</label><input id="scheduled-update-hours" class="input" type="number" min="1" max="168" value="5"></div>
-        </div>
-        <p id="update-policy-summary" class="muted" aria-live="polite"></p>
-        <p id="update-policy-error" class="form-error" role="alert"></p>
-        <button id="update-policy-save" class="button primary" type="button">保存更新策略</button>
-      </section>
-      <section class="details-section" aria-labelledby="update-command-title">
-        <h4 id="update-command-title">最近更新命令</h4>
-        <div id="update-command-history" class="details-grid"><p class="muted">暂无一次性更新命令</p></div>
-      </section>
+      <div class="details-scroll">
+        <div id="details-body" class="details-grid"></div>
+        <section class="details-section update-policy-section" aria-labelledby="update-policy-title">
+          <h4 id="update-policy-title">更新策略</h4>
+          <p class="muted">仅影响当前客户端，不需要重新打包客户端。保存后客户端会通过实时策略流接收变更。</p>
+          <div class="toolbar-switches">
+            <label class="check" for="enable-check-update"><input id="enable-check-update" type="checkbox">启动时检查软件更新</label>
+            <label class="check" for="allow-auto-update"><input id="allow-auto-update" type="checkbox">自动更新</label>
+            <label class="check" for="enable-scheduled-update"><input id="enable-scheduled-update" type="checkbox">定时检查更新</label>
+          </div>
+          <div class="policy-controls">
+            <div class="field"><label for="update-mode">更新方式</label><select id="update-mode" class="select"><option value="notify">仅提示</option><option value="download">自动下载</option><option value="auto_install">自动安装</option><option value="disabled">关闭更新</option><option value="immediate">立即更新（保存后下发）</option></select></div>
+            <div class="field"><label for="update-channel">更新通道</label><select id="update-channel" class="select"><option value="stable">stable</option><option value="beta">beta</option></select></div>
+            <div class="field"><label for="update-version">指定版本（可选）</label><input id="update-version" class="input" maxlength="32" placeholder="例如 1.5.0" autocomplete="off"></div>
+            <div class="field"><label for="update-build">指定 build_seq（可选）</label><input id="update-build" class="input" inputmode="numeric" pattern="[0-9]*" placeholder="例如 2026100101" autocomplete="off"></div>
+            <div class="field"><label for="scheduled-update-hours">定时检查间隔（小时）</label><input id="scheduled-update-hours" class="input" type="number" min="1" max="168" value="5"></div>
+          </div>
+          <p id="update-policy-summary" class="muted" aria-live="polite"></p>
+          <p id="update-policy-error" class="form-error" role="alert"></p>
+          <button id="update-policy-save" class="button primary" type="button">保存更新策略</button>
+        </section>
+        <section class="details-section" aria-labelledby="update-command-title">
+          <h4 id="update-command-title">最近更新命令</h4>
+          <div class="dialog-actions">
+            <button id="details-check-update" class="button" type="button">立即检查更新</button>
+            <button id="details-install-update" class="button primary" type="button">立即安装更新</button>
+          </div>
+          <div id="update-command-history" class="details-grid"><p class="muted">暂无一次性更新命令</p></div>
+        </section>
+      </div>
       <div class="dialog-actions"><button id="details-close" class="button" type="button">关闭</button></div>
     </div>
   </dialog>
@@ -210,7 +217,7 @@
       requestAnimationFrame(() => $('alias-input').focus());
     }
     function selectedDevices() { return Array.from(state.selected.values()); }
-    function updateAssignmentButton() { const count = state.selected.size; $('address-book-action').disabled = count === 0; $('address-book-action').textContent = count ? '加入通讯录（' + count + '）' : '加入通讯录'; ['batch-check-update','batch-install-update','batch-scheduled-selected'].forEach(id => { $(id).disabled = count === 0; }); }
+    function updateAssignmentButton() { const count = state.selected.size; $('address-book-action').disabled = count === 0; $('address-book-action').textContent = count ? '加入通讯录（' + count + '）' : '加入通讯录'; $('batch-remove-devices').textContent = count ? '批量移除（' + count + '）' : '批量移除'; ['batch-remove-devices','batch-check-update','batch-install-update','batch-scheduled-selected'].forEach(id => { $(id).disabled = count === 0; }); }
     function updateSelectAll(devices = visibleDevices()) { const control = $('select-all-devices'); const selected = devices.filter(device => state.selected.has(deviceKey(device))).length; control.checked = devices.length > 0 && selected === devices.length; control.indeterminate = selected > 0 && selected < devices.length; }
     function syncSelectionControls(devices = visibleDevices()) {
       const visibleKeys = new Set(devices.map(deviceKey));
@@ -347,7 +354,7 @@
       const networkCell = appendCell(row, '网络'); networkCell.append(textLine('cell-title network-ip', device.public_ip || '公网 IP 未上报')); const location = geoLabel(device.geo); if (location) networkCell.append(textLine('cell-subtitle network-location', location));
       const statusCell = appendCell(row, '状态'); const currentPresence = presence(device); const badge = document.createElement('span'); badge.className = 'status-badge ' + currentPresence; badge.append(textLine('status-dot ' + currentPresence, ''), document.createTextNode(labels[currentPresence])); statusCell.append(badge);
       const activity = appendCell(row, '最近活动'); const timestamp = activityAt(device); activity.append(textLine('cell-title', relativeTime(timestamp))); if (timestamp) activity.append(textLine('cell-subtitle', new Date(timestamp * 1000).toLocaleString()));
-      const actionCell = appendCell(row, '操作', 'actions-cell'); const actions = document.createElement('div'); actions.className = 'row-actions'; const detailButton = document.createElement('button'); detailButton.className = 'button small'; detailButton.type = 'button'; detailButton.textContent = '详情'; detailButton.setAttribute('aria-label', '查看客户端详情'); detailButton.onclick = () => openDetails(device); const checkButton = document.createElement('button'); checkButton.className = 'button small'; checkButton.type = 'button'; checkButton.textContent = '立即检查'; checkButton.setAttribute('aria-label', '立即检查更新'); checkButton.onclick = () => sendUpdateCommand(device, 'check', checkButton); const installButton = document.createElement('button'); installButton.className = 'button small primary'; installButton.type = 'button'; installButton.textContent = '立即更新'; installButton.setAttribute('aria-label', '立即安装更新'); installButton.onclick = () => sendUpdateCommand(device, 'install', installButton); const aliasButton = document.createElement('button'); aliasButton.className = 'button small'; aliasButton.type = 'button'; aliasButton.textContent = '编辑备注'; aliasButton.setAttribute('aria-label', '编辑备注'); aliasButton.onclick = () => openAlias(device); const assignmentButton = document.createElement('button'); assignmentButton.className = 'button small'; assignmentButton.type = 'button'; assignmentButton.textContent = '分配通讯录'; assignmentButton.setAttribute('aria-label', '分配通讯录'); assignmentButton.onclick = () => openAssignment([device]); const removeButton = document.createElement('button'); removeButton.className = 'button small danger'; removeButton.type = 'button'; removeButton.textContent = '移除'; removeButton.setAttribute('aria-label', '移除'); removeButton.onclick = () => removeDevice(device); actions.append(detailButton, checkButton, installButton, aliasButton, assignmentButton, removeButton); actionCell.append(actions);
+      const actionCell = appendCell(row, '操作', 'actions-cell'); const actions = document.createElement('div'); actions.className = 'row-actions'; const detailButton = document.createElement('button'); detailButton.className = 'button small'; detailButton.type = 'button'; detailButton.textContent = '详情'; detailButton.setAttribute('aria-label', '查看客户端详情'); detailButton.onclick = () => openDetails(device); const aliasButton = document.createElement('button'); aliasButton.className = 'button small'; aliasButton.type = 'button'; aliasButton.textContent = '编辑备注'; aliasButton.setAttribute('aria-label', '编辑备注'); aliasButton.onclick = () => openAlias(device); const assignmentButton = document.createElement('button'); assignmentButton.className = 'button small'; assignmentButton.type = 'button'; assignmentButton.textContent = '分配通讯录'; assignmentButton.setAttribute('aria-label', '分配通讯录'); assignmentButton.onclick = () => openAssignment([device]); const removeButton = document.createElement('button'); removeButton.className = 'button small danger'; removeButton.type = 'button'; removeButton.textContent = '移除'; removeButton.setAttribute('aria-label', '移除'); removeButton.onclick = () => removeDevice(device); actions.append(detailButton, aliasButton, assignmentButton, removeButton); actionCell.append(actions);
       row.dataset.renderSignature = JSON.stringify(device);
     }
 
@@ -423,6 +430,14 @@
         await load();
       } catch (error) { const refs = Array.isArray(error.references) ? error.references : []; setFeedback(refs.length ? error.message + '：' + refs.map(item => item.username || item.user_id).join('、') : error.message, 'error'); }
     }
+    async function removeSelectedDevices() {
+      const devices = selectedDevices(); if (!devices.length) return;
+      if (!confirm('确认批量移除选中的 ' + devices.length + ' 台客户端登记和上报信息？')) return;
+      try {
+        const response = await api('__ADMIN_PATH__/api/devices', { method: 'DELETE', body: JSON.stringify({ devices: devices.map(device => ({ id: device.id, uuid: device.uuid })) }) });
+        state.selected.clear(); await load(); updateAssignmentButton(); setFeedback('已移除 ' + response.removed + ' 台客户端', 'success');
+      } catch (error) { const refs = Array.isArray(error.references) ? error.references : []; setFeedback(refs.length ? error.message + '：' + refs.map(item => item.id + ' / ' + (item.username || item.user_id)).join('、') : error.message, 'error'); }
+    }
 
     function scheduleRefresh() {
       if (state.timer) clearInterval(state.timer);
@@ -437,6 +452,7 @@
     $('presence-filter').addEventListener('change', render); $('platform-filter').addEventListener('change', render); $('assigned-user-filter').addEventListener('change', render); $('version-filter').addEventListener('input', render);
     $('labelled-only').addEventListener('change', render);
     $('address-book-action').addEventListener('click', () => openAssignment());
+    $('batch-remove-devices').addEventListener('click', removeSelectedDevices);
     $('batch-check-update').addEventListener('click', () => sendBatchUpdateCommand('check', false).catch(error => setFeedback(error.message, 'error')));
     $('batch-install-update').addEventListener('click', () => sendBatchUpdateCommand('install', false).catch(error => setFeedback(error.message, 'error')));
     $('batch-check-all').addEventListener('click', () => sendBatchUpdateCommand('check', true).catch(error => setFeedback(error.message, 'error')));
@@ -458,6 +474,8 @@
     ['update-mode', 'update-channel'].forEach(id => $(id).addEventListener('change', updatePolicySummary));
     ['update-version', 'update-build'].forEach(id => $(id).addEventListener('input', updatePolicySummary));
     $('update-policy-save').addEventListener('click', saveUpdatePolicy);
+    $('details-check-update').addEventListener('click', event => { if (state.policyDevice) sendUpdateCommand(state.policyDevice, 'check', event.currentTarget); });
+    $('details-install-update').addEventListener('click', event => { if (state.policyDevice) sendUpdateCommand(state.policyDevice, 'install', event.currentTarget); });
     bindDialogDismiss();
     $('alias-form').addEventListener('submit', async event => {
       event.preventDefault();

@@ -861,6 +861,55 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(status, 422)
         self.assertIn("build_seq", error["error"])
 
+    def test_reported_update_settings_initialize_and_reconcile_policy_by_revision(self):
+        csrf = self.admin_csrf()
+        device_id, uuid = "reported-policy-device", "reported-policy-device-uuid"
+        reported = {
+            "id": device_id, "uuid": uuid, "hostname": "reported-policy-host",
+            "enable_check_update": True, "allow_auto_update": True,
+            "enable_scheduled_update": True, "scheduled_update_interval_hours": 18,
+            "update_policy_revision": 0,
+        }
+        self.client.json("POST", "/?s=/api/sysinfo", reported)
+        _, initial, _ = self.client.json("GET", f"/?s=/ops-x9/api/update/policies/{device_id}?uuid={uuid}")
+        self.assertTrue(initial["enable_check_update"])
+        self.assertTrue(initial["allow_auto_update"])
+        self.assertTrue(initial["enable_scheduled_update"])
+        self.assertEqual(initial["scheduled_update_interval_hours"], 18)
+        self.assertEqual(initial["policy_revision"], 0)
+
+        _, saved, _ = self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {
+            "uuid": uuid, "mode": "notify", "channel": "stable",
+            "enable_check_update": False, "allow_auto_update": False,
+            "enable_scheduled_update": False, "scheduled_update_interval_hours": 6,
+        }, {"X-CSRF-Token": csrf})
+        self.assertEqual(saved["policy_revision"], 1)
+
+        self.client.json("POST", "/?s=/api/sysinfo", reported)
+        _, after_stale, _ = self.client.json("GET", f"/?s=/ops-x9/api/update/policies/{device_id}?uuid={uuid}")
+        self.assertFalse(after_stale["enable_check_update"])
+        self.assertFalse(after_stale["allow_auto_update"])
+        self.assertFalse(after_stale["enable_scheduled_update"])
+        self.assertEqual(after_stale["scheduled_update_interval_hours"], 6)
+        self.assertEqual(after_stale["policy_revision"], 1)
+
+        self.client.json("POST", "/?s=/api/sysinfo", {
+            **reported, "update_policy_revision": 1, "enable_check_update": True,
+            "allow_auto_update": True, "enable_scheduled_update": True,
+            "scheduled_update_interval_hours": 9,
+        })
+        _, reconciled, _ = self.client.json("GET", f"/?s=/ops-x9/api/update/policies/{device_id}?uuid={uuid}")
+        self.assertTrue(reconciled["enable_check_update"])
+        self.assertTrue(reconciled["allow_auto_update"])
+        self.assertTrue(reconciled["enable_scheduled_update"])
+        self.assertEqual(reconciled["scheduled_update_interval_hours"], 9)
+        self.assertEqual(reconciled["policy_revision"], 2)
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute(
+            "SELECT enable_check_update,allow_auto_update,enable_scheduled_update,scheduled_update_interval_hours,policy_revision FROM device_update_policies WHERE id=? AND uuid=?",
+            (device_id, uuid),
+        ).fetchone(), (1, 1, 1, 9, 2))
+        db.close()
     def test_admin_bulk_update_commands_and_scheduled_policy(self):
         csrf = self.admin_csrf()
         suffix = uuid.uuid4().hex[:10]
@@ -1711,6 +1760,39 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(db.execute("SELECT id,uuid,json_extract(payload,'$.hostname') FROM device_reports WHERE id=? ORDER BY uuid", (device_id,)).fetchall(), [
             (device_id, "CaseUUID", "host-upper"), (device_id, "caseuuid", "host-lower"), (device_id, "uuid-b", "host-b"),
         ])
+        db.close()
+
+    def test_26a_batch_device_removal_is_atomic_and_uses_composite_identity(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        removable = {"id": f"batch-remove-{suffix}", "uuid": "uuid-remove"}
+        sibling = {"id": removable["id"], "uuid": "uuid-keep"}
+        second = {"id": f"batch-remove-second-{suffix}", "uuid": "uuid-second"}
+        auth = self.rust_login()
+        for device in [removable, sibling, second]:
+            self.client.json("POST", "/?s=/api/heartbeat", {**device, "conns": []})
+            self.client.json("POST", "/?s=/api/sysinfo", {**device, "hostname": device["uuid"]})
+            self.client.json("POST", "/?s=/api/devices/deploy", {**device, "pk": f"pk-{device['uuid']}"}, auth)
+
+        self.client.json("DELETE", "/?s=/ops-x9/api/devices", {
+            "devices": [removable, second],
+        }, {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        for table in ["device_reports", "device_deployments"]:
+            self.assertEqual(db.execute(f"SELECT COUNT(*) FROM {table} WHERE id=? AND uuid=?", (removable["id"], removable["uuid"])).fetchone()[0], 0)
+            self.assertEqual(db.execute(f"SELECT COUNT(*) FROM {table} WHERE id=? AND uuid=?", (second["id"], second["uuid"])).fetchone()[0], 0)
+            self.assertEqual(db.execute(f"SELECT COUNT(*) FROM {table} WHERE id=? AND uuid=?", (sibling["id"], sibling["uuid"])).fetchone()[0], 1)
+        self.assertEqual(db.execute("SELECT payload FROM device_reports WHERE id=? AND uuid=?", (sibling["id"], sibling["uuid"])).fetchone()[0].find("uuid-keep") >= 0, True)
+        db.close()
+
+        blocked = {"id": f"batch-remove-blocked-{suffix}", "uuid": "uuid-blocked"}
+        free = {"id": f"batch-remove-free-{suffix}", "uuid": "uuid-free"}
+        for device in [blocked, free]:
+            self.client.json("POST", "/?s=/api/heartbeat", {**device, "conns": []})
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers", {"id": blocked["id"], "alias": "保留", "tags": []}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.client.json("DELETE", "/?s=/ops-x9/api/devices", {"devices": [blocked, free]}, {"X-CSRF-Token": csrf}, expected=(409,))
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM device_reports WHERE (id=? AND uuid=?) OR (id=? AND uuid=?)", (blocked["id"], blocked["uuid"], free["id"], free["uuid"])).fetchone()[0], 2)
         db.close()
 
     def test_27_admin_can_assign_one_or_many_devices_to_selected_address_book_users(self):

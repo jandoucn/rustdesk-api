@@ -63,6 +63,9 @@ function report_runtime_payload(array $data): array
     if (array_key_exists('scheduled_update_interval_hours', $data) && is_numeric($data['scheduled_update_interval_hours'])) {
         $hours=(int)$data['scheduled_update_interval_hours']; if($hours>=1&&$hours<=168)$runtime['scheduled_update_interval_hours']=$hours;
     }
+    if (array_key_exists('update_policy_revision', $data) && is_numeric($data['update_policy_revision'])) {
+        $revision=(int)$data['update_policy_revision']; if($revision>=0)$runtime['update_policy_revision']=$revision;
+    }
     return $runtime;
 }
 function release_identity(array $report, array $runtime): array
@@ -530,6 +533,35 @@ function update_policy_payload(array $policy, string $id, string $uuid): array
         'target_version'=>$policy['target_version'] ?? null,'target_build_seq'=>$policy['target_build_seq'] ?? null,
         'updated_at'=>(int)$policy['updated_at'],
     ];
+}
+function sync_reported_update_policy(PDO $db, string $id, string $uuid, array $runtime): void
+{
+    foreach (['enable_check_update','allow_auto_update','enable_scheduled_update','scheduled_update_interval_hours','update_policy_revision'] as $field) {
+        if (!array_key_exists($field, $runtime)) return;
+    }
+    $reportedRevision = (int)$runtime['update_policy_revision'];
+    $existing = db_one($db, 'SELECT * FROM device_update_policies WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
+    if ($existing && (int)$existing['policy_revision'] !== $reportedRevision) return;
+    $reported = [
+        'enable_check_update'=>(int)(bool)$runtime['enable_check_update'],
+        'allow_auto_update'=>(int)(bool)$runtime['allow_auto_update'],
+        'enable_scheduled_update'=>(int)(bool)$runtime['enable_scheduled_update'],
+        'scheduled_update_interval_hours'=>(int)$runtime['scheduled_update_interval_hours'],
+    ];
+    if ($existing
+        && (int)$existing['enable_check_update'] === $reported['enable_check_update']
+        && (int)$existing['allow_auto_update'] === $reported['allow_auto_update']
+        && (int)$existing['enable_scheduled_update'] === $reported['enable_scheduled_update']
+        && (int)$existing['scheduled_update_interval_hours'] === $reported['scheduled_update_interval_hours']) return;
+    $revision = $existing ? $reportedRevision + 1 : $reportedRevision;
+    db_upsert($db, 'device_update_policies', [
+        'id'=>$id,'uuid'=>$uuid,'mode'=>$existing['mode'] ?? 'notify','channel'=>$existing['channel'] ?? 'stable',
+        'target_version'=>$existing['target_version'] ?? null,'target_build_seq'=>$existing['target_build_seq'] ?? null,
+        'auto_install'=>(int)($existing['auto_install'] ?? false),
+        'enable_check_update'=>$reported['enable_check_update'],'allow_auto_update'=>$reported['allow_auto_update'],
+        'enable_scheduled_update'=>$reported['enable_scheduled_update'],'scheduled_update_interval_hours'=>$reported['scheduled_update_interval_hours'],
+        'policy_revision'=>$revision,'updated_by'=>null,'updated_at'=>time(),
+    ], ['id','uuid'], ['mode','channel','target_version','target_build_seq','auto_install','enable_check_update','allow_auto_update','enable_scheduled_update','scheduled_update_interval_hours','policy_revision','updated_by','updated_at']);
 }
 function update_policy_boolean(array $data, string $field, bool $default): bool
 {
@@ -1613,7 +1645,7 @@ try {
         $scheduledInterval=scheduled_update_interval($d,(int)($existing['scheduled_update_interval_hours']??5));
         $saved=[];
         txn($db,function()use($db,$id,$uuid,$mode,$channel,$d,$revision,$actor,$enableCheckUpdate,$allowAutoUpdate,$enableScheduledUpdate,$scheduledInterval,&$saved){
-            db_upsert($db,'device_update_policies',['id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'target_version'=>array_key_exists('target_version',$d)?text_field($d,'target_version',32):null,'target_build_seq'=>array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null?(int)$d['target_build_seq']:null,'auto_install'=>(int)($d['auto_install']??false)||($mode==='auto_install'?1:0),'enable_check_update'=>$enableCheckUpdate,'allow_auto_update'=>$allowAutoUpdate,'enable_scheduled_update'=>$enableScheduledUpdate,'scheduled_update_interval_hours'=>$scheduledInterval,'policy_revision'=>$revision,'updated_by'=>(int)$actor['id'],'updated_at'=>time()],['id','uuid'],['mode','channel','target_version','target_build_seq','auto_install','enable_check_update','allow_auto_update','enable_scheduled_update','scheduled_update_interval_hours','policy_revision','updated_by','updated_at']);
+            db_upsert($db,'device_update_policies',['id'=>$id,'uuid'=>$uuid,'mode'=>$mode,'channel'=>$channel,'target_version'=>array_key_exists('target_version',$d)?text_field($d,'target_version',32):null,'target_build_seq'=>array_key_exists('target_build_seq',$d)&&$d['target_build_seq']!==null?(int)$d['target_build_seq']:null,'auto_install'=>(int)((bool)($d['auto_install']??false)||$mode==='auto_install'),'enable_check_update'=>$enableCheckUpdate,'allow_auto_update'=>$allowAutoUpdate,'enable_scheduled_update'=>$enableScheduledUpdate,'scheduled_update_interval_hours'=>$scheduledInterval,'policy_revision'=>$revision,'updated_by'=>(int)$actor['id'],'updated_at'=>time()],['id','uuid'],['mode','channel','target_version','target_build_seq','auto_install','enable_check_update','allow_auto_update','enable_scheduled_update','scheduled_update_interval_hours','policy_revision','updated_by','updated_at']);
             $saved=update_policy($db,$id,$uuid,$channel); admin_event($db,(int)$actor['id'],'update_device_policy',0);
         });
         $command=null;
@@ -2042,7 +2074,25 @@ try {
             $total=count($inventory); $data=array_slice($inventory,$offset,$limit); foreach($data as &$row)unset($row['_search']); unset($row);
             reply(['total'=>$total,'summary'=>$summary,'data'=>$data]);
         }
-        method('DELETE'); csrf_check(); if($id==='') fail(404,'设备不存在');$uuid=device_uuid($db,$id,text_field($_GET,'uuid',256));
+        method('DELETE'); csrf_check();
+        if ($id === '') {
+            $devices = update_batch_devices($db, json_body()); $references = [];
+            foreach ($devices as $device) {
+                foreach (db_all($db, 'SELECT a.uid,u.username FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid JOIN rustdesk_users u ON u.id=a.uid WHERE a.personal=1 AND p.id=:id ORDER BY a.uid', ['id'=>$device['id']]) as $row) {
+                    $references[] = ['id'=>$device['id'],'uuid'=>$device['uuid'],'user_id'=>(int)$row['uid'],'username'=>$row['username']];
+                }
+            }
+            if ($references) reply(['error'=>'所选客户端仍被通讯录引用，请先移除通讯录分配','references'=>$references], 409);
+            txn($db, function() use ($db,$devices,$actor) {
+                foreach ($devices as $device) {
+                    db_exec($db,'DELETE FROM device_deployments WHERE id=:id AND uuid=:uuid',$device);
+                    db_exec($db,'DELETE FROM device_reports WHERE id=:id AND uuid=:uuid',$device);
+                    admin_event($db,(int)$actor['id'],'delete_device',0);
+                }
+            });
+            reply(['ok'=>true,'removed'=>count($devices)]);
+        }
+        $uuid=device_uuid($db,$id,text_field($_GET,'uuid',256));
         $references = db_all($db, 'SELECT a.uid,u.username FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid JOIN rustdesk_users u ON u.id=a.uid WHERE a.personal=1 AND p.id=:id ORDER BY a.uid', ['id'=>$id]);
         if ($references) reply(['error'=>'设备仍被通讯录引用，请先移除通讯录分配','references'=>array_map(static fn($row)=>['user_id'=>(int)$row['uid'],'username'=>$row['username']],$references)], 409);
         txn($db,function()use($db,$id,$uuid,$actor){db_exec($db,'DELETE FROM device_deployments WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);db_exec($db,'DELETE FROM device_reports WHERE id=:id AND uuid=:uuid',['id'=>$id,'uuid'=>$uuid]);admin_event($db,(int)$actor['id'],'delete_device',0);}); reply(['ok'=>true]);
@@ -2174,11 +2224,14 @@ try {
             $incomingNetwork = report_network_payload($d);
             if (!array_key_exists('network', $d) && !array_key_exists('private_ips', $d)) unset($incomingNetwork['private_ips']);
             $network = refresh_public_network(merge_json_objects(decoded_payload($existing['network_payload'] ?? null), $incomingNetwork));
-            db_upsert($db,'device_reports',[
-                'id'=>$id,'uuid'=>$uuid,'payload'=>json_encode(merge_json_objects(decoded_payload($existing['payload'] ?? null), $d),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR),
-                'last_seen'=>time(),'last_heartbeat'=>0,'heartbeat_payload'=>'{}',
-                'runtime_payload'=>json_object_text($runtime),'network_payload'=>json_object_text($network),
-            ],['id','uuid'],['payload','last_seen','runtime_payload','network_payload']);
+            txn($db, function() use ($db,$id,$uuid,$d,$existing,$runtime,$network) {
+                db_upsert($db,'device_reports',[
+                    'id'=>$id,'uuid'=>$uuid,'payload'=>json_encode(merge_json_objects(decoded_payload($existing['payload'] ?? null), $d),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR),
+                    'last_seen'=>time(),'last_heartbeat'=>0,'heartbeat_payload'=>'{}',
+                    'runtime_payload'=>json_object_text($runtime),'network_payload'=>json_object_text($network),
+                ],['id','uuid'],['payload','last_seen','runtime_payload','network_payload']);
+                sync_reported_update_policy($db,$id,$uuid,$runtime);
+            });
             header('Content-Type: text/plain; charset=utf-8'); echo 'SYSINFO_UPDATED'; exit;
         }
         $known = db_one($db, 'SELECT id FROM device_reports WHERE id=:id AND uuid=:uuid', ['id' => $id, 'uuid' => $uuid]);

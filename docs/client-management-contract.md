@@ -74,6 +74,8 @@ Unknown fields, tags, peer metadata and other address-book entries must be prese
 - Removes report and deployment records for the selected `(id, uuid)` only.
 - A legacy request without `uuid` is accepted only when the ID resolves to exactly one UUID; ambiguous IDs return `409`.
 
+`DELETE ${RUSTDESK_ADMIN_PATH}/api/devices` accepts `devices: [{id,uuid}]` and removes the exact selected identities in one transaction. If any selected device is still referenced by an address book, the whole batch is rejected with `409` and no device is removed.
+
 ## Update-control contract
 
 Every update identity uses the reported raw `client_id` plus the device's real UUID. Exact identity wins. The legacy `client_id=RustDesk Yan` compatibility path may resolve only when that UUID identifies exactly one reported device.
@@ -83,6 +85,7 @@ The policy response, update-check response and `update-policy` SSE event expose:
 - `enable_check_update` and `allow_auto_update`;
 - `enable_scheduled_update`, default `false`;
 - `scheduled_update_interval_hours`, default `5`, accepted range `1..168`.
+- `update_policy_revision`, reported by the client with the four runtime settings above. A report may initialize server state; after that, only a report matching the current revision can reconcile a local client-side change, so stale telemetry cannot overwrite a newer administrator policy.
 
 `PATCH ${RUSTDESK_ADMIN_PATH}/api/update/policies/{id}` changes one device. `PATCH ${RUSTDESK_ADMIN_PATH}/api/update/policies/batch` accepts either `devices: [{id,uuid}]` or `all: true` for scheduled-check policy changes. Every changed device increments its `policy_revision`, so a connected SSE client receives the change within the current stream polling window.
 

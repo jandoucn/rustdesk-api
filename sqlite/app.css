@@ -230,7 +230,11 @@ dialog::backdrop { background: rgba(27, 35, 35, .48); backdrop-filter: blur(2px)
 .tag-choice input { width: 15px; height: 15px; margin: 0; accent-color: var(--primary); }
 .tag-picker-empty { color: var(--muted); font-size: 12px; }
 #tag-dialog { width: min(640px, calc(100vw - 28px)); }
-#details-dialog { width: min(860px, calc(100vw - 28px)); }
+#details-dialog { width: min(860px, calc(100vw - 28px)); overflow: hidden; }
+#details-dialog .dialog-form { display: flex; max-height: calc(100vh - 30px); flex-direction: column; }
+#details-dialog .dialog-head { flex: 0 0 auto; }
+#details-dialog .details-scroll { display: grid; min-height: 0; gap: 14px; overflow: auto; padding-right: 4px; }
+#details-dialog > .dialog-form > .dialog-actions { flex: 0 0 auto; }
 #details-dialog .details-value.is-empty { color: var(--muted); }
 .tag-editor { display: grid; grid-template-columns: minmax(190px, 1fr) 64px auto auto; align-items: end; gap: 9px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
 .color-field input[type="color"] { width: 100%; height: 40px; padding: 4px; border: 1px solid var(--border-strong); border-radius: var(--radius); background: #fff; cursor: pointer; }

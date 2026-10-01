@@ -136,6 +136,43 @@ class MySQLIntegrationTest(unittest.TestCase):
         self.assertTrue(event["enable_scheduled_update"])
         self.assertEqual(event["scheduled_update_interval_hours"], 24)
 
+    def test_21c_reported_update_settings_reconcile_only_matching_revision(self):
+        csrf = self.admin_login()
+        suffix = str(time.time_ns())
+        device_id, uuid_value = "mysql-reported-policy-" + suffix, "mysql-reported-policy-uuid-" + suffix
+        reported = {"id": device_id, "uuid": uuid_value, "hostname": "mysql-policy-host", "enable_check_update": True, "allow_auto_update": True, "enable_scheduled_update": True, "scheduled_update_interval_hours": 14, "update_policy_revision": 0}
+        self.client.json("POST", "/api/sysinfo", reported)
+        self.assertEqual(self.sql(f"SELECT enable_check_update,allow_auto_update,enable_scheduled_update,scheduled_update_interval_hours,policy_revision FROM device_update_policies WHERE id='{device_id}' AND uuid='{uuid_value}'"), ["1\t1\t1\t14\t0"])
+        self.client.json("PATCH", f"/ops-x9/api/update/policies/{device_id}", {"uuid": uuid_value, "mode": "notify", "channel": "stable", "enable_check_update": False, "allow_auto_update": False, "enable_scheduled_update": False, "scheduled_update_interval_hours": 6}, {"X-CSRF-Token": csrf})
+        self.client.json("POST", "/api/sysinfo", reported)
+        self.assertEqual(self.sql(f"SELECT enable_check_update,allow_auto_update,enable_scheduled_update,scheduled_update_interval_hours,policy_revision FROM device_update_policies WHERE id='{device_id}' AND uuid='{uuid_value}'"), ["0\t0\t0\t6\t1"])
+        self.client.json("POST", "/api/sysinfo", {**reported, "update_policy_revision": 1, "scheduled_update_interval_hours": 11})
+        self.assertEqual(self.sql(f"SELECT enable_check_update,allow_auto_update,enable_scheduled_update,scheduled_update_interval_hours,policy_revision FROM device_update_policies WHERE id='{device_id}' AND uuid='{uuid_value}'"), ["1\t1\t1\t11\t2"])
+
+    def test_21d_batch_device_removal_is_atomic_and_uses_composite_identity(self):
+        csrf = self.admin_login()
+        suffix = str(time.time_ns())
+        removable = {"id": "mysql-batch-remove-" + suffix, "uuid": "remove"}
+        sibling = {"id": removable["id"], "uuid": "keep"}
+        second = {"id": "mysql-batch-remove-second-" + suffix, "uuid": "second"}
+        for device in [removable, sibling, second]:
+            self.client.json("POST", "/api/heartbeat", {**device, "conns": []})
+            self.client.json("POST", "/api/sysinfo", {**device, "hostname": device["uuid"]})
+            self.sql(f"INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES('{device['id']}','{device['uuid']}','pk',1,'{{\"hostname\":\"{device['uuid']}\"}}',UNIX_TIMESTAMP())")
+        self.client.json("DELETE", "/ops-x9/api/devices", {"devices": [removable, second]}, {"X-CSRF-Token": csrf})
+        for table in ["device_reports", "device_deployments"]:
+            self.assertEqual(self.sql(f"SELECT COUNT(*) FROM {table} WHERE (id='{removable['id']}' AND uuid='remove') OR (id='{second['id']}' AND uuid='second')"), ["0"])
+            self.assertEqual(self.sql(f"SELECT COUNT(*) FROM {table} WHERE id='{sibling['id']}' AND uuid='keep'"), ["1"])
+
+        blocked = {"id": "mysql-batch-remove-blocked-" + suffix, "uuid": "blocked"}
+        free = {"id": "mysql-batch-remove-free-" + suffix, "uuid": "free"}
+        for device in [blocked, free]:
+            self.client.json("POST", "/api/heartbeat", {**device, "conns": []})
+        self.client.json("POST", "/ops-x9/api/address-book/peers", {"id": blocked["id"], "alias": "保留", "tags": []}, {"X-CSRF-Token": csrf}, expected=(201,))
+        _, conflict, _ = self.client.json("DELETE", "/ops-x9/api/devices", {"devices": [blocked, free]}, {"X-CSRF-Token": csrf}, expected=(409,))
+        self.assertEqual(conflict["references"][0]["id"], blocked["id"])
+        self.assertEqual(self.sql(f"SELECT COUNT(*) FROM device_reports WHERE (id='{blocked['id']}' AND uuid='blocked') OR (id='{free['id']}' AND uuid='free')"), ["2"])
+
     def test_21a_one_shot_update_command_round_trip_and_sql(self):
         csrf = self.admin_login()
         suffix = str(time.time_ns())

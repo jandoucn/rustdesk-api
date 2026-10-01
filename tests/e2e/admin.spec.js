@@ -404,6 +404,11 @@ test('client details edits a per-device update policy and persists after reload'
   const deviceId = `policy-ui-${Date.now().toString(36)}`;
   const uuid = `${deviceId}-uuid`;
   await reportClient(request, deviceId, `${deviceId}-host`);
+  await expect((await request.post('/api/sysinfo', { data: {
+    id: deviceId, uuid, hostname: `${deviceId}-host`, platform: 'windows', version: '1.5.0',
+    enable_check_update: true, allow_auto_update: false, enable_scheduled_update: true,
+    scheduled_update_interval_hours: 9, update_policy_revision: 0,
+  } })).ok()).toBeTruthy();
   await loginAdmin(page);
   await page.goto(`${adminPath}/devices`);
   await page.locator('#q').fill(deviceId);
@@ -413,13 +418,12 @@ test('client details edits a per-device update policy and persists after reload'
   const dialog = page.locator('#details-dialog');
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText('更新策略', { exact: true })).toBeVisible();
-  await expect(dialog.locator('#enable-check-update')).not.toBeChecked();
+  await expect(dialog.locator('#enable-check-update')).toBeChecked();
   await expect(dialog.locator('#allow-auto-update')).not.toBeChecked();
-  await expect(dialog.locator('#enable-scheduled-update')).not.toBeChecked();
-  await expect(dialog.locator('#scheduled-update-hours')).toHaveValue('5');
-  await dialog.locator('#enable-check-update').check();
+  await expect(dialog.locator('#enable-scheduled-update')).toBeChecked();
+  await expect(dialog.locator('#scheduled-update-hours')).toHaveValue('9');
+  await dialog.locator('#enable-check-update').uncheck();
   await dialog.locator('#allow-auto-update').check();
-  await dialog.locator('#enable-scheduled-update').check();
   await dialog.locator('#scheduled-update-hours').fill('12');
   await dialog.locator('#update-mode').selectOption('disabled');
   await dialog.locator('#update-channel').selectOption('beta');
@@ -433,7 +437,7 @@ test('client details edits a per-device update policy and persists after reload'
   await expect(dialog.locator('#update-channel')).toHaveValue('beta');
   await expect(dialog.locator('#update-version')).toHaveValue('1.6.0');
   await expect(dialog.locator('#update-build')).toHaveValue('2026100102');
-  await expect(dialog.locator('#enable-check-update')).toBeChecked();
+  await expect(dialog.locator('#enable-check-update')).not.toBeChecked();
   await expect(dialog.locator('#allow-auto-update')).toBeChecked();
   await expect(dialog.locator('#enable-scheduled-update')).toBeChecked();
   await expect(dialog.locator('#scheduled-update-hours')).toHaveValue('12');
@@ -446,6 +450,33 @@ test('client details edits a per-device update policy and persists after reload'
   await expect(dialog.locator('#update-policy-error')).toContainText('1 到 168');
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+});
+
+test('selected clients can be removed in bulk after confirmation', async ({ page, request }) => {
+  const suffix = Date.now().toString(36);
+  const ids = [`batch-remove-ui-${suffix}-1`, `batch-remove-ui-${suffix}-2`];
+  await Promise.all(ids.map(id => reportClient(request, id)));
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(`batch-remove-ui-${suffix}`);
+  await page.getByRole('button', { name: '搜索' }).click();
+  await page.locator('#select-all-devices').check();
+  const remove = page.locator('#batch-remove-devices');
+  await expect(remove).toBeEnabled();
+  page.once('dialog', dialog => dialog.dismiss());
+  await remove.click();
+  await expect(page.locator('#rows tr')).toHaveCount(2);
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+  await expect(remove).toBeVisible();
+  page.once('dialog', dialog => dialog.accept());
+  await remove.click();
+  await expect(page.locator('#status')).toContainText('已移除 2 台客户端');
+  await expect(page.locator('#rows tr')).toHaveCount(0);
+  await page.reload();
+  await page.locator('#q').fill(`batch-remove-ui-${suffix}`);
+  await page.getByRole('button', { name: '搜索' }).click();
+  await expect(page.locator('#rows tr')).toHaveCount(0);
 });
 
 test('selected clients receive batch check commands and scheduled-update policy', async ({ page, request }) => {
@@ -599,7 +630,7 @@ test('desktop release renders as installed and keeps UUID out of the inventory r
   await expect(row).not.toContainText('UUID');
 });
 
-test('device row sends one-shot check and install commands and shows command status', async ({ page, request }) => {
+test('client details sends one-shot check and install commands and shows command status', async ({ page, request }) => {
   const deviceId = `update-command-${Date.now().toString(36)}`;
   const uuid = `${deviceId}-uuid`;
   await reportClient(request, deviceId);
@@ -615,15 +646,18 @@ test('device row sends one-shot check and install commands and shows command sta
   await page.locator('#q').fill(deviceId);
   await page.getByRole('button', { name: '搜索' }).click();
   const row = page.locator(`[data-device-id="${deviceId}"]`);
-  await row.getByRole('button', { name: '立即检查更新' }).click();
-  await expect(page.locator('#status')).toContainText('检查命令已发送');
-  await row.getByRole('button', { name: '立即安装更新' }).click();
-  await expect(page.locator('#status')).toContainText('安装命令已发送');
+  await expect(row.getByRole('button', { name: '立即检查更新' })).toHaveCount(0);
+  await expect(row.getByRole('button', { name: '立即安装更新' })).toHaveCount(0);
   await row.getByRole('button', { name: '查看客户端详情' }).click();
-  await expect(page.locator('#details-dialog')).toContainText('最近更新命令');
-  await expect(page.locator('#details-dialog')).toContainText('等待客户端接收');
+  const dialog = page.locator('#details-dialog');
+  await dialog.getByRole('button', { name: '立即检查更新' }).click();
+  await expect(page.locator('#status')).toContainText('检查命令已发送');
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+  await dialog.getByRole('button', { name: '立即安装更新' }).click();
+  await expect(page.locator('#status')).toContainText('安装命令已发送');
+  await expect(page.locator('#details-dialog')).toContainText('最近更新命令');
+  await expect(page.locator('#details-dialog')).toContainText('等待客户端接收');
 });
 
 test('inventory backfills GeoLite region and timezone for a stored public IP', async ({ page, request }) => {
