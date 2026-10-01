@@ -68,6 +68,24 @@ function release_identity(array $report, array $runtime): array
     $seq = $pick(['build_seq']);
     return ['client_id'=>$text(['client_id']),'client_uuid'=>$text(['client_uuid']),'product'=>$text(['product']),'edition'=>$text(['edition']),'version'=>$text(['version']),'build_number'=>$text(['build_number']),'build_seq'=>is_numeric($seq)?(int)$seq:null,'channel'=>$text(['channel']),'platform'=>$text(['platform']),'arch'=>$text(['arch','client_arch']),'distribution'=>$text(['distribution']),'install_mode'=>$text(['install_mode']),'source_commit'=>$text(['source_commit']),'os'=>$text(['os']),'os_version'=>$text(['os_version'])];
 }
+function canonical_release_identity(PDO $db, array $release): array
+{
+    $buildNumber = trim((string)($release['build_number'] ?? ''));
+    $sourceCommit = trim((string)($release['source_commit'] ?? ''));
+    if ($buildNumber === '' && $sourceCommit === '') return $release;
+    $rows = db_all($db, 'SELECT version,build_seq,manifest FROM update_releases WHERE active=1 ORDER BY published_at DESC');
+    foreach ($rows as $row) {
+        $manifest = decoded_payload($row['manifest'] ?? null);
+        if ($buildNumber !== '' && (string)($manifest['build_number'] ?? '') !== $buildNumber) continue;
+        if ($sourceCommit !== '' && (string)($manifest['source_commit'] ?? '') !== $sourceCommit) continue;
+        $release['version'] = (string)($manifest['version'] ?? $row['version'] ?? $release['version'] ?? '');
+        $release['build_seq'] = (int)($manifest['build_seq'] ?? $row['build_seq'] ?? $release['build_seq'] ?? 0);
+        $release['build_number'] = (string)($manifest['build_number'] ?? $buildNumber);
+        $release['source_commit'] = (string)($manifest['source_commit'] ?? $sourceCommit);
+        break;
+    }
+    return $release;
+}
 function remember_release_identity(PDO $db, array $data): void
 {
     $text = static function (array $data, string $key, int $max): string {
@@ -1143,7 +1161,7 @@ function enrich_admin_address_book_peer(PDO $db, array $peer): array
     $reportRow = db_one($db, 'SELECT uuid,payload,runtime_payload,network_payload,last_seen,last_heartbeat FROM device_reports WHERE id=:id ORDER BY last_heartbeat DESC,last_seen DESC LIMIT 1', ['id'=>$id]);
     $deploymentRow = db_one($db, 'SELECT uuid,payload,uid,updated_at FROM device_deployments WHERE id=:id ORDER BY updated_at DESC LIMIT 1', ['id'=>$id]);
     $report = decoded_payload($reportRow['payload'] ?? null); $runtime = decoded_payload($reportRow['runtime_payload'] ?? null); $network = decoded_payload($reportRow['network_payload'] ?? null); $deploy = decoded_payload($deploymentRow['payload'] ?? null);
-    $release = release_identity($report, $runtime); $publicIp = is_public_ip((string)($network['public_ip'] ?? '')) ? (string)$network['public_ip'] : '';
+    $release = canonical_release_identity($db, release_identity($report, $runtime)); $publicIp = is_public_ip((string)($network['public_ip'] ?? '')) ? (string)$network['public_ip'] : '';
     $geo = $publicIp !== '' ? (is_array($network['geo'] ?? null) && $network['geo'] !== [] ? $network['geo'] : public_ip_geo($publicIp)) : [];
     $lastHeartbeat = (int)($reportRow['last_heartbeat'] ?? 0);
     return array_merge($peer, [
@@ -1653,7 +1671,7 @@ try {
                     $storedGeo=$network['geo']??null;
                     $publicGeo=is_array($storedGeo)&&$storedGeo!==[]?$storedGeo:public_ip_geo($publicIp);
                 }
-                $aliasEntry=$aliases[$reportRow['id']]??null; $lastHeartbeat=(int)$reportRow['last_heartbeat']; $release=release_identity($report,$runtime);
+                $aliasEntry=$aliases[$reportRow['id']]??null; $lastHeartbeat=(int)$reportRow['last_heartbeat']; $release=canonical_release_identity($db, release_identity($report,$runtime));
                 $inventory[]=['id'=>$reportRow['id'],'uuid'=>$reportRow['uuid'],'owner_id'=>$deployment&&$deployment['uid']!==null?(int)$deployment['uid']:null,
                     'hostname'=>$report['hostname']??($deploy['device_name']??''),'username'=>$report['username']??($deploy['device_username']??''),
                     'platform'=>$release['platform']!==''?$release['platform']:($report['os']??($deploy['platform']??'')),'os'=>$release['os']!==''?$release['os']:($report['os']??''),'os_version'=>$release['os_version'],'cpu'=>$report['cpu']??'','memory'=>$report['memory']??'','version'=>$release['version']!==''?$release['version']:($report['version']??''),
