@@ -91,6 +91,10 @@ The policy response, update-check response and `update-policy` SSE event expose:
 
 `POST ${RUSTDESK_ADMIN_PATH}/api/update/commands/{id}` and `/api/update/commands/batch` accept `action: check|install`. `check` asks the client to check and present its normal confirmation flow; `install` is the server-forced install command. Publishing a new manifest creates one deduplicated, version-locked `check` command for each compatible known client. An idempotent repeat publication creates no duplicate commands.
 
+The public update-policy stream is owned by the asynchronous broker. It supports signed devices and the legacy unsigned fallback used by compatible RustDesk clients; authenticated commands remain limited to signed streams. The broker reserves most long-poll capacity for signed devices, caps streams globally and per device identity, batches SQLite snapshots below the PHP endpoint limit, and never occupies PHP-FPM workers for the lifetime of a client connection. Unsigned admission and capacity rejection do not call PHP or SQLite; an overloaded client receives `503` with `Retry-After` and reconnects later.
+
+Sysinfo inventory does not guarantee `package_kind`. When it is absent, one-shot command creation may use product, edition, platform and architecture to lock a release only if that release contains every supported package kind for the platform. Otherwise a check command remains targetless and install waits until a signed check has persisted the exact package identity. The client supplies the exact signed `target_key` and `package_kind` in `/rd/update/v1/check`; that request remains the authority for choosing EXE versus MSI and the corresponding download asset.
+
 When a client already has the matching or a newer release, `/rd/update/v1/check` still returns `target_version` and `target_build_seq` for display, but omits `url`, `manifest_url` and `manifest` installation payloads.
 
 ## UI contract

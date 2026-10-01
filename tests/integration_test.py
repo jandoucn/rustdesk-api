@@ -832,20 +832,10 @@ class IntegrationTest(unittest.TestCase):
         self.assertFalse(resumed_event["allow_auto_update"])
         self.assertFalse(resumed_event["enable_scheduled_update"])
         self.assertEqual(resumed_event["scheduled_update_interval_hours"], 5)
-        def wait_for_policy():
-            request = urllib.request.Request(
-                self.url + f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}",
-                headers={"Accept": "text/event-stream", "Last-Event-ID": str(second_event_id)},
-            )
-            with urllib.request.urlopen(request, timeout=6) as response:
-                return response.read().decode("utf-8", "replace")
+        self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "enable_check_update": True, "allow_auto_update": True}, {"X-CSRF-Token": csrf})
         started = time.monotonic()
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            waiting = pool.submit(wait_for_policy)
-            time.sleep(0.5)
-            self.client.json("PATCH", f"/?s=/ops-x9/api/update/policies/{device_id}", {"uuid": uuid, "mode": "notify", "channel": "stable", "enable_check_update": True, "allow_auto_update": True}, {"X-CSRF-Token": csrf})
-            live_stream = waiting.result(timeout=5)
-        self.assertLess(time.monotonic() - started, 5)
+        _, live_stream, _ = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={uuid}", headers={"Accept": "text/event-stream", "Last-Event-ID": str(second_event_id)}, expected=(200,))
+        self.assertLess(time.monotonic() - started, 1)
         live_event = json.loads(next(line[6:] for line in live_stream.splitlines() if line.startswith("data: ")))
         self.assertEqual(live_event["policy_revision"], 3)
         self.assertTrue(live_event["enable_check_update"])
@@ -1021,6 +1011,194 @@ class IntegrationTest(unittest.TestCase):
         db.commit()
         db.close()
 
+    def test_one_shot_commands_resolve_latest_release_without_reported_package_kind(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id, device_uuid = f"missing-kind-{suffix}", f"missing-kind-uuid-{suffix}"
+        public_key = device_public_key()
+        current_build = 2026100106
+        target_build = 2026100201
+        current = {
+            "client_id": device_id,
+            "client_uuid": device_uuid,
+            "product": "rustdesk-yan",
+            "edition": "standard",
+            "version": "1.5.0",
+            "build_number": "20261001.6",
+            "build_seq": current_build,
+            "channel": "stable",
+            "platform": "Windows",
+            "arch": "x86_64",
+            "install_mode": "installed",
+        }
+        target = {
+            "primary": "https://download.yan.life/rustdesk/stable/current.exe",
+            "mirrors": [],
+            "size": 12,
+            "sha256": "a" * 64,
+            "signature": "c" * 88,
+            "signature_key_id": "yan-release-2026",
+        }
+        manifest = {
+            "product": "rustdesk-yan",
+            "edition": "multi",
+            "version": "1.5.0",
+            "build_seq": target_build,
+            "channel": "stable",
+            "targets": {
+                "windows-x86_64-exe-standard": target,
+                "windows-x86_64-msi-standard": {**target, "primary": "https://download.yan.life/rustdesk/stable/current.msi"},
+            },
+        }
+        now = int(time.time())
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, public_key, 1, "{}", now))
+        db.execute("INSERT INTO device_reports(id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, json.dumps(current), now, now, "{}"))
+        db.execute("INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,1)", ("1.5.0", target_build, "stable", json.dumps(manifest), now))
+        db.commit()
+        db.close()
+
+        endpoint = f"/?s=/ops-x9/api/update/commands/{device_id}"
+        _, check_command, _ = self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "check"}, {"X-CSRF-Token": csrf}, expected=(201,))
+        _, install_command, _ = self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "install"}, {"X-CSRF-Token": csrf}, expected=(201,))
+        for command in (check_command, install_command):
+            self.assertEqual((command["target_version"], int(command["target_build_seq"])), ("1.5.0", target_build))
+
+        db = sqlite3.connect(self.db)
+        stored = db.execute(
+            "SELECT action,target_version,target_build_seq,status FROM device_update_commands WHERE command_id IN (?,?) ORDER BY action",
+            (check_command["command_id"], install_command["command_id"]),
+        ).fetchall()
+        self.assertEqual(stored, [("check", "1.5.0", target_build, "pending"), ("install", "1.5.0", target_build, "pending")])
+        db.close()
+
+        request = {**current, "target_key": "windows-x86_64-exe-standard", "package_kind": "exe"}
+        headers = {
+            "Content-Type": "application/json",
+            "X-RustDesk-Update-Command-ID": check_command["command_id"],
+            **device_auth_headers("POST", "/rd/update/v1/check", device_id, device_uuid, request, check_command["command_id"]),
+        }
+        _, response, _ = self.client.json("POST", "/?s=/rd/update/v1/check", request, headers)
+        self.assertTrue(response["update_available"])
+        self.assertEqual((response["target_version"], response["target_build_seq"]), ("1.5.0", target_build))
+        db = sqlite3.connect(self.db)
+        db.execute("DELETE FROM update_releases WHERE version='1.5.0' AND build_seq=? AND channel='stable'", (target_build,))
+        db.commit()
+        db.close()
+
+    def test_unresolved_check_command_uses_signed_client_target_without_guessing_install_package(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id, device_uuid = f"unresolved-{suffix}", f"unresolved-uuid-{suffix}"
+        public_key = device_public_key()
+        target_build = 2026100202
+        target = {
+            "primary": "https://download.yan.life/rustdesk/stable/unresolved.exe",
+            "mirrors": [],
+            "size": 12,
+            "sha256": "a" * 64,
+            "signature": "c" * 88,
+            "signature_key_id": "yan-release-2026",
+        }
+        manifest = {
+            "product": "rustdesk-yan",
+            "edition": "multi",
+            "version": "1.5.0",
+            "build_seq": target_build,
+            "channel": "stable",
+            "targets": {"windows-x86_64-exe-standard": target},
+        }
+        now = int(time.time())
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, public_key, 1, "{}", now))
+        db.execute("INSERT INTO device_reports(id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, json.dumps({"id": device_id, "uuid": device_uuid}), now, now, "{}"))
+        db.execute("INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,1)", ("1.5.0", target_build, "stable", json.dumps(manifest), now))
+        db.commit()
+        db.close()
+
+        endpoint = f"/?s=/ops-x9/api/update/commands/{device_id}"
+        _, command, _ = self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "check"}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertIsNone(command["target_version"])
+        self.assertIsNone(command["target_build_seq"])
+        self.assertEqual(self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "install"}, {"X-CSRF-Token": csrf}, expected=(409,))[0], 409)
+
+        request = {
+            "client_id": device_id,
+            "client_uuid": device_uuid,
+            "product": "rustdesk-yan",
+            "edition": "standard",
+            "version": "1.5.0",
+            "build_seq": 2026100106,
+            "channel": "stable",
+            "platform": "windows",
+            "arch": "x86_64",
+            "target_key": "windows-x86_64-exe-standard",
+            "package_kind": "exe",
+        }
+        unsigned = {**request, "target_key": "windows-x86_64-msi-standard", "package_kind": "msi"}
+        self.client.json("POST", "/?s=/rd/update/v1/check", unsigned)
+        db = sqlite3.connect(self.db)
+        unsigned_payload = json.loads(db.execute("SELECT payload FROM device_reports WHERE id=? AND uuid=?", (device_id, device_uuid)).fetchone()[0])
+        db.close()
+        self.assertNotIn("target_key", unsigned_payload)
+        self.assertNotIn("package_kind", unsigned_payload)
+        headers = {
+            "Content-Type": "application/json",
+            "X-RustDesk-Update-Command-ID": command["command_id"],
+            **device_auth_headers("POST", "/rd/update/v1/check", device_id, device_uuid, request, command["command_id"]),
+        }
+        _, response, _ = self.client.json("POST", "/?s=/rd/update/v1/check", request, headers)
+        self.assertTrue(response["update_available"])
+        self.assertEqual((response["target_version"], response["target_build_seq"]), ("1.5.0", target_build))
+        db = sqlite3.connect(self.db)
+        remembered = json.loads(db.execute("SELECT payload FROM device_reports WHERE id=? AND uuid=?", (device_id, device_uuid)).fetchone()[0])
+        db.close()
+        self.assertEqual((remembered["target_key"], remembered["package_kind"]), ("windows-x86_64-exe-standard", "exe"))
+        _, install_command, _ = self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "install"}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertEqual((install_command["target_version"], install_command["target_build_seq"]), ("1.5.0", target_build))
+        db = sqlite3.connect(self.db)
+        db.execute("DELETE FROM update_releases WHERE version='1.5.0' AND build_seq=? AND channel='stable'", (target_build,))
+        db.commit()
+        db.close()
+
+    def test_unknown_package_kind_does_not_lock_single_kind_release(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id, device_uuid = f"single-kind-{suffix}", f"single-kind-uuid-{suffix}"
+        product = f"single-kind-product-{suffix}"
+        target_build = 2026100203
+        current = {
+            "client_id": device_id, "client_uuid": device_uuid, "product": product,
+            "edition": "standard", "version": "1.5.0", "build_seq": 2026100106,
+            "channel": "stable", "platform": "Windows", "arch": "x86_64",
+        }
+        target = {
+            "primary": "https://download.yan.life/rustdesk/stable/single-kind.msi", "mirrors": [], "size": 12,
+            "sha256": "a" * 64, "signature": "c" * 88, "signature_key_id": "yan-release-2026",
+        }
+        manifest = {
+            "product": product, "edition": "multi", "version": "1.5.0", "build_seq": target_build,
+            "channel": "stable", "targets": {"windows-x86_64-msi-standard": target},
+        }
+        now = int(time.time())
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, device_public_key(), 1, "{}", now))
+        db.execute("INSERT INTO device_reports(id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, json.dumps(current), now, now, "{}"))
+        db.execute("INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,1)", ("1.5.0", target_build, "stable", json.dumps(manifest), now))
+        db.commit()
+        db.close()
+
+        endpoint = f"/?s=/ops-x9/api/update/commands/{device_id}"
+        _, check_command, _ = self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "check"}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertIsNone(check_command["target_version"])
+        self.assertIsNone(check_command["target_build_seq"])
+        self.assertEqual(self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "install"}, {"X-CSRF-Token": csrf}, expected=(409,))[0], 409)
+
+        db = sqlite3.connect(self.db)
+        db.execute("DELETE FROM update_releases WHERE version='1.5.0' AND build_seq=? AND channel='stable'", (target_build,))
+        db.commit()
+        db.close()
+
     def test_update_command_auth_target_lock_monotonic_state_and_stream_fairness(self):
         csrf = self.admin_csrf()
         suffix = uuid.uuid4().hex[:10]
@@ -1103,19 +1281,59 @@ class IntegrationTest(unittest.TestCase):
         db = sqlite3.connect(self.db)
         db.execute("INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, device_public_key(), 1, "{}", int(time.time())))
         db.commit(); db.close()
-        def wait_for_command():
-            request = urllib.request.Request(self.url + f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={device_uuid}&after_revision=0", headers={"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid)})
-            with urllib.request.urlopen(request, timeout=6) as response:
-                return response.read().decode("utf-8", "replace")
+        _, created, _ = self.client.json("POST", f"/?s=/ops-x9/api/update/commands/{device_id}", {"uuid": device_uuid, "action": "check"}, {"X-CSRF-Token": csrf}, expected=(201,))
         started = time.monotonic()
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            waiting = pool.submit(wait_for_command)
-            time.sleep(0.5)
-            _, created, _ = self.client.json("POST", f"/?s=/ops-x9/api/update/commands/{device_id}", {"uuid": device_uuid, "action": "check"}, {"X-CSRF-Token": csrf}, expected=(201,))
-            stream = waiting.result(timeout=5)
-        self.assertLess(time.monotonic() - started, 5)
+        _, stream, _ = self.client.request("GET", f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={device_uuid}&after_revision=0", headers={"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid)}, expected=(200,))
+        self.assertLess(time.monotonic() - started, 1)
         self.assertIn("event: update-command\n", stream)
         self.assertIn(created["command_id"], stream)
+
+    def test_stream_broker_auth_and_batch_snapshot_preserve_policy_command_semantics(self):
+        suffix = uuid.uuid4().hex[:10]
+        device_id, device_uuid = f"broker-{suffix}", f"broker-uuid-{suffix}"
+        public_key = device_public_key()
+        now = int(time.time())
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, public_key, 1, "{}", now))
+        db.execute("INSERT INTO device_reports(id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, "{}", now, now, "{}"))
+        db.execute("INSERT INTO device_update_policies(id,uuid,mode,channel,target_version,target_build_seq,auto_install,enable_check_update,allow_auto_update,enable_scheduled_update,scheduled_update_interval_hours,policy_revision,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (device_id, device_uuid, "notify", "stable", None, None, 0, 1, 0, 1, 12, 4, now))
+        pending_id, expired_id = uuid.uuid4().hex, uuid.uuid4().hex
+        command_values = (device_id, device_uuid, "check", "stable", None, None, "pending", None, now, now + 60, now, 1)
+        db.execute("INSERT INTO device_update_commands(command_id,device_id,uuid,action,channel,target_version,target_build_seq,status,last_error,created_at,expires_at,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (pending_id, *command_values))
+        expired_values = (device_id, device_uuid, "check", "stable", None, None, "pending", None, now - 120, now - 1, now - 120, 1)
+        db.execute("INSERT INTO device_update_commands(command_id,device_id,uuid,action,channel,target_version,target_build_seq,status,last_error,created_at,expires_at,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (expired_id, *expired_values))
+        db.commit()
+        db.close()
+
+        auth_path = f"/?s=/_rustdesk-stream-internal/auth&client_id={device_id}&client_uuid={device_uuid}&after_revision=3"
+        auth_request = urllib.request.Request(
+            self.url + auth_path,
+            headers={"Accept": "text/event-stream", **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid)},
+        )
+        with urllib.request.urlopen(auth_request, timeout=3) as response:
+            self.assertEqual(response.status, 200)
+            auth = json.loads(response.read())
+            self.assertEqual(auth, {"client_id": device_id, "client_uuid": device_uuid, "authenticated": True})
+
+        _, snapshot, _ = self.client.json("POST", "/?s=/_rustdesk-stream-internal/snapshot", {
+            "streams": [
+                {"connection_id": "authenticated", "client_id": device_id, "client_uuid": device_uuid, "after_revision": 3, "authenticated": True, "channel": "stable"},
+                {"connection_id": "unsigned", "client_id": device_id, "client_uuid": device_uuid, "after_revision": 3, "authenticated": False, "channel": "stable"},
+                {"connection_id": "current", "client_id": device_id, "client_uuid": device_uuid, "after_revision": 4, "authenticated": False, "channel": "stable"},
+            ]
+        })
+        authenticated = snapshot["streams"]["authenticated"]
+        unsigned = snapshot["streams"]["unsigned"]
+        self.assertEqual([event["type"] for event in authenticated], ["update-policy", "update-command"])
+        self.assertEqual(authenticated[0]["id"], "4")
+        self.assertEqual(authenticated[0]["data"]["scheduled_update_interval_hours"], 12)
+        self.assertEqual(authenticated[1]["id"], pending_id)
+        self.assertEqual([event["type"] for event in unsigned], ["update-policy"])
+        self.assertEqual(snapshot["streams"]["current"], [])
+        db = sqlite3.connect(self.db)
+        self.assertEqual(db.execute("SELECT status FROM device_update_commands WHERE command_id=?", (expired_id,)).fetchone(), ("expired",))
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM device_update_nonces WHERE device_id=? AND uuid=?", (device_id, device_uuid)).fetchone()[0], 1)
+        db.close()
 
     def test_heartbeat_client_enrolls_update_key_and_receives_commands(self):
         csrf = self.admin_csrf()

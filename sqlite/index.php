@@ -104,7 +104,7 @@ function canonical_release_identity(PDO $db, array $release): array
     }
     return $release;
 }
-function remember_release_identity(PDO $db, array $data): void
+function remember_release_identity(PDO $db, array $data, bool $allowPackageIdentity = false): void
 {
     $text = static function (array $data, string $key, int $max): string {
         $value = $data[$key] ?? '';
@@ -116,7 +116,8 @@ function remember_release_identity(PDO $db, array $data): void
     if (count($rows) !== 1 && $id !== '') $rows = db_all($db, 'SELECT id,uuid,payload,runtime_payload FROM device_reports WHERE id=:id', ['id'=>$id]);
     if (count($rows) !== 1) return;
     $row = $rows[0]; $payload = decoded_payload($row['payload']); $runtime = decoded_payload($row['runtime_payload'] ?? null);
-    foreach (['client_id','client_uuid','product','edition','version','build_number','build_seq','channel','platform','arch','distribution','install_mode','source_commit','os','os_version'] as $key) {
+    foreach (['client_id','client_uuid','product','edition','version','build_number','build_seq','channel','platform','arch','distribution','install_mode','source_commit','os','os_version','target_key','package_kind'] as $key) {
+        if (!$allowPackageIdentity && in_array($key, ['target_key','package_kind'], true)) continue;
         if (!array_key_exists($key, $data) || $data[$key] === null || $data[$key] === '') continue;
         if (in_array($key, ['distribution','install_mode','platform','os'], true) && isset($payload[$key]) && $payload[$key] !== '' && $payload[$key] !== null) continue;
         if ($key === 'build_seq') { if (!is_numeric($data[$key])) continue; $payload[$key] = (int)$data[$key]; continue; }
@@ -484,7 +485,7 @@ function update_target_candidates(array $client): array
     $keys[] = "$platform-$arch-$packageKind";
     return $keys;
 }
-function manifest_supports_client(array $manifest, array $client): bool
+function manifest_supports_client(array $manifest, array $client, bool $allowUnknownPackageKind = false): bool
 {
     foreach (['product', 'edition'] as $field) {
         $wanted = text_field($client, $field, 64);
@@ -492,19 +493,37 @@ function manifest_supports_client(array $manifest, array $client): bool
             && !($field === 'edition' && (string)$manifest[$field] === 'multi')) return false;
     }
     $candidates = update_target_candidates($client);
+    $targets = is_array($manifest['targets'] ?? null) ? $manifest['targets'] : [];
+    if (!$candidates && $allowUnknownPackageKind && text_field($client, 'package_kind', 16) === '') {
+        $product = text_field($client, 'product', 64);
+        $platform = strtolower(text_field($client, 'platform', 32));
+        $arch = strtolower(text_field($client, 'arch', 32));
+        $edition = strtolower(text_field($client, 'edition', 32));
+        if ($product !== '' && $platform !== '' && $arch !== '' && $edition !== '') {
+            $requiredKinds = match ($platform) {
+                'windows' => ['exe', 'msi'], 'macos' => ['dmg'], 'linux' => ['appimage'], 'android' => ['apk'], default => [],
+            };
+            foreach ($requiredKinds as $kind) {
+                $specific = "$platform-$arch-$kind-$edition";
+                $generic = "$platform-$arch-$kind";
+                if (!isset($targets[$specific]) && !isset($targets[$generic])) return false;
+            }
+            return $requiredKinds !== [];
+        }
+        return false;
+    }
     if (!$candidates) return text_field($client, 'target_key', 128) === ''
         && text_field($client, 'platform', 32) === '' && text_field($client, 'arch', 32) === '';
-    $targets = is_array($manifest['targets'] ?? null) ? $manifest['targets'] : [];
     foreach ($candidates as $key) if (isset($targets[$key]) && is_array($targets[$key])) return true;
     return false;
 }
-function public_update_manifest(PDO $db, string $channel, ?string $targetVersion = null, ?int $targetBuild = null, array $client = []): ?array
+function public_update_manifest(PDO $db, string $channel, ?string $targetVersion = null, ?int $targetBuild = null, array $client = [], bool $allowUnknownPackageKind = false): ?array
 {
     $best = null;
     foreach (db_all($db, 'SELECT version,build_seq,channel,manifest FROM update_releases WHERE channel=:channel AND active=1', ['channel'=>$channel]) as $row) {
         $manifest = decoded_payload($row['manifest']); $manifest['version'] ??= $row['version']; $manifest['build_seq'] ??= (int)$row['build_seq']; $manifest['channel'] ??= $row['channel'];
         if ($targetVersion !== null && $targetVersion !== '' && compare_release($manifest, ['version'=>$targetVersion,'build_seq'=>$targetBuild ?? PHP_INT_MAX]) > 0) continue;
-        if ($client && !manifest_supports_client($manifest, $client)) continue;
+        if ($client && !manifest_supports_client($manifest, $client, $allowUnknownPackageKind)) continue;
         if ($best === null || compare_release($manifest, $best) > 0) $best = $manifest;
     }
     return $best;
@@ -513,6 +532,10 @@ function update_policy(PDO $db, string $id, string $uuid, string $channel): arra
 {
     $policy = db_one($db, 'SELECT * FROM device_update_policies WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid])
         ?: ['id'=>$id,'uuid'=>$uuid,'mode'=>'notify','channel'=>$channel,'target_version'=>null,'target_build_seq'=>null,'auto_install'=>0,'enable_check_update'=>0,'allow_auto_update'=>0,'enable_scheduled_update'=>0,'scheduled_update_interval_hours'=>5,'policy_revision'=>0,'updated_at'=>0];
+    return normalize_update_policy($policy);
+}
+function normalize_update_policy(array $policy): array
+{
     $policy['auto_install'] = (bool)($policy['auto_install'] ?? false);
     $policy['enable_check_update'] = (bool)($policy['enable_check_update'] ?? false);
     $policy['allow_auto_update'] = (bool)($policy['allow_auto_update'] ?? false);
@@ -740,9 +763,9 @@ function create_update_command(PDO $db, array $actor, string $id, array $data): 
     $client = update_command_client($db, $id, $uuid);
     if ($targetVersion !== '') {
         $release = db_one($db, 'SELECT version,build_seq,manifest FROM update_releases WHERE channel=:channel AND version=:version AND build_seq=:build AND active=1', ['channel'=>$channel,'version'=>$targetVersion,'build'=>$targetBuild]);
-        if ($release && !manifest_supports_client(decoded_payload($release['manifest']), $client)) $release = null;
+        if ($release && !manifest_supports_client(decoded_payload($release['manifest']), $client, true)) $release = null;
     } else {
-        $manifest = public_update_manifest($db, $channel, null, null, $client);
+        $manifest = public_update_manifest($db, $channel, null, null, $client, true);
         $release = $manifest ? ['version'=>$manifest['version'] ?? '', 'build_seq'=>$manifest['build_seq'] ?? 0] : null;
     }
     if (!$release && $action === 'install') fail(409, '当前更新通道没有兼容的可安装版本');
@@ -769,16 +792,18 @@ function update_command_request(PDO $db, string $id, string $uuid, string $comma
     if ($command['target_version'] !== null && !db_one($db, 'SELECT version FROM update_releases WHERE channel=:channel AND version=:version AND build_seq=:build', ['channel'=>$command['channel'],'version'=>$command['target_version'],'build'=>(int)$command['target_build_seq']])) fail(409, '更新命令锁定的版本不存在');
     return $command;
 }
-function update_check_response(PDO $db, array $data, ?array $command = null): array
+function update_check_response(PDO $db, array $data, ?array $command = null, bool $rememberPackageIdentity = false): array
 {
     $id = text_field($data, 'client_id', 128, text_field($data, 'id', 128)); $uuid = text_field($data, 'client_uuid', 256, text_field($data, 'uuid', 256));
     if ($id === '' || $uuid === '') fail(422, '缺少客户端 ID 或 UUID');
-    remember_release_identity($db, $data);
+    remember_release_identity($db, $data, $rememberPackageIdentity);
     [$id, $uuid] = resolve_update_identity($db, $id, $uuid);
     $version = text_field($data, 'version', 32, '0.0.0'); $build = (int)($data['build_seq'] ?? 0); $channel = text_field($data, 'channel', 32, 'stable'); $policy = update_policy($db, $id, $uuid, $channel); $channel = (string)($policy['channel'] ?: $channel);
     if ($command !== null) {
         $channel = (string)$command['channel'];
-        $manifest = $command['target_version'] === null ? null : decoded_payload((db_one($db, 'SELECT manifest FROM update_releases WHERE channel=:channel AND version=:version AND build_seq=:build', ['channel'=>$channel,'version'=>$command['target_version'],'build'=>(int)$command['target_build_seq']])['manifest'] ?? null));
+        $manifest = $command['target_version'] === null
+            ? ((string)$command['action'] === 'check' ? public_update_manifest($db, $channel, null, null, $data) : null)
+            : decoded_payload((db_one($db, 'SELECT manifest FROM update_releases WHERE channel=:channel AND version=:version AND build_seq=:build', ['channel'=>$channel,'version'=>$command['target_version'],'build'=>(int)$command['target_build_seq']])['manifest'] ?? null));
         if ($manifest) { $manifest['version'] ??= $command['target_version']; $manifest['build_seq'] ??= (int)$command['target_build_seq']; $manifest['channel'] ??= $channel; }
     } else {
         $manifest = public_update_manifest($db, $channel, $policy['target_version'] ?? null, isset($policy['target_build_seq']) ? (int)$policy['target_build_seq'] : null, $data);
@@ -813,41 +838,94 @@ function update_policy_stream(PDO $db): never
     header('Cache-Control: no-cache');
     header('X-Accel-Buffering: no');
     echo "retry: 1000\n\n";
-    @ob_flush(); flush();
-    $deadline = microtime(true) + 15.0;
-    $nextHeartbeat = microtime(true) + 2.0;
-    do {
-        expire_update_commands($db,$id,$uuid);
-        $emitted = false;
-        $policy = update_policy($db, $id, $uuid, $channel);
-        if ((int)$policy['policy_revision'] > $afterRevision) {
-            $payload = update_policy_payload($policy, $id, $uuid);
-            echo 'id: '.$policy['policy_revision']."\n";
-            echo "event: update-policy\n";
-            echo 'data: '.json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n\n";
-            $emitted = true;
-        }
-        $commands = $authenticated ? db_all($db, "SELECT * FROM device_update_commands WHERE device_id=:id AND uuid=:uuid AND status='pending' AND expires_at>:now ORDER BY created_at,command_id LIMIT 20", ['id'=>$id,'uuid'=>$uuid,'now'=>time()]) : [];
-        foreach ($commands as $command) {
-            $payload=['command_id'=>$command['command_id'],'action'=>$command['action'],'client_id'=>$id,'client_uuid'=>$uuid,'target_version'=>$command['target_version'] ?? null,'target_build_seq'=>isset($command['target_build_seq'])?(int)$command['target_build_seq']:null,'created_at'=>(int)$command['created_at'],'expires_at'=>(int)$command['expires_at']];
-            echo 'id: '.$command['command_id']."\n";
-            echo "event: update-command\n";
-            echo 'data: '.json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n\n";
-            $emitted = true;
-        }
-        if ($emitted) {
-            @ob_flush(); flush();
-            exit;
-        }
-        if (microtime(true) >= $nextHeartbeat) {
-            echo ": heartbeat\n\n";
-            @ob_flush(); flush();
-            $nextHeartbeat = microtime(true) + 2.0;
-        }
-        if (connection_aborted()) exit;
-        usleep(250000);
-    } while (microtime(true) < $deadline);
+    expire_update_commands($db,$id,$uuid);
+    $policy = update_policy($db, $id, $uuid, $channel);
+    if ((int)$policy['policy_revision'] > $afterRevision) {
+        $payload = update_policy_payload($policy, $id, $uuid);
+        echo 'id: '.$policy['policy_revision']."\n";
+        echo "event: update-policy\n";
+        echo 'data: '.json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n\n";
+    }
+    $commands = $authenticated ? db_all($db, "SELECT * FROM device_update_commands WHERE device_id=:id AND uuid=:uuid AND status='pending' AND expires_at>:now ORDER BY created_at,command_id LIMIT 20", ['id'=>$id,'uuid'=>$uuid,'now'=>time()]) : [];
+    foreach ($commands as $command) {
+        $payload=['command_id'=>$command['command_id'],'action'=>$command['action'],'client_id'=>$id,'client_uuid'=>$uuid,'target_version'=>$command['target_version'] ?? null,'target_build_seq'=>isset($command['target_build_seq'])?(int)$command['target_build_seq']:null,'created_at'=>(int)$command['created_at'],'expires_at'=>(int)$command['expires_at']];
+        echo 'id: '.$command['command_id']."\n";
+        echo "event: update-command\n";
+        echo 'data: '.json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n\n";
+    }
     exit;
+}
+function require_stream_internal_request(): void
+{
+    $remote = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
+    if (!in_array($remote, ['127.0.0.1', '::1'], true)) fail(404, 'Not Found');
+}
+function update_policy_stream_auth(PDO $db): never
+{
+    require_stream_internal_request();
+    $id = text_field($_GET, 'client_id', 128, text_field($_GET, 'id', 128));
+    $uuid = text_field($_GET, 'client_uuid', 256, text_field($_GET, 'uuid', 256));
+    if ($id === '' || $uuid === '') fail(422, '缺少客户端 ID 或 UUID');
+    [$id, $uuid] = resolve_update_identity($db, $id, $uuid);
+    $authenticated = trim((string)($_SERVER['HTTP_X_RUSTDESK_DEVICE_SIGNATURE'] ?? '')) !== '';
+    if ($authenticated) [$id, $uuid] = update_device_auth($db, 'GET', '/rd/update/v1/policy/stream', $id, $uuid);
+    $afterRevision = trim((string)($_GET['after_revision'] ?? ''));
+    $lastEventId = trim((string)($_SERVER['HTTP_LAST_EVENT_ID'] ?? ''));
+    if ($afterRevision !== '' && !ctype_digit($afterRevision)) fail(422, 'after_revision 必须是非负整数');
+    if ($lastEventId !== '' && !ctype_digit($lastEventId) && !preg_match('/^[0-9a-f]{32}$/', $lastEventId)) fail(422, 'Last-Event-ID 格式错误');
+    $channel = text_field($_GET, 'channel', 32, 'stable');
+    if (!in_array($channel, ['stable', 'beta'], true)) fail(422, '更新通道无效');
+    reply(['client_id'=>$id, 'client_uuid'=>$uuid, 'authenticated'=>$authenticated]);
+}
+function update_policy_stream_snapshot(PDO $db): never
+{
+    require_stream_internal_request();
+    $data = json_body();
+    $streams = $data['streams'] ?? null;
+    if (!is_array($streams) || !array_is_list($streams) || count($streams) > 5000) fail(422, 'streams 必须是最多 5000 项的数组');
+    $normalized = [];
+    foreach ($streams as $stream) {
+        if (!is_array($stream)) fail(422, 'stream 格式错误');
+        $connectionId = $stream['connection_id'] ?? '';
+        $id = $stream['client_id'] ?? '';
+        $uuid = $stream['client_uuid'] ?? '';
+        $afterRevision = $stream['after_revision'] ?? -1;
+        $authenticated = $stream['authenticated'] ?? false;
+        $channel = $stream['channel'] ?? 'stable';
+        if (!is_string($connectionId) || !preg_match('/^[A-Za-z0-9._~-]{1,64}$/', $connectionId)) fail(422, 'connection_id 格式错误');
+        if (!is_string($id) || $id === '' || strlen($id) > 128 || !is_string($uuid) || $uuid === '' || strlen($uuid) > 256) fail(422, '客户端身份格式错误');
+        if (!is_int($afterRevision) || $afterRevision < -1 || !is_bool($authenticated) || !is_string($channel) || !in_array($channel, ['stable', 'beta'], true)) fail(422, 'stream 状态格式错误');
+        [$id, $uuid] = resolve_update_identity($db, $id, $uuid);
+        $normalized[$connectionId] = ['id'=>$id, 'uuid'=>$uuid, 'after_revision'=>$afterRevision, 'authenticated'=>$authenticated, 'channel'=>$channel];
+    }
+    $now = time();
+    db_exec($db, "UPDATE device_update_commands SET status='expired',updated_at=:now WHERE status='pending' AND expires_at<=:now", ['now'=>$now]);
+    $policies = [];
+    foreach (db_all($db, 'SELECT * FROM device_update_policies') as $policy) {
+        $policies[(string)$policy['id']."\0".(string)$policy['uuid']] = normalize_update_policy($policy);
+    }
+    $commands = [];
+    foreach (db_all($db, "SELECT * FROM device_update_commands WHERE status='pending' AND expires_at>:now ORDER BY created_at,command_id", ['now'=>$now]) as $command) {
+        $commands[(string)$command['device_id']."\0".(string)$command['uuid']][] = $command;
+    }
+    $result = [];
+    foreach ($normalized as $connectionId=>$stream) {
+        $key = $stream['id']."\0".$stream['uuid'];
+        $policy = $policies[$key] ?? normalize_update_policy(['id'=>$stream['id'],'uuid'=>$stream['uuid'],'mode'=>'notify','channel'=>$stream['channel'],'target_version'=>null,'target_build_seq'=>null,'auto_install'=>0,'enable_check_update'=>0,'allow_auto_update'=>0,'enable_scheduled_update'=>0,'scheduled_update_interval_hours'=>5,'policy_revision'=>0,'updated_at'=>0]);
+        $events = [];
+        if ((int)$policy['policy_revision'] > $stream['after_revision']) {
+            $events[] = ['id'=>(string)$policy['policy_revision'], 'type'=>'update-policy', 'data'=>update_policy_payload($policy, $stream['id'], $stream['uuid'])];
+        }
+        if ($stream['authenticated']) foreach (array_slice($commands[$key] ?? [], 0, 20) as $command) {
+            $events[] = ['id'=>(string)$command['command_id'], 'type'=>'update-command', 'data'=>[
+                'command_id'=>$command['command_id'],'action'=>$command['action'],'client_id'=>$stream['id'],'client_uuid'=>$stream['uuid'],
+                'target_version'=>$command['target_version'] ?? null,'target_build_seq'=>isset($command['target_build_seq'])?(int)$command['target_build_seq']:null,
+                'created_at'=>(int)$command['created_at'],'expires_at'=>(int)$command['expires_at'],
+            ]];
+        }
+        $result[$connectionId] = $events;
+    }
+    reply(['streams'=>$result]);
 }
 function publish_token_auth(): void
 {
@@ -913,7 +991,7 @@ function enqueue_release_checks(PDO $db, array $manifest, int $updatedBy): int
     foreach ($devices as $device) {
         $id=(string)$device['id']; $uuid=(string)$device['uuid']; $client=update_command_client($db,$id,$uuid);
         $policy=update_policy($db,$id,$uuid,'stable');
-        if ((string)$policy['channel'] !== (string)$manifest['channel'] || !manifest_supports_client($manifest,$client)) continue;
+        if ((string)$policy['channel'] !== (string)$manifest['channel'] || !manifest_supports_client($manifest,$client,true)) continue;
         $current=['version'=>text_field($client,'version',32,'0.0.0'),'build_seq'=>(int)($client['build_seq']??0)];
         if (compare_release($manifest,$current) <= 0) continue;
         $duplicate=db_one($db,"SELECT command_id FROM device_update_commands WHERE device_id=:id AND uuid=:uuid AND action='check' AND target_version=:version AND target_build_seq=:build AND status IN ('pending','accepted','received','checking','started','deferred') LIMIT 1",['id'=>$id,'uuid'=>$uuid,'version'=>$manifest['version'],'build'=>(int)$manifest['build_seq']]);
@@ -1572,11 +1650,13 @@ try {
     if (preg_match('#^/rd/update/v1/manifest/([A-Za-z0-9._~-]+)\.json$#', $path, $match)) {
         method('GET'); $manifest=public_update_manifest($db,$match[1]); if(!$manifest)fail(404,'更新清单不存在'); header('Cache-Control: public, max-age=60'); reply($manifest);
     }
+    if ($path === '/_rustdesk-stream-internal/auth') { method('GET'); update_policy_stream_auth($db); }
+    if ($path === '/_rustdesk-stream-internal/snapshot') { method('POST'); update_policy_stream_snapshot($db); }
     if ($path === '/rd/update/v1/policy/stream') { method('GET'); update_policy_stream($db); }
     if ($path === '/rd/update/v1/check') {
         method('POST'); $data=json_body(); $id=text_field($data,'client_id',128,text_field($data,'id',128)); $uuid=text_field($data,'client_uuid',256,text_field($data,'uuid',256));
         if($id===''||$uuid==='')fail(422,'缺少客户端 ID 或 UUID'); [$id,$uuid]=resolve_update_identity($db,$id,$uuid); $commandId=trim((string)($_SERVER['HTTP_X_RUSTDESK_UPDATE_COMMAND_ID']??''));
-        if($commandId!=='')update_device_auth($db,'POST','/rd/update/v1/check',$id,$uuid,$commandId); $command=update_command_request($db,$id,$uuid,$commandId); reply(update_check_response($db,$data,$command));
+	        if($commandId!=='')update_device_auth($db,'POST','/rd/update/v1/check',$id,$uuid,$commandId); $command=update_command_request($db,$id,$uuid,$commandId); reply(update_check_response($db,$data,$command,$commandId!==''));
     }
     if ($path === '/rd/update/v1/publish') { method('POST'); publish_token_auth(); reply(publish_update_manifest($db,json_body()),201); }
     if ($path === '/rd/update/v1/events') {

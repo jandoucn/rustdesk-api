@@ -1,3 +1,9 @@
+FROM golang:1.24-alpine AS stream-broker
+WORKDIR /src
+COPY ./stream-broker/go.mod ./
+COPY ./stream-broker/*.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/rustdesk-stream-broker .
+
 # PHP 8.3 FPM Alpine runtime
 FROM php:8.3-fpm-alpine AS php
 
@@ -22,6 +28,7 @@ RUN set -eux; \
 # 复制自定义的Nginx配置文件到容器中
 COPY ./config/nginx.conf /etc/nginx/nginx.conf
 COPY ./config/docker-entrypoint.sh /usr/local/bin/rustdesk-entrypoint
+COPY --from=stream-broker /out/rustdesk-stream-broker /usr/local/bin/rustdesk-stream-broker
 RUN chmod 0755 /usr/local/bin/rustdesk-entrypoint
 
 # GeoLite is an image seed. The entrypoint copies it into the persistent data

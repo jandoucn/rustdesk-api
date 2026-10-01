@@ -81,6 +81,22 @@ function setLatestUpdateCommandStatus(id, uuid, status) {
   ], { encoding: 'utf8' }).trim();
 }
 
+function updateCommandSqlSnapshot(id, uuid) {
+  const container = process.env.RUSTDESK_API_CONTAINER;
+  if (!container) throw new Error('RUSTDESK_API_CONTAINER is required for persisted update-command E2E');
+  const php = [
+    "require '/var/www/html/lib.php';",
+    '$db=open_database();',
+    "$rows=db_all($db,'SELECT action,target_version,target_build_seq,status FROM device_update_commands WHERE device_id=:id AND uuid=:uuid ORDER BY action',['id'=>getenv('TEST_DEVICE_ID'),'uuid'=>getenv('TEST_DEVICE_UUID')]);",
+    'echo json_encode($rows,JSON_THROW_ON_ERROR);',
+  ].join('');
+  const output = execFileSync('docker', [
+    'exec', '-e', `TEST_DEVICE_ID=${id}`, '-e', `TEST_DEVICE_UUID=${uuid}`,
+    container, 'php', '-r', php,
+  ], { encoding: 'utf8' });
+  return JSON.parse(output.trim());
+}
+
 function addressBookSqlSnapshot(uid, peerIds) {
   const container = process.env.RUSTDESK_API_CONTAINER;
   if (!container) throw new Error('RUSTDESK_API_CONTAINER is required for persisted address-book E2E');
@@ -652,15 +668,24 @@ test('desktop release renders as installed and keeps UUID out of the inventory r
 test('client details sends one-shot check and install commands and shows command status', async ({ page, request }) => {
   const deviceId = `update-command-${Date.now().toString(36)}`;
   const uuid = `${deviceId}-uuid`;
-  await reportClient(request, deviceId);
-  await loginAdmin(page);
   const buildSeq = Date.now();
+  await expect((await request.post('/api/heartbeat', { data: { id: deviceId, uuid, ver: 150, conns: [] } })).ok()).toBeTruthy();
+  await expect((await request.post('/api/sysinfo', { data: {
+    id: deviceId, uuid, hostname: `${deviceId}-host`, product: 'rustdesk-yan', edition: 'standard',
+    version: '9.9.9', build_number: '20261001.6', build_seq: buildSeq - 1, channel: 'stable',
+    platform: 'Windows', arch: 'x86_64', install_mode: 'installed',
+  } })).ok()).toBeTruthy();
+  await loginAdmin(page);
   await page.evaluate(async ({ adminPath, buildSeq }) => {
     const session = await (await fetch(`${adminPath}/api/session`)).json();
     const asset = { primary: `https://download.yan.life/rustdesk/stable/e2e-${buildSeq}/rustdesk.exe`, mirrors: [], size: 12, sha256: 'a'.repeat(64), signature: btoa('s'.repeat(64)), signature_key_id: 'yan-release-2026' };
-    const response = await fetch(`${adminPath}/api/update/releases`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': session.csrf }, body: JSON.stringify({ version: '9.9.9', build_seq: buildSeq, channel: 'stable', manifest: { product: 'rustdesk-yan', edition: 'custom', source_commit: 'e2e-update-command', targets: { 'windows-x86_64-exe-custom': asset } } }) });
+    const response = await fetch(`${adminPath}/api/update/releases`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': session.csrf }, body: JSON.stringify({ version: '9.9.9', build_seq: buildSeq, channel: 'stable', manifest: { product: 'rustdesk-yan', edition: 'multi', source_commit: 'e2e-update-command', targets: { 'windows-x86_64-exe-standard': asset, 'windows-x86_64-msi-standard': { ...asset, primary: `https://download.yan.life/rustdesk/stable/e2e-${buildSeq}/rustdesk.msi` } } } }) });
     if (!response.ok) throw new Error(await response.text());
   }, { adminPath, buildSeq });
+  const publishedCommands = updateCommandSqlSnapshot(deviceId, uuid);
+  expect(publishedCommands).toEqual([
+    { action: 'check', target_version: '9.9.9', target_build_seq: buildSeq, status: 'pending' },
+  ]);
   await page.goto(`${adminPath}/devices`);
   await page.locator('#q').fill(deviceId);
   await page.getByRole('button', { name: '搜索' }).click();
@@ -677,6 +702,13 @@ test('client details sends one-shot check and install commands and shows command
   await expect(page.locator('#status')).toContainText('安装命令已发送');
   await expect(page.locator('#details-dialog')).toContainText('最近更新命令');
   await expect(page.locator('#details-dialog')).toContainText('等待客户端接收');
+  const persistedCommands = updateCommandSqlSnapshot(deviceId, uuid);
+  expect(persistedCommands).toHaveLength(publishedCommands.length + 2);
+  expect(persistedCommands.filter(command => command.action === 'check')).toHaveLength(2);
+  expect(persistedCommands.filter(command => command.action === 'install')).toHaveLength(1);
+  for (const command of persistedCommands) {
+    expect(command).toEqual({ action: command.action, target_version: '9.9.9', target_build_seq: buildSeq, status: 'pending' });
+  }
   setLatestUpdateCommandStatus(deviceId, uuid, 'installing');
   await expect(page.locator('#details-dialog')).toContainText('正在安装', { timeout: 5000 });
 });

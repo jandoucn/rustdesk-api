@@ -68,6 +68,10 @@ Tests must use real CRUD and compare persisted SQLite values. New page actions r
 - Presence states are derived from the latest heartbeat: online at 20 seconds or less, recently online through 90 seconds, then offline.
 - The console refreshes presence every 5 seconds while visible and pauses while the document is hidden.
 - A RustDesk OSS hbbs process does not expose a standard external API for its in-memory connection registry. Do not claim that hbbs-only clients are visible unless an explicit hbbs event/data integration has been added and tested.
+- Client update-policy SSE connections are owned by the asynchronous stream broker, never by PHP-FPM workers. PHP may perform short authentication and batched SQLite snapshot requests only; it must not wait, sleep or hold one worker per connected client.
+- The stream broker supports device-signed and legacy unsigned SSE connections, reserves most long-poll capacity for signed devices, caps streams globally and per device identity, and batches snapshots below the PHP endpoint limit. Unsigned admission does not call PHP, and overload responses must not synchronously call PHP or SQLite.
+- The public `/rd/update/v1/policy/stream` contract, device-signature verification, nonce replay protection, policy resume semantics and command identity binding must remain compatible when changing the broker or its Nginx routing.
+- Device inventory does not guarantee `package_kind`. One-shot command creation may lock a release from product, edition, platform and architecture only when that release covers every supported package kind for the platform; otherwise check stays targetless and install waits for signed package identity. Exact EXE/MSI/DMG/AppImage/APK selection remains bound to the client's signed `/rd/update/v1/check` `target_key` and must not be guessed from inventory metadata.
 
 ## Address-book alias contract
 
