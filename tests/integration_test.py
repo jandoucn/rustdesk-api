@@ -763,6 +763,303 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(ambiguous["mode"], "notify")
         self.assertEqual(ambiguous["policy_revision"], 0)
 
+    def test_android_signed_check_selects_exact_apk_edition_and_build(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        catalog_build = 2099100203
+        standard_build = 2099100201
+        sos_build = 2099100202
+        standard_id = f"android-standard-{suffix}"
+        standard_uuid = f"android-standard-uuid-{suffix}"
+        sos_id = f"android-sos-{suffix}"
+        sos_uuid = f"android-sos-uuid-{suffix}"
+        device_ids = (standard_id, sos_id)
+
+        def apk_target(edition: str, build_seq: int) -> dict:
+            return {
+                "version": "1.6.0",
+                "build_number": f"20991002.{build_seq % 100}",
+                "build_seq": build_seq,
+                "source_commit": "a" * 40,
+                "source_tag": f"android-{edition}",
+                "primary": f"https://download.yan.life/rustdesk/stable/android-{edition}.apk",
+                "mirrors": [],
+                "size": 1024,
+                "sha256": ("a" if edition == "standard" else "b") * 64,
+                "signature": __import__("base64").b64encode(b"s" * 64).decode(),
+                "signature_key_id": "yan-release-2026",
+            }
+
+        manifest = {
+            "schema": 2,
+            "product": "rustdesk-yan",
+            "edition": "multi",
+            "version": "1.6.0",
+            "build_number": "20991002.3",
+            "build_seq": catalog_build,
+            "channel": "stable",
+            "targets": {
+                "android-aarch64-apk-standard": apk_target("standard", standard_build),
+                "android-aarch64-apk-sos": apk_target("sos", sos_build),
+            },
+        }
+
+        def cleanup():
+            db = sqlite3.connect(self.db)
+            placeholders = ",".join("?" for _ in device_ids)
+            db.execute(f"DELETE FROM device_update_commands WHERE device_id IN ({placeholders})", device_ids)
+            db.execute(f"DELETE FROM device_update_nonces WHERE device_id IN ({placeholders})", device_ids)
+            db.execute(f"DELETE FROM device_update_keys WHERE device_id IN ({placeholders})", device_ids)
+            db.execute(f"DELETE FROM device_reports WHERE id IN ({placeholders})", device_ids)
+            db.execute(f"DELETE FROM device_deployments WHERE id IN ({placeholders})", device_ids)
+            db.execute("DELETE FROM update_releases WHERE version='1.6.0' AND build_seq=? AND channel='stable'", (catalog_build,))
+            db.commit()
+            db.close()
+
+        self.addCleanup(cleanup)
+        now = int(time.time())
+        db = sqlite3.connect(self.db)
+        db.execute(
+            "INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,1)",
+            ("1.6.0", catalog_build, "stable", json.dumps(manifest), now),
+        )
+        db.commit()
+        db.close()
+
+        clients = (
+            (standard_id, standard_uuid, "standard", standard_build, "android-aarch64-apk-standard"),
+            (sos_id, sos_uuid, "sos", sos_build, "android-aarch64-apk-sos"),
+        )
+        for client_id, client_uuid, edition, target_build, target_key in clients:
+            report = {
+                "client_id": client_id,
+                "client_uuid": client_uuid,
+                "product": "rustdesk-yan",
+                "edition": edition,
+                "platform": "android",
+                "arch": "aarch64",
+                "package_kind": "apk",
+                "target_key": target_key,
+                "version": "1.5.1",
+                "build_seq": target_build - 1,
+                "channel": "stable",
+            }
+            self.client.json("POST", "/?s=/api/heartbeat", {"id": client_id, "uuid": client_uuid, "conns": []})
+            self.client.json("POST", "/?s=/api/sysinfo", {"id": client_id, "uuid": client_uuid, **report})
+            db = sqlite3.connect(self.db)
+            db.execute(
+                "INSERT OR REPLACE INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)",
+                (client_id, client_uuid, device_public_key(), 1, json.dumps(report), now),
+            )
+            db.commit()
+            db.close()
+
+            endpoint = f"/?s=/ops-x9/api/update/commands/{client_id}"
+            _, command, _ = self.client.json(
+                "POST",
+                endpoint,
+                {"uuid": client_uuid, "action": "check", "target_version": "1.6.0", "target_build_seq": target_build},
+                {"X-CSRF-Token": csrf},
+                expected=(201,),
+            )
+            headers = {
+                "X-RustDesk-Update-Command-ID": command["command_id"],
+                **device_auth_headers("POST", "/rd/update/v1/check", client_id, client_uuid, report, command["command_id"]),
+            }
+            _, available, _ = self.client.json("POST", "/?s=/rd/update/v1/check", report, headers)
+            self.assertTrue(available["update_available"])
+            self.assertEqual(available["url"], manifest["targets"][target_key]["primary"])
+            self.assertEqual((available["target_version"], available["target_build_seq"]), ("1.6.0", target_build))
+
+            _, current, _ = self.client.json("POST", "/?s=/rd/update/v1/check", {**report, "version": "1.6.0", "build_seq": target_build})
+            self.assertFalse(current["update_available"])
+            self.assertEqual(current["target_build_seq"], target_build)
+            _, newer, _ = self.client.json("POST", "/?s=/rd/update/v1/check", {**report, "version": "1.6.0", "build_seq": target_build + 1})
+            self.assertFalse(newer["update_available"])
+
+            db = sqlite3.connect(self.db)
+            stored = db.execute(
+                "SELECT payload FROM device_reports WHERE id=? AND uuid=?",
+                (client_id, client_uuid),
+            ).fetchone()
+            command_row = db.execute(
+                "SELECT device_id,uuid,action,target_version,target_build_seq,status FROM device_update_commands WHERE command_id=?",
+                (command["command_id"],),
+            ).fetchone()
+            db.close()
+            persisted = json.loads(stored[0])
+            self.assertEqual(
+                (persisted["client_id"], persisted["client_uuid"], persisted["platform"], persisted["arch"], persisted["package_kind"], persisted["edition"], persisted["target_key"]),
+                (client_id, client_uuid, "android", "aarch64", "apk", edition, target_key),
+            )
+            self.assertEqual(command_row[:5], (client_id, client_uuid, "check", "1.6.0", target_build))
+
+    def test_android_policy_persists_and_signed_stream_delivers_command(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id = f"android-policy-{suffix}"
+        device_uuid = f"android-policy-uuid-{suffix}"
+
+        def cleanup():
+            db = sqlite3.connect(self.db)
+            db.execute("DELETE FROM device_update_commands WHERE device_id=? AND uuid=?", (device_id, device_uuid))
+            db.execute("DELETE FROM device_update_nonces WHERE device_id=? AND uuid=?", (device_id, device_uuid))
+            db.execute("DELETE FROM device_update_keys WHERE device_id=? AND uuid=?", (device_id, device_uuid))
+            db.execute("DELETE FROM device_update_policies WHERE id=? AND uuid=?", (device_id, device_uuid))
+            db.execute("DELETE FROM device_reports WHERE id=? AND uuid=?", (device_id, device_uuid))
+            db.execute("DELETE FROM device_deployments WHERE id=? AND uuid=?", (device_id, device_uuid))
+            db.commit()
+            db.close()
+
+        self.addCleanup(cleanup)
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_uuid, "conns": []})
+        self.client.json("POST", "/?s=/api/sysinfo", {
+            "id": device_id,
+            "uuid": device_uuid,
+            "client_id": device_id,
+            "client_uuid": device_uuid,
+            "product": "rustdesk-yan",
+            "edition": "standard",
+            "platform": "android",
+            "arch": "aarch64",
+            "package_kind": "apk",
+        })
+        db = sqlite3.connect(self.db)
+        db.execute(
+            "INSERT OR REPLACE INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)",
+            (device_id, device_uuid, device_public_key(), 1, "{}", int(time.time())),
+        )
+        db.commit()
+        db.close()
+
+        _, policy, _ = self.client.json(
+            "PATCH",
+            f"/?s=/ops-x9/api/update/policies/{device_id}",
+            {
+                "uuid": device_uuid,
+                "mode": "notify",
+                "channel": "stable",
+                "enable_check_update": True,
+                "allow_auto_update": True,
+                "enable_scheduled_update": True,
+                "scheduled_update_interval_hours": 5,
+            },
+            {"X-CSRF-Token": csrf},
+        )
+        _, command, _ = self.client.json(
+            "POST",
+            f"/?s=/ops-x9/api/update/commands/{device_id}",
+            {"uuid": device_uuid, "action": "check"},
+            {"X-CSRF-Token": csrf},
+            expected=(201,),
+        )
+        headers = {
+            "Accept": "text/event-stream",
+            **device_auth_headers("GET", "/rd/update/v1/policy/stream", device_id, device_uuid),
+        }
+        _, stream, content_type = self.client.request(
+            "GET",
+            f"/?s=/rd/update/v1/policy/stream&client_id={device_id}&client_uuid={device_uuid}&after_revision=0",
+            headers=headers,
+            expected=(200,),
+        )
+        self.assertIn("text/event-stream", content_type)
+        self.assertIn("event: update-policy\n", stream)
+        self.assertIn("event: update-command\n", stream)
+        events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
+        policy_event = next(event for event in events if "policy_revision" in event)
+        command_event = next(event for event in events if event.get("command_id") == command["command_id"])
+        self.assertEqual(
+            (
+                policy_event["client_id"], policy_event["client_uuid"], policy_event["enable_check_update"],
+                policy_event["allow_auto_update"], policy_event["enable_scheduled_update"],
+                policy_event["scheduled_update_interval_hours"], policy_event["policy_revision"],
+            ),
+            (device_id, device_uuid, True, True, True, 5, policy["policy_revision"]),
+        )
+        self.assertEqual(
+            (command_event["client_id"], command_event["client_uuid"], command_event["action"]),
+            (device_id, device_uuid, "check"),
+        )
+        db = sqlite3.connect(self.db)
+        persisted_policy = db.execute(
+            "SELECT enable_check_update,allow_auto_update,enable_scheduled_update,scheduled_update_interval_hours,policy_revision FROM device_update_policies WHERE id=? AND uuid=?",
+            (device_id, device_uuid),
+        ).fetchone()
+        persisted_command = db.execute(
+            "SELECT device_id,uuid,action,status FROM device_update_commands WHERE command_id=?",
+            (command["command_id"],),
+        ).fetchone()
+        db.close()
+        self.assertEqual(persisted_policy, (1, 1, 1, 5, policy["policy_revision"]))
+        self.assertEqual(persisted_command, (device_id, device_uuid, "check", "pending"))
+
+    def test_android_legacy_client_id_falls_back_by_unique_uuid(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id = f"android-legacy-{suffix}"
+        device_uuid = f"android-legacy-uuid-{suffix}"
+
+        def cleanup():
+            db = sqlite3.connect(self.db)
+            db.execute("DELETE FROM device_update_policies WHERE id=? AND uuid=?", (device_id, device_uuid))
+            db.execute("DELETE FROM device_reports WHERE id=? AND uuid=?", (device_id, device_uuid))
+            db.commit()
+            db.close()
+
+        self.addCleanup(cleanup)
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_uuid, "conns": []})
+        self.client.json("POST", "/?s=/api/sysinfo", {
+            "id": device_id,
+            "uuid": device_uuid,
+            "client_id": device_id,
+            "client_uuid": device_uuid,
+            "product": "rustdesk-yan",
+            "edition": "standard",
+            "platform": "android",
+            "arch": "aarch64",
+            "package_kind": "apk",
+        })
+        _, saved, _ = self.client.json(
+            "PATCH",
+            f"/?s=/ops-x9/api/update/policies/{device_id}",
+            {
+                "uuid": device_uuid,
+                "mode": "auto_install",
+                "channel": "stable",
+                "auto_install": True,
+                "enable_check_update": True,
+                "allow_auto_update": True,
+                "enable_scheduled_update": True,
+                "scheduled_update_interval_hours": 6,
+            },
+            {"X-CSRF-Token": csrf},
+        )
+        _, resolved, _ = self.client.json("POST", "/?s=/rd/update/v1/check", {
+            "client_id": "RustDesk Yan",
+            "client_uuid": device_uuid,
+            "product": "rustdesk-yan",
+            "edition": "standard",
+            "platform": "android",
+            "arch": "aarch64",
+            "package_kind": "apk",
+            "version": "1.5.1",
+            "build_seq": 1,
+            "channel": "stable",
+        })
+        self.assertEqual(
+            (
+                resolved["mode"], resolved["auto_install"], resolved["enable_check_update"],
+                resolved["allow_auto_update"], resolved["enable_scheduled_update"],
+                resolved["scheduled_update_interval_hours"], resolved["policy_revision"],
+            ),
+            ("auto_install", True, True, True, True, 6, saved["policy_revision"]),
+        )
+        db = sqlite3.connect(self.db)
+        identities = db.execute("SELECT id,uuid FROM device_reports WHERE uuid=?", (device_uuid,)).fetchall()
+        db.close()
+        self.assertEqual(identities, [(device_id, device_uuid)])
+
     def test_machine_publish_validates_manifest_and_drives_platform_checks(self):
         asset = {
             "primary": "https://download.yan.life/rustdesk/stable/v1.5.0-build-2026.09.30-01/rustdesk-1.5.0-standard-windows-x86_64.exe",
