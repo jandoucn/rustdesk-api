@@ -462,6 +462,63 @@ function compare_release(array $a, array $b): int
     $av = version_tuple((string)($a['version'] ?? '')); $bv = version_tuple((string)($b['version'] ?? ''));
     return $av <=> $bv ?: ((int)($a['build_seq'] ?? 0) <=> (int)($b['build_seq'] ?? 0));
 }
+function manifest_target_key(array $manifest, array $client): string
+{
+    foreach (update_target_candidates($client) as $key) if (isset($manifest['targets'][$key]) && is_array($manifest['targets'][$key])) return $key;
+    return '';
+}
+function target_release(array $manifest, string $targetKey = ''): array
+{
+    $target = $targetKey !== '' && is_array($manifest['targets'][$targetKey] ?? null) ? $manifest['targets'][$targetKey] : [];
+    return ['version'=>(string)($target['version'] ?? $manifest['version'] ?? '0.0.0'), 'build_seq'=>(int)($target['build_seq'] ?? $manifest['build_seq'] ?? 0)];
+}
+function common_unknown_package_release(array $manifest, array $client): ?array
+{
+    if (text_field($client, 'package_kind', 16) !== '') return null;
+    $platform = strtolower(text_field($client, 'platform', 32));
+    $arch = strtolower(text_field($client, 'arch', 32));
+    $edition = strtolower(text_field($client, 'edition', 32));
+    if ($platform === '' || $arch === '' || $edition === '') return null;
+    $kinds = match ($platform) {
+        'windows' => ['exe', 'msi'], 'macos' => ['dmg'], 'linux' => ['appimage'], 'android' => ['apk'], default => [],
+    };
+    if (!$kinds) return null;
+    $identity = null;
+    foreach ($kinds as $kind) {
+        $specific = "$platform-$arch-$kind-$edition"; $generic = "$platform-$arch-$kind";
+        $target = $manifest['targets'][$specific] ?? $manifest['targets'][$generic] ?? null;
+        if (!is_array($target)) return null;
+        $candidate = [];
+        foreach (['version','build_number','build_seq','source_commit','source_tag'] as $field) $candidate[$field] = $target[$field] ?? $manifest[$field] ?? null;
+        if ($identity !== null && $candidate !== $identity) return null;
+        $identity = $candidate;
+    }
+    return $identity;
+}
+function project_manifest_target(array $manifest, array $client): array
+{
+    $key = manifest_target_key($manifest, $client);
+    if ($key !== '') {
+        $release = target_release($manifest, $key);
+        $manifest['version'] = $release['version']; $manifest['build_seq'] = $release['build_seq'];
+        $manifest['target_key'] = $key;
+        foreach (['build_number','source_commit','source_tag'] as $field) if (array_key_exists($field, $manifest['targets'][$key])) $manifest[$field] = $manifest['targets'][$key][$field];
+    } else {
+        $release = common_unknown_package_release($manifest, $client);
+        if ($release !== null) foreach ($release as $field => $value) $manifest[$field] = $field === 'build_seq' ? (int)$value : $value;
+    }
+    return $manifest;
+}
+function release_for_target(PDO $db, string $channel, array $client, string $version, int $build): ?array
+{
+    foreach (db_all($db, 'SELECT version,build_seq,manifest FROM update_releases WHERE channel=:channel AND active=1 ORDER BY build_seq DESC,published_at DESC', ['channel'=>$channel]) as $row) {
+        $manifest = decoded_payload($row['manifest'] ?? null); $manifest['version'] ??= $row['version']; $manifest['build_seq'] ??= (int)$row['build_seq']; $manifest['channel'] ??= $channel;
+        if (!manifest_supports_client($manifest, $client, true)) continue;
+        $projected = project_manifest_target($manifest, $client);
+        if ((string)$projected['version'] === $version && (int)$projected['build_seq'] === $build) return $manifest;
+    }
+    return null;
+}
 function update_mode(string $mode): string { return in_array($mode, ['disabled','notify','download','auto_install'], true) ? $mode : 'notify'; }
 function update_target_candidates(array $client): array
 {
@@ -500,15 +557,7 @@ function manifest_supports_client(array $manifest, array $client, bool $allowUnk
         $arch = strtolower(text_field($client, 'arch', 32));
         $edition = strtolower(text_field($client, 'edition', 32));
         if ($product !== '' && $platform !== '' && $arch !== '' && $edition !== '') {
-            $requiredKinds = match ($platform) {
-                'windows' => ['exe', 'msi'], 'macos' => ['dmg'], 'linux' => ['appimage'], 'android' => ['apk'], default => [],
-            };
-            foreach ($requiredKinds as $kind) {
-                $specific = "$platform-$arch-$kind-$edition";
-                $generic = "$platform-$arch-$kind";
-                if (!isset($targets[$specific]) && !isset($targets[$generic])) return false;
-            }
-            return $requiredKinds !== [];
+            return common_unknown_package_release($manifest, $client) !== null;
         }
         return false;
     }
@@ -519,12 +568,15 @@ function manifest_supports_client(array $manifest, array $client, bool $allowUnk
 }
 function public_update_manifest(PDO $db, string $channel, ?string $targetVersion = null, ?int $targetBuild = null, array $client = [], bool $allowUnknownPackageKind = false): ?array
 {
-    $best = null;
+    $best = null; $bestCatalogBuild = -1;
     foreach (db_all($db, 'SELECT version,build_seq,channel,manifest FROM update_releases WHERE channel=:channel AND active=1', ['channel'=>$channel]) as $row) {
         $manifest = decoded_payload($row['manifest']); $manifest['version'] ??= $row['version']; $manifest['build_seq'] ??= (int)$row['build_seq']; $manifest['channel'] ??= $row['channel'];
-        if ($targetVersion !== null && $targetVersion !== '' && compare_release($manifest, ['version'=>$targetVersion,'build_seq'=>$targetBuild ?? PHP_INT_MAX]) > 0) continue;
         if ($client && !manifest_supports_client($manifest, $client, $allowUnknownPackageKind)) continue;
-        if ($best === null || compare_release($manifest, $best) > 0) $best = $manifest;
+        if ($client) $manifest = project_manifest_target($manifest, $client);
+        if ($targetVersion !== null && $targetVersion !== '' && compare_release($manifest, ['version'=>$targetVersion,'build_seq'=>$targetBuild ?? PHP_INT_MAX]) > 0) continue;
+        $comparison = $best === null ? 1 : compare_release($manifest, $best);
+        $catalogBuild = (int)($manifest['catalog_revision'] ?? $row['build_seq']);
+        if ($comparison > 0 || ($comparison === 0 && $catalogBuild > $bestCatalogBuild)) { $best = $manifest; $bestCatalogBuild = $catalogBuild; }
     }
     return $best;
 }
@@ -762,8 +814,8 @@ function create_update_command(PDO $db, array $actor, string $id, array $data): 
     $channel = (string)($policy['channel'] ?: 'stable');
     $client = update_command_client($db, $id, $uuid);
     if ($targetVersion !== '') {
-        $release = db_one($db, 'SELECT version,build_seq,manifest FROM update_releases WHERE channel=:channel AND version=:version AND build_seq=:build AND active=1', ['channel'=>$channel,'version'=>$targetVersion,'build'=>$targetBuild]);
-        if ($release && !manifest_supports_client(decoded_payload($release['manifest']), $client, true)) $release = null;
+        $release = release_for_target($db, $channel, $client, $targetVersion, (int)$targetBuild);
+        if ($release) $release = ['version'=>$targetVersion,'build_seq'=>$targetBuild];
     } else {
         $manifest = public_update_manifest($db, $channel, null, null, $client, true);
         $release = $manifest ? ['version'=>$manifest['version'] ?? '', 'build_seq'=>$manifest['build_seq'] ?? 0] : null;
@@ -789,7 +841,8 @@ function update_command_request(PDO $db, string $id, string $uuid, string $comma
     $command = db_one($db, 'SELECT * FROM device_update_commands WHERE command_id=:command AND device_id=:id AND uuid=:uuid', ['command'=>$commandId,'id'=>$id,'uuid'=>$uuid]);
     if (!$command || !in_array((string)$command['action'], ['check','install'], true)) fail(403, '更新命令与客户端不匹配');
     if ((string)$command['status'] === 'pending' && (int)$command['expires_at'] <= time()) { expire_update_commands($db, $id, $uuid); fail(410, '更新命令已过期'); }
-    if ($command['target_version'] !== null && !db_one($db, 'SELECT version FROM update_releases WHERE channel=:channel AND version=:version AND build_seq=:build', ['channel'=>$command['channel'],'version'=>$command['target_version'],'build'=>(int)$command['target_build_seq']])) fail(409, '更新命令锁定的版本不存在');
+    $client = update_command_client($db, $id, $uuid);
+    if ($command['target_version'] !== null && !release_for_target($db, $command['channel'], $client, $command['target_version'], (int)$command['target_build_seq'])) fail(409, '更新命令锁定的版本不存在');
     return $command;
 }
 function update_check_response(PDO $db, array $data, ?array $command = null, bool $rememberPackageIdentity = false): array
@@ -803,8 +856,8 @@ function update_check_response(PDO $db, array $data, ?array $command = null, boo
         $channel = (string)$command['channel'];
         $manifest = $command['target_version'] === null
             ? ((string)$command['action'] === 'check' ? public_update_manifest($db, $channel, null, null, $data) : null)
-            : decoded_payload((db_one($db, 'SELECT manifest FROM update_releases WHERE channel=:channel AND version=:version AND build_seq=:build', ['channel'=>$channel,'version'=>$command['target_version'],'build'=>(int)$command['target_build_seq']])['manifest'] ?? null));
-        if ($manifest) { $manifest['version'] ??= $command['target_version']; $manifest['build_seq'] ??= (int)$command['target_build_seq']; $manifest['channel'] ??= $channel; }
+            : release_for_target($db, $channel, $data, (string)$command['target_version'], (int)$command['target_build_seq']);
+        if ($manifest) { $manifest['version'] ??= $command['target_version']; $manifest['build_seq'] ??= (int)$command['target_build_seq']; $manifest['channel'] ??= $channel; $manifest = project_manifest_target($manifest, $data); }
     } else {
         $manifest = public_update_manifest($db, $channel, $policy['target_version'] ?? null, isset($policy['target_build_seq']) ? (int)$policy['target_build_seq'] : null, $data);
     }
@@ -964,6 +1017,11 @@ function validate_update_manifest(array $manifest): array
         foreach ($mirrors as $mirror) if (!is_string($mirror) || !str_starts_with($mirror, 'https://') || !filter_var($mirror, FILTER_VALIDATE_URL)) fail(422, '更新镜像地址无效');
         if (!isset($target['size']) || !is_numeric($target['size']) || (int)$target['size'] < 1) fail(422, '更新文件大小无效');
         if (!is_string($target['sha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/i', $target['sha256'])) fail(422, '更新 SHA-256 无效');
+        if (array_key_exists('version', $target) && version_tuple((string)$target['version']) === [0,0,0]) fail(422, 'target 版本无效');
+        if (array_key_exists('build_seq', $target) && (!is_numeric($target['build_seq']) || (int)$target['build_seq'] < 1)) fail(422, 'target build_seq 无效');
+        if ((int)($manifest['schema'] ?? 1) >= 2) {
+            foreach (['version','build_number','build_seq','source_commit','source_tag'] as $field) if (!array_key_exists($field, $target) || ($field === 'build_seq' ? !is_numeric($target[$field]) : trim((string)$target[$field]) === '')) fail(422, 'schema2 target 身份不完整');
+        }
         $signatureKeyId = text_field($target, 'signature_key_id', 128);
         if ($signatureKeyId === '') fail(422, '更新签名 key id 缺失');
         if (!isset($configuredKeyIds[$signatureKeyId])) fail(422, '更新签名 key id 未配置');
@@ -992,12 +1050,14 @@ function enqueue_release_checks(PDO $db, array $manifest, int $updatedBy): int
         $id=(string)$device['id']; $uuid=(string)$device['uuid']; $client=update_command_client($db,$id,$uuid);
         $policy=update_policy($db,$id,$uuid,'stable');
         if ((string)$policy['channel'] !== (string)$manifest['channel'] || !manifest_supports_client($manifest,$client,true)) continue;
+        $deviceManifest = project_manifest_target($manifest, $client);
+        $deviceRelease = target_release($deviceManifest, (string)($deviceManifest['target_key'] ?? ''));
         $current=['version'=>text_field($client,'version',32,'0.0.0'),'build_seq'=>(int)($client['build_seq']??0)];
-        if (compare_release($manifest,$current) <= 0) continue;
-        $duplicate=db_one($db,"SELECT command_id FROM device_update_commands WHERE device_id=:id AND uuid=:uuid AND action='check' AND target_version=:version AND target_build_seq=:build AND status IN ('pending','accepted','received','checking','started','deferred') LIMIT 1",['id'=>$id,'uuid'=>$uuid,'version'=>$manifest['version'],'build'=>(int)$manifest['build_seq']]);
+        if (compare_release($deviceRelease,$current) <= 0) continue;
+        $duplicate=db_one($db,"SELECT command_id FROM device_update_commands WHERE device_id=:id AND uuid=:uuid AND action='check' AND target_version=:version AND target_build_seq=:build AND status IN ('pending','accepted','received','checking','started','deferred') LIMIT 1",['id'=>$id,'uuid'=>$uuid,'version'=>$deviceRelease['version'],'build'=>(int)$deviceRelease['build_seq']]);
         if ($duplicate) continue;
         db_exec($db,"INSERT INTO device_update_commands(command_id,device_id,uuid,action,channel,target_version,target_build_seq,status,last_error,created_at,expires_at,updated_at,updated_by) VALUES(:command,:id,:uuid,'check',:channel,:version,:build,'pending',NULL,:created,:expires,:updated,:actor)",[
-            'command'=>bin2hex(random_bytes(16)),'id'=>$id,'uuid'=>$uuid,'channel'=>$manifest['channel'],'version'=>$manifest['version'],'build'=>(int)$manifest['build_seq'],'created'=>$now,'expires'=>$now+86400,'updated'=>$now,'actor'=>$updatedBy,
+            'command'=>bin2hex(random_bytes(16)),'id'=>$id,'uuid'=>$uuid,'channel'=>$manifest['channel'],'version'=>$deviceRelease['version'],'build'=>(int)$deviceRelease['build_seq'],'created'=>$now,'expires'=>$now+86400,'updated'=>$now,'actor'=>$updatedBy,
         ]);
         $created++;
     }

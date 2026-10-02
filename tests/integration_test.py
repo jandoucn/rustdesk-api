@@ -159,6 +159,68 @@ class HttpClient:
 
 
 class IntegrationTest(unittest.TestCase):
+    def test_target_release_metadata_is_selected_per_client(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:8]
+        db = sqlite3.connect(self.db)
+        latest_build = db.execute(
+            "SELECT COALESCE(MAX(build_seq), 0) FROM update_releases WHERE channel='stable'"
+        ).fetchone()[0]
+        db.close()
+        build = max(int(time.time()), int(latest_build) + 2)
+        version = f"1.5.{int(suffix, 16)}"
+        source_commit = "c" * 40
+        device_ids = (f"target-android-{suffix}", f"target-windows-{suffix}")
+        def cleanup():
+            db = sqlite3.connect(self.db)
+            db.execute("DELETE FROM device_update_commands WHERE device_id IN (?,?)", device_ids)
+            db.execute("DELETE FROM device_reports WHERE id IN (?,?)", device_ids)
+            db.execute("DELETE FROM device_deployments WHERE id IN (?,?)", device_ids)
+            db.execute("DELETE FROM update_releases WHERE version=? AND build_seq=? AND channel='stable'", (version, build + 1))
+            db.commit()
+            db.close()
+        self.addCleanup(cleanup)
+        manifest = {
+            "schema": 2, "product": "rustdesk-yan", "edition": "multi",
+            "targets": {
+                "android-arm64-apk-standard": {"version": version, "build_number": str(build), "build_seq": build, "source_commit": source_commit, "source_tag": "android-only", "primary": "https://download.yan.life/rustdesk/stable/a.apk", "mirrors": [], "size": 12, "sha256": "a" * 64, "signature": __import__("base64").b64encode(b"t" * 64).decode(), "signature_key_id": "yan-release-2026"},
+                "windows-x86_64-exe-standard": {"version": "1.5.0", "build_number": "20261001.7", "build_seq": 2026100107, "source_commit": "d" * 40, "source_tag": "desktop-old", "primary": "https://download.yan.life/rustdesk/stable/w.exe", "mirrors": [], "size": 12, "sha256": "b" * 64, "signature": __import__("base64").b64encode(b"t" * 64).decode(), "signature_key_id": "yan-release-2026"},
+            },
+        }
+        payload = {"version": version, "build_seq": build + 1, "channel": "stable", "manifest": manifest}
+        invalid_manifest = json.loads(json.dumps(manifest))
+        invalid_manifest["targets"]["android-arm64-apk-standard"].pop("build_number")
+        self.client.json(
+            "POST",
+            "/?s=/ops-x9/api/update/releases",
+            {**payload, "manifest": invalid_manifest},
+            {"X-CSRF-Token": csrf},
+            expected=(422,),
+        )
+        android = {"client_id": device_ids[0], "client_uuid": f"target-android-u-{suffix}", "product": "rustdesk-yan", "edition": "standard", "platform": "android", "arch": "arm64", "package_kind": "apk", "version": version, "build_seq": build - 1, "channel": "stable"}
+        windows = {"client_id": device_ids[1], "client_uuid": f"target-windows-u-{suffix}", "product": "rustdesk-yan", "edition": "standard", "platform": "windows", "arch": "x86_64", "package_kind": "exe", "version": "1.5.0", "build_seq": 2026100107, "channel": "stable"}
+        for client in (android, windows):
+            self.client.json("POST", "/?s=/api/heartbeat", {"id": client["client_id"], "uuid": client["client_uuid"], "conns": []})
+            self.client.json("POST", "/?s=/api/sysinfo", {"id": client["client_id"], "uuid": client["client_uuid"], **client})
+        self.client.json("POST", "/?s=/rd/update/v1/check", android)
+        self.client.json("POST", "/?s=/rd/update/v1/check", windows)
+        self.client.json("POST", "/?s=/ops-x9/api/update/releases", payload, {"X-CSRF-Token": csrf}, expected=(201,))
+        _, android_check, _ = self.client.json("POST", "/?s=/rd/update/v1/check", android)
+        _, windows_check, _ = self.client.json("POST", "/?s=/rd/update/v1/check", windows)
+        self.assertEqual(android_check["target_build_seq"], build)
+        self.assertTrue(android_check["update_available"])
+        self.assertEqual(android_check["manifest"]["version"], version)
+        self.assertEqual(android_check["manifest"]["build_seq"], build)
+        self.assertEqual(android_check["manifest"]["source_commit"], source_commit)
+        self.assertEqual(windows_check["target_build_seq"], 2026100107)
+        self.assertFalse(windows_check["update_available"])
+        db = sqlite3.connect(self.db)
+        queued = db.execute("SELECT device_id,target_build_seq FROM device_update_commands WHERE device_id IN (?,?)", (android["client_id"], windows["client_id"])).fetchall()
+        self.assertEqual(queued, [(android["client_id"], build)])
+        db.close()
+        endpoint = f"/?s=/ops-x9/api/update/commands/{windows['client_id']}"
+        _, command, _ = self.client.json("POST", endpoint, {"uuid": windows["client_uuid"], "action": "install", "target_version": "1.5.0", "target_build_seq": 2026100107}, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.assertEqual((command["target_version"], command["target_build_seq"]), ("1.5.0", 2026100107))
     def test_20_address_book_management_extensions(self):
         csrf = self.admin_csrf()
         _, options, _ = self.client.json("GET", "/?s=/ops-x9/api/address-book/assignment-options")
@@ -1018,6 +1080,7 @@ class IntegrationTest(unittest.TestCase):
         public_key = device_public_key()
         current_build = 2026100106
         target_build = 2026100201
+        catalog_build = 2026100202
         current = {
             "client_id": device_id,
             "client_uuid": device_uuid,
@@ -1032,6 +1095,11 @@ class IntegrationTest(unittest.TestCase):
             "install_mode": "installed",
         }
         target = {
+            "version": "1.5.0",
+            "build_number": "20261002.1",
+            "build_seq": target_build,
+            "source_commit": "a" * 40,
+            "source_tag": "desktop-target",
             "primary": "https://download.yan.life/rustdesk/stable/current.exe",
             "mirrors": [],
             "size": 12,
@@ -1040,10 +1108,13 @@ class IntegrationTest(unittest.TestCase):
             "signature_key_id": "yan-release-2026",
         }
         manifest = {
+            "schema": 2,
             "product": "rustdesk-yan",
             "edition": "multi",
-            "version": "1.5.0",
-            "build_seq": target_build,
+            "version": "1.5.1",
+            "build_number": "20261002.2",
+            "build_seq": catalog_build,
+            "catalog_revision": catalog_build,
             "channel": "stable",
             "targets": {
                 "windows-x86_64-exe-standard": target,
@@ -1054,7 +1125,7 @@ class IntegrationTest(unittest.TestCase):
         db = sqlite3.connect(self.db)
         db.execute("INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, public_key, 1, "{}", now))
         db.execute("INSERT INTO device_reports(id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, json.dumps(current), now, now, "{}"))
-        db.execute("INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,1)", ("1.5.0", target_build, "stable", json.dumps(manifest), now))
+        db.execute("INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,1)", ("1.5.1", catalog_build, "stable", json.dumps(manifest), now))
         db.commit()
         db.close()
 
@@ -1082,7 +1153,82 @@ class IntegrationTest(unittest.TestCase):
         self.assertTrue(response["update_available"])
         self.assertEqual((response["target_version"], response["target_build_seq"]), ("1.5.0", target_build))
         db = sqlite3.connect(self.db)
-        db.execute("DELETE FROM update_releases WHERE version='1.5.0' AND build_seq=? AND channel='stable'", (target_build,))
+        db.execute("DELETE FROM update_releases WHERE version='1.5.1' AND build_seq=? AND channel='stable'", (catalog_build,))
+        db.commit()
+        db.close()
+
+    def test_inherited_target_tie_prefers_latest_catalog_snapshot(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id, device_uuid = f"catalog-tie-{suffix}", f"catalog-tie-uuid-{suffix}"
+        target_version, target_build = "1.5.0", 2026100107
+        current = {
+            "client_id": device_id,
+            "client_uuid": device_uuid,
+            "product": "rustdesk-yan",
+            "edition": "standard",
+            "version": "1.5.0",
+            "build_seq": 2026100106,
+            "channel": "stable",
+            "platform": "windows",
+            "arch": "x86_64",
+            "package_kind": "exe",
+            "target_key": "windows-x86_64-exe-standard",
+        }
+        now = int(time.time())
+        rows = []
+        for catalog_build, tag in ((2026100203, "older-catalog"), (2026100204, "newer-catalog")):
+            target = {
+                "version": target_version,
+                "build_number": "20261001.7",
+                "build_seq": target_build,
+                "source_commit": "d" * 40,
+                "source_tag": tag,
+                "primary": f"https://download.yan.life/rustdesk/stable/{tag}/windows.exe",
+                "mirrors": [],
+                "size": 12,
+                "sha256": "b" * 64,
+                "signature": __import__("base64").b64encode(b"t" * 64).decode(),
+                "signature_key_id": "yan-release-2026",
+            }
+            manifest = {
+                "schema": 2,
+                "catalog_revision": catalog_build,
+                "product": "rustdesk-yan",
+                "edition": "multi",
+                "version": "1.5.1",
+                "build_number": str(catalog_build),
+                "build_seq": catalog_build,
+                "channel": "stable",
+                "targets": {"windows-x86_64-exe-standard": target},
+            }
+            rows.append(("1.5.1", catalog_build, "stable", json.dumps(manifest), now + catalog_build, 1))
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO device_deployments(id,uuid,pk,uid,payload,updated_at) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, device_public_key(), 1, "{}", now))
+        db.execute("INSERT INTO device_reports(id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload) VALUES(?,?,?,?,?,?)", (device_id, device_uuid, json.dumps(current), now, now, "{}"))
+        db.executemany("INSERT INTO update_releases(version,build_seq,channel,manifest,published_at,active) VALUES(?,?,?,?,?,?)", rows)
+        db.commit()
+        db.close()
+
+        _, response, _ = self.client.json("POST", "/?s=/rd/update/v1/check", current)
+        self.assertEqual(response["manifest"]["source_tag"], "newer-catalog")
+        self.assertIn("/newer-catalog/", response["manifest"]["targets"][current["target_key"]]["primary"])
+
+        endpoint = f"/?s=/ops-x9/api/update/commands/{device_id}"
+        _, command, _ = self.client.json("POST", endpoint, {"uuid": device_uuid, "action": "install", "target_version": target_version, "target_build_seq": target_build}, {"X-CSRF-Token": csrf}, expected=(201,))
+        headers = {
+            "Content-Type": "application/json",
+            "X-RustDesk-Update-Command-ID": command["command_id"],
+            **device_auth_headers("POST", "/rd/update/v1/check", device_id, device_uuid, current, command["command_id"]),
+        }
+        _, command_response, _ = self.client.json("POST", "/?s=/rd/update/v1/check", current, headers)
+        self.assertEqual(command_response["manifest"]["source_tag"], "newer-catalog")
+
+        db = sqlite3.connect(self.db)
+        db.execute("DELETE FROM device_update_commands WHERE device_id=? AND uuid=?", (device_id, device_uuid))
+        db.execute("DELETE FROM device_reports WHERE id=? AND uuid=?", (device_id, device_uuid))
+        db.execute("DELETE FROM device_deployments WHERE id=? AND uuid=?", (device_id, device_uuid))
+        db.execute("DELETE FROM update_releases WHERE build_seq IN (?,?)", (2026100203, 2026100204))
         db.commit()
         db.close()
 
