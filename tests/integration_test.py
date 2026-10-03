@@ -383,6 +383,7 @@ class IntegrationTest(unittest.TestCase):
         schema_version = db.execute("SELECT value FROM app_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row[1] for row in db.execute("PRAGMA table_info(device_reports)").fetchall()}
         policy_columns = {row[1] for row in db.execute("PRAGMA table_info(device_update_policies)").fetchall()}
+        event_indexes = {row[1] for row in db.execute("PRAGMA index_list(device_update_events)").fetchall()}
         db.close()
         self.assertEqual(row, ("legacy", legacy_password("legacy123"), 1700000001, 0))
         self.assertEqual(peer, (2, "legacy-id", "Old alias", "prod,blue", "legacy-hash"))
@@ -390,6 +391,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(schema_version, "14")
         self.assertTrue({"runtime_payload", "network_payload"}.issubset(columns))
         self.assertTrue({"enable_check_update", "allow_auto_update", "enable_scheduled_update", "scheduled_update_interval_hours"}.issubset(policy_columns))
+        self.assertIn("device_update_events_device", event_indexes)
         auth = {"Authorization": "Bearer " + ("a" * 64)}
         _, current, _ = self.client.json("POST", "/?s=/api/currentUser", {"id": "legacy-id", "uuid": "legacy-uuid"}, auth)
         self.assertEqual(current.get("name"), "legacy")
@@ -1409,6 +1411,14 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual((event_log["data"][0]["from_version"], event_log["data"][0]["to_version"]), ("1.5.0", "1.5.1"))
         self.assertEqual((event_log["data"][0]["from_build_seq"], event_log["data"][0]["to_build_seq"]), (current_build, target_build))
         self.assertEqual(self.client.json("GET", f"/?s=/ops-x9/api/update/events/{device_id}", expected=(422,))[0], 422)
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO device_update_events(command_id,device_id,uuid,from_version,to_version,from_build_seq,to_build_seq,status,source,error_code,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (command_id, device_id, device_uuid, "1.4.9", "1.5.0", current_build - 1, current_build, "completed", "remote_command", "historical_marker", now - 86405, now - 86404))
+        db.commit(); db.close()
+        _, today_events, _ = self.client.json("GET", f"/?s=/ops-x9/api/update/events/{device_id}&uuid={device_uuid}&from={now - 100}&to={now + 100}")
+        self.assertEqual([event["error_code"] for event in today_events["data"]], [None])
+        _, history_events, _ = self.client.json("GET", f"/?s=/ops-x9/api/update/events/{device_id}&uuid={device_uuid}&from={now - 86420}&to={now - 86390}")
+        self.assertEqual([event["error_code"] for event in history_events["data"]], ["historical_marker"])
+        self.assertEqual(self.client.json("GET", f"/?s=/ops-x9/api/update/events/{device_id}&uuid={device_uuid}&from={now}&to={now + 86401}", expected=(422,))[0], 422)
 
         _, heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_uuid, "conns": []})
         self.assertEqual(heartbeat, {"sysinfo": True})

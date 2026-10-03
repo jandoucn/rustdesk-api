@@ -790,6 +790,15 @@ function public_update_event(array $row): array
     $row['status_label'] = command_status_label((string)$row['status']);
     return $row;
 }
+function update_log_time_range(): ?array
+{
+    $from = $_GET['from'] ?? null; $to = $_GET['to'] ?? null;
+    if ($from === null && $to === null) return null;
+    if (!is_string($from) || !is_string($to) || !ctype_digit($from) || !ctype_digit($to)) fail(422, '日志日期范围无效');
+    $fromValue = (int)$from; $toValue = (int)$to;
+    if ($fromValue < 0 || $toValue <= $fromValue || $toValue - $fromValue > 86400) fail(422, '日志日期范围无效');
+    return [$fromValue, $toValue];
+}
 function expire_update_commands(PDO $db, string $id, string $uuid): void
 {
     db_exec($db, "UPDATE device_update_commands SET status='expired',updated_at=:now WHERE device_id=:id AND uuid=:uuid AND expires_at<=:now AND status='pending'", ['now'=>time(),'id'=>$id,'uuid'=>$uuid]);
@@ -979,6 +988,48 @@ function require_stream_internal_request(): void
 {
     $remote = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
     if (!in_array($remote, ['127.0.0.1', '::1'], true)) fail(404, 'Not Found');
+}
+function update_stream_revision(int $timestamp, int $suffix): int
+{
+    $timestamp = max(0, $timestamp); $suffix = max(0, $suffix) & 0xffffffff;
+    return ($timestamp << 32) | $suffix;
+}
+function update_admin_stream_auth(PDO $db): never
+{
+    require_stream_internal_request();
+    $requestedPath = rtrim(text_field($_GET, 'admin_path', 256), '/');
+    if ($requestedPath === '' || $requestedPath !== admin_path()) fail(404, 'Not Found');
+    $id = text_field($_GET, 'client_id', 128, text_field($_GET, 'id', 128));
+    $uuid = text_field($_GET, 'client_uuid', 256, text_field($_GET, 'uuid', 256));
+    if ($id === '' || $uuid === '') fail(422, '缺少客户端 ID 或 UUID');
+    admin_user($db);
+    [$id, $uuid] = resolve_update_identity($db, $id, $uuid);
+    reply(['client_id'=>$id, 'client_uuid'=>$uuid, 'authenticated'=>true]);
+}
+function update_admin_stream_snapshot(PDO $db): never
+{
+    require_stream_internal_request();
+    $data = json_body(); $requestedPath = rtrim(text_field($data, 'admin_path', 256), '/');
+    if ($requestedPath === '' || $requestedPath !== admin_path()) fail(404, 'Not Found');
+    admin_user($db);
+    $streams = $data['streams'] ?? null;
+    if (!is_array($streams) || !array_is_list($streams) || count($streams) > 5000) fail(422, 'streams 必须是最多 5000 项的数组');
+    $result = [];
+    foreach ($streams as $stream) {
+        if (!is_array($stream)) fail(422, 'stream 格式错误');
+        $connectionId = $stream['connection_id'] ?? ''; $id = $stream['client_id'] ?? ''; $uuid = $stream['client_uuid'] ?? ''; $afterRevision = $stream['after_revision'] ?? -1;
+        if (!is_string($connectionId) || !preg_match('/^[A-Za-z0-9._~-]{1,64}$/', $connectionId) || !is_string($id) || $id === '' || strlen($id) > 128 || !is_string($uuid) || $uuid === '' || strlen($uuid) > 256 || !is_int($afterRevision) || $afterRevision < -1) fail(422, 'stream 状态格式错误');
+        [$id, $uuid] = resolve_update_identity($db, $id, $uuid);
+        $event = db_one($db, 'SELECT id,started_at FROM device_update_events WHERE device_id=:id AND uuid=:uuid ORDER BY id DESC LIMIT 1', ['id'=>$id, 'uuid'=>$uuid]);
+        $command = db_one($db, 'SELECT command_id,updated_at FROM device_update_commands WHERE device_id=:id AND uuid=:uuid ORDER BY updated_at DESC,command_id DESC LIMIT 1', ['id'=>$id, 'uuid'=>$uuid]);
+        $revision = 0;
+        if ($event) $revision = max($revision, update_stream_revision((int)$event['started_at'], (int)$event['id']));
+        if ($command) $revision = max($revision, update_stream_revision((int)$command['updated_at'], (int)hexdec(substr((string)$command['command_id'], 0, 8))));
+        $events = [];
+        if ($revision > $afterRevision) $events[] = ['id'=>(string)$revision, 'type'=>'update-log', 'data'=>['client_id'=>$id, 'client_uuid'=>$uuid, 'revision'=>$revision]];
+        $result[$connectionId] = $events;
+    }
+    reply(['streams'=>$result]);
 }
 function update_policy_stream_auth(PDO $db): never
 {
@@ -1779,6 +1830,8 @@ try {
     }
     if ($path === '/_rustdesk-stream-internal/auth') { method('GET'); update_policy_stream_auth($db); }
     if ($path === '/_rustdesk-stream-internal/snapshot') { method('POST'); update_policy_stream_snapshot($db); }
+    if ($path === '/_rustdesk-stream-internal/admin-auth') { method('GET'); update_admin_stream_auth($db); }
+    if ($path === '/_rustdesk-stream-internal/admin-snapshot') { method('POST'); update_admin_stream_snapshot($db); }
     if ($path === '/rd/update/v1/policy/stream') { method('GET'); update_policy_stream($db); }
     if ($path === '/rd/update/v1/check') {
         method('POST'); $data=json_body(); $id=text_field($data,'client_id',128,text_field($data,'id',128)); $uuid=text_field($data,'client_uuid',256,text_field($data,'uuid',256));
@@ -1839,7 +1892,9 @@ try {
         if($_SERVER['REQUEST_METHOD']==='GET'){
             $uuid=text_field($_GET,'uuid',256); if($uuid==='')fail(422,'设备 UUID 不能为空');
             [$id,$uuid]=device_update_identity($db,$id,$uuid); expire_update_commands($db,$id,$uuid);
-            $rows=db_all($db,'SELECT * FROM device_update_commands WHERE device_id=:id AND uuid=:uuid ORDER BY created_at DESC,command_id DESC LIMIT 50',['id'=>$id,'uuid'=>$uuid]);
+            $range=update_log_time_range(); $args=['id'=>$id,'uuid'=>$uuid]; $where='device_id=:id AND uuid=:uuid';
+            if($range!==null){$where.=' AND created_at>=:from AND created_at<:to';$args['from']=$range[0];$args['to']=$range[1];}
+            $rows=db_all($db,"SELECT * FROM device_update_commands WHERE $where ORDER BY created_at DESC,command_id DESC LIMIT 50",$args);
             reply(['data'=>array_map('public_update_command',$rows)]);
         }
         method('POST'); csrf_check(); reply(create_update_command($db,$actor,$id,json_body()),201);
@@ -1888,7 +1943,9 @@ try {
         if($id==='')reply(['data'=>array_map('public_update_event',db_all($db,'SELECT e.*,c.action,c.target_version AS command_target_version,c.target_build_seq AS command_target_build_seq FROM device_update_events e LEFT JOIN device_update_commands c ON c.command_id=e.command_id ORDER BY e.started_at DESC,e.id DESC LIMIT 200'))]);
         $uuid=text_field($_GET,'uuid',256); if($uuid==='')fail(422,'设备 UUID 不能为空');
         [$id,$uuid]=device_update_identity($db,$id,$uuid);
-        $rows=db_all($db,'SELECT e.*,c.action,c.target_version AS command_target_version,c.target_build_seq AS command_target_build_seq FROM device_update_events e LEFT JOIN device_update_commands c ON c.command_id=e.command_id WHERE e.device_id=:id AND e.uuid=:uuid ORDER BY e.started_at DESC,e.id DESC LIMIT 200',['id'=>$id,'uuid'=>$uuid]);
+        $range=update_log_time_range(); $args=['id'=>$id,'uuid'=>$uuid]; $where='e.device_id=:id AND e.uuid=:uuid';
+        if($range!==null){$where.=' AND e.started_at<:to AND (e.finished_at IS NULL OR e.finished_at>=:from)';$args['from']=$range[0];$args['to']=$range[1];}
+        $rows=db_all($db,"SELECT e.*,c.action,c.target_version AS command_target_version,c.target_build_seq AS command_target_build_seq FROM device_update_events e LEFT JOIN device_update_commands c ON c.command_id=e.command_id WHERE $where ORDER BY e.started_at DESC,e.id DESC LIMIT 200",$args);
         reply(['data'=>array_map('public_update_event',$rows)]);
     }
     if ($adminApi && preg_match('#^/admin/api/users(?:/([1-9][0-9]*))?$#', $path, $match)) {

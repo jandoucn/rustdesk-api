@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -26,6 +27,9 @@ type streamState struct {
 	AfterRevision int64  `json:"after_revision"`
 	Authenticated bool   `json:"authenticated"`
 	Channel       string `json:"channel"`
+	Kind          string `json:"kind,omitempty"`
+	AdminPath     string `json:"admin_path,omitempty"`
+	Cookie        string `json:"-"`
 	events        chan []streamEvent
 }
 
@@ -43,32 +47,46 @@ type snapshotResponse struct {
 }
 
 type broker struct {
-	authURL      string
-	snapshotURL  string
-	client       *http.Client
-	pollInterval time.Duration
-	maxLifetime  time.Duration
-	nextID       atomic.Uint64
-	mu           sync.Mutex
-	streams      map[string]*streamState
-	pending      map[string]*streamState
-	identityUses map[string]int
-	maxStreams   int
-	maxIdentity  int
-	maxUnsigned  int
-	unsignedUses int
-	batchSize    int
+	authURL          string
+	snapshotURL      string
+	adminAuthURL     string
+	adminSnapshotURL string
+	client           *http.Client
+	pollInterval     time.Duration
+	maxLifetime      time.Duration
+	nextID           atomic.Uint64
+	mu               sync.Mutex
+	streams          map[string]*streamState
+	pending          map[string]*streamState
+	identityUses     map[string]int
+	maxStreams       int
+	maxIdentity      int
+	maxUnsigned      int
+	unsignedUses     int
+	batchSize        int
 }
 
 func newBroker(authURL, snapshotURL string, client *http.Client, pollInterval, maxLifetime time.Duration) *broker {
 	return &broker{
-		authURL: authURL, snapshotURL: snapshotURL, client: client, pollInterval: pollInterval, maxLifetime: maxLifetime,
+		authURL: authURL, snapshotURL: snapshotURL, adminAuthURL: strings.Replace(authURL, "/auth", "/admin-auth", 1), adminSnapshotURL: strings.Replace(snapshotURL, "/snapshot", "/admin-snapshot", 1), client: client, pollInterval: pollInterval, maxLifetime: maxLifetime,
 		streams: make(map[string]*streamState), pending: make(map[string]*streamState), identityUses: make(map[string]int),
 		maxStreams: 4096, maxIdentity: 4, maxUnsigned: 512, batchSize: 1000,
 	}
 }
 
 func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/api/update/events/stream") {
+		b.serveAdminLogStream(w, r)
+		return
+	}
+	if r.Method != http.MethodGet || r.URL.Path != "/rd/update/v1/policy/stream" {
+		http.NotFound(w, r)
+		return
+	}
+	b.servePolicyStream(w, r)
+}
+
+func (b *broker) servePolicyStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet || r.URL.Path != "/rd/update/v1/policy/stream" {
 		http.NotFound(w, r)
 		return
@@ -110,6 +128,63 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(status), status)
 			return
 		}
+	}
+	b.commit(connectionID, identity)
+	prepareStreamResponse(w)
+	flusher.Flush()
+	heartbeat := time.NewTicker(2 * time.Second)
+	defer heartbeat.Stop()
+	deadline := time.NewTimer(b.maxLifetime)
+	defer deadline.Stop()
+	for {
+		select {
+		case events := <-state.events:
+			writeStreamEvents(w, events)
+			flusher.Flush()
+			return
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": heartbeat\n\n")
+			flusher.Flush()
+		case <-deadline.C:
+			return
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (b *broker) serveAdminLogStream(w http.ResponseWriter, r *http.Request) {
+	adminPath := strings.TrimSuffix(r.URL.Path, "/api/update/events/stream")
+	if adminPath == "" || !strings.HasPrefix(adminPath, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	identity, status, err := requestedIdentity(r)
+	if err != nil {
+		http.Error(w, err.Error(), status)
+		return
+	}
+	afterRevision, err := resumeRevision(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming is unavailable", http.StatusInternalServerError)
+		return
+	}
+	connectionID := strconv.FormatUint(b.nextID.Add(1), 10)
+	state := &streamState{ConnectionID: connectionID, ClientID: identity.ClientID, ClientUUID: identity.ClientUUID, AfterRevision: afterRevision, Authenticated: true, Kind: "admin-log", AdminPath: adminPath, Cookie: r.Header.Get("Cookie"), events: make(chan []streamEvent, 1)}
+	if !b.reserve(state) {
+		writeOverloaded(w)
+		return
+	}
+	defer b.remove(connectionID)
+	identity, status, err = b.authorizeAdmin(r, state)
+	if err != nil {
+		http.Error(w, http.StatusText(status), status)
+		return
 	}
 	b.commit(connectionID, identity)
 	prepareStreamResponse(w)
@@ -202,6 +277,35 @@ func (b *broker) authorize(source *http.Request) (authorizedIdentity, int, error
 	identity.ClientUUID = strings.TrimSpace(identity.ClientUUID)
 	if identity.ClientID == "" || len(identity.ClientID) > 128 || identity.ClientUUID == "" || len(identity.ClientUUID) > 256 {
 		return authorizedIdentity{}, http.StatusBadGateway, errors.New("stream authorization returned invalid identity")
+	}
+	return identity, http.StatusOK, nil
+}
+
+func (b *broker) authorizeAdmin(source *http.Request, state *streamState) (authorizedIdentity, int, error) {
+	endpoint := b.adminAuthURL + "?admin_path=" + url.QueryEscape(state.AdminPath) + "&client_id=" + url.QueryEscape(state.ClientID) + "&client_uuid=" + url.QueryEscape(state.ClientUUID)
+	request, err := http.NewRequestWithContext(source.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		return authorizedIdentity{}, http.StatusBadGateway, err
+	}
+	if state.Cookie != "" {
+		request.Header.Set("Cookie", state.Cookie)
+	}
+	response, err := b.client.Do(request)
+	if err != nil {
+		return authorizedIdentity{}, http.StatusBadGateway, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return authorizedIdentity{}, response.StatusCode, errors.New("admin stream authorization rejected")
+	}
+	var identity authorizedIdentity
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&identity); err != nil {
+		return authorizedIdentity{}, http.StatusBadGateway, errors.New("admin stream authorization returned invalid JSON")
+	}
+	identity.ClientID = strings.TrimSpace(identity.ClientID)
+	identity.ClientUUID = strings.TrimSpace(identity.ClientUUID)
+	if identity.ClientID == "" || identity.ClientUUID == "" || !identity.Authenticated {
+		return authorizedIdentity{}, http.StatusBadGateway, errors.New("admin stream authorization returned invalid identity")
 	}
 	return identity, http.StatusOK, nil
 }
@@ -330,22 +434,40 @@ func (b *broker) run(ctx context.Context) {
 
 func (b *broker) poll(ctx context.Context) error {
 	b.mu.Lock()
-	streams := make([]streamState, 0, len(b.streams))
+	policyStreams := make([]streamState, 0, len(b.streams))
+	adminStreams := make([]streamState, 0)
 	for _, stream := range b.streams {
-		streams = append(streams, streamState{ConnectionID: stream.ConnectionID, ClientID: stream.ClientID, ClientUUID: stream.ClientUUID, AfterRevision: stream.AfterRevision, Authenticated: stream.Authenticated, Channel: stream.Channel})
+		copy := streamState{ConnectionID: stream.ConnectionID, ClientID: stream.ClientID, ClientUUID: stream.ClientUUID, AfterRevision: stream.AfterRevision, Authenticated: stream.Authenticated, Channel: stream.Channel, Kind: stream.Kind, AdminPath: stream.AdminPath, Cookie: stream.Cookie}
+		if stream.Kind == "admin-log" {
+			adminStreams = append(adminStreams, copy)
+		} else {
+			policyStreams = append(policyStreams, copy)
+		}
 	}
 	b.mu.Unlock()
-	for start := 0; start < len(streams); start += b.batchSize {
-		end := min(start+b.batchSize, len(streams))
-		if err := b.pollBatch(ctx, snapshotRequest{Streams: streams[start:end]}); err != nil {
+	for start := 0; start < len(policyStreams); start += b.batchSize {
+		end := min(start+b.batchSize, len(policyStreams))
+		if err := b.pollBatch(ctx, snapshotRequest{Streams: policyStreams[start:end]}, false); err != nil {
 			return err
+		}
+	}
+	adminGroups := make(map[string][]streamState)
+	for _, stream := range adminStreams {
+		adminGroups[stream.AdminPath+"\x00"+stream.Cookie] = append(adminGroups[stream.AdminPath+"\x00"+stream.Cookie], stream)
+	}
+	for _, group := range adminGroups {
+		for start := 0; start < len(group); start += b.batchSize {
+			end := min(start+b.batchSize, len(group))
+			if err := b.pollBatch(ctx, snapshotRequest{Streams: group[start:end]}, true); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func (b *broker) pollBatch(ctx context.Context, requestBody snapshotRequest) error {
-	snapshot, err := b.snapshot(ctx, requestBody)
+func (b *broker) pollBatch(ctx context.Context, requestBody snapshotRequest, admin bool) error {
+	snapshot, err := b.snapshot(ctx, requestBody, admin)
 	if err != nil {
 		return err
 	}
@@ -365,16 +487,34 @@ func (b *broker) pollBatch(ctx context.Context, requestBody snapshotRequest) err
 	return nil
 }
 
-func (b *broker) snapshot(ctx context.Context, requestBody snapshotRequest) (snapshotResponse, error) {
-	payload, err := json.Marshal(requestBody)
+func (b *broker) snapshot(ctx context.Context, requestBody snapshotRequest, admin bool) (snapshotResponse, error) {
+	endpoint := b.snapshotURL
+	var payload []byte
+	var err error
+	if admin {
+		endpoint = b.adminSnapshotURL
+		adminPath := ""
+		if len(requestBody.Streams) > 0 {
+			adminPath = requestBody.Streams[0].AdminPath
+		}
+		payload, err = json.Marshal(struct {
+			AdminPath string        `json:"admin_path"`
+			Streams   []streamState `json:"streams"`
+		}{AdminPath: adminPath, Streams: requestBody.Streams})
+	} else {
+		payload, err = json.Marshal(requestBody)
+	}
 	if err != nil {
 		return snapshotResponse{}, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, b.snapshotURL, bytes.NewReader(payload))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return snapshotResponse{}, err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if admin && len(requestBody.Streams) > 0 && requestBody.Streams[0].Cookie != "" {
+		request.Header.Set("Cookie", requestBody.Streams[0].Cookie)
+	}
 	response, err := b.client.Do(request)
 	if err != nil {
 		return snapshotResponse{}, err
@@ -404,6 +544,8 @@ func main() {
 	snapshotURL := envOr("RUSTDESK_STREAM_SNAPSHOT_URL", "http://127.0.0.1:8081/_rustdesk-stream-internal/snapshot")
 	listen := envOr("RUSTDESK_STREAM_LISTEN", "127.0.0.1:8787")
 	b := newBroker(authURL, snapshotURL, &http.Client{Timeout: 5 * time.Second}, 500*time.Millisecond, 15*time.Second)
+	b.adminAuthURL = envOr("RUSTDESK_ADMIN_STREAM_AUTH_URL", b.adminAuthURL)
+	b.adminSnapshotURL = envOr("RUSTDESK_ADMIN_STREAM_SNAPSHOT_URL", b.adminSnapshotURL)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	go b.run(ctx)

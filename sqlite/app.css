@@ -53,7 +53,11 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .update-log-window { margin-top: 14px; overflow: hidden; border: 1px solid #364244; border-radius: var(--radius); background: #151a1b; color: #d7e1df; }
 .update-log-head { display: flex; min-height: 34px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 12px; border-bottom: 1px solid #354042; background: #202728; color: #b8c5c3; font: 700 11px/1 "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .update-log-head span:last-child { color: #7fc7d5; font-weight: 500; }
-.update-command-log { width: 100%; height: 230px; padding: 10px 12px; overflow: auto; overscroll-behavior: contain; background: #151a1b; font: 12px/1.55 "SFMono-Regular", Consolas, "Liberation Mono", monospace; scrollbar-color: #536163 #151a1b; }
+.update-log-toolbar { display: flex; min-height: 40px; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid #354042; background: #1a2021; color: #9faeac; font-size: 12px; }
+.update-log-toolbar label { white-space: nowrap; }
+.update-log-toolbar input { min-width: 0; height: 28px; padding: 3px 7px; border: 1px solid #526162; border-radius: 4px; background: #101515; color: #d7e1df; color-scheme: dark; }
+.update-log-toolbar .button { min-height: 28px; padding: 0 9px; }
+.update-command-log { box-sizing: border-box; width: 100%; height: 230px; min-height: 230px; max-height: 230px; padding: 10px 12px; overflow-x: hidden; overflow-y: scroll; overscroll-behavior: contain; background: #151a1b; font: 12px/1.55 "SFMono-Regular", Consolas, "Liberation Mono", monospace; scrollbar-color: #536163 #151a1b; }
 .update-log-line { display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 8px; padding: 2px 0; }
 .update-log-time { color: #758583; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .update-log-message { min-width: 0; overflow-wrap: anywhere; color: #c9d3d1; }
@@ -374,7 +378,8 @@ dialog::backdrop { background: rgba(27, 35, 35, .48); backdrop-filter: blur(2px)
   .tag-management-row .row-actions { width: 100%; }
   .tag-editor { grid-template-columns: minmax(0, 1fr); }
   .details-grid { grid-template-columns: 1fr; }
-  .update-command-log { height: 210px; padding: 9px 10px; }
+  .update-log-toolbar { flex-wrap: wrap; }
+  .update-command-log { height: 210px; min-height: 210px; max-height: 210px; padding: 9px 10px; }
   .update-log-line { grid-template-columns: 68px minmax(0, 1fr); gap: 6px; font-size: 11px; }
   .color-field input[type="color"] { width: 64px; }
 }

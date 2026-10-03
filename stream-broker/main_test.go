@@ -108,6 +108,59 @@ func TestBrokerRejectsRequestsDeniedByInternalAuth(t *testing.T) {
 	}
 }
 
+func TestBrokerStreamsAdminUpdateLogWithSessionCookie(t *testing.T) {
+	auth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("admin_path") != "/ops-console" || r.Header.Get("Cookie") != "rd_admin=session" {
+			t.Fatalf("admin auth did not preserve path/cookie: path=%q cookie=%q", r.URL.Query().Get("admin_path"), r.Header.Get("Cookie"))
+		}
+		_ = json.NewEncoder(w).Encode(authorizedIdentity{ClientID: "client-admin", ClientUUID: "uuid-admin", Authenticated: true})
+	}))
+	defer auth.Close()
+	snapshot := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Cookie") != "rd_admin=session" {
+			t.Fatalf("admin snapshot did not preserve cookie: %q", r.Header.Get("Cookie"))
+		}
+		var request struct {
+			AdminPath string        `json:"admin_path"`
+			Streams   []streamState `json:"streams"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode admin snapshot: %v", err)
+		}
+		if request.AdminPath != "/ops-console" || len(request.Streams) != 1 || request.Streams[0].Kind != "admin-log" {
+			t.Fatalf("unexpected admin snapshot request: %+v", request)
+		}
+		_ = json.NewEncoder(w).Encode(snapshotResponse{Streams: map[string][]streamEvent{
+			request.Streams[0].ConnectionID: {{ID: "100", Type: "update-log", Data: json.RawMessage(`{"revision":100}`)}},
+		}})
+	}))
+	defer snapshot.Close()
+	b := newBroker(auth.URL, snapshot.URL, snapshot.Client(), 10*time.Millisecond, time.Second)
+	b.adminAuthURL, b.adminSnapshotURL = auth.URL, snapshot.URL
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.run(ctx)
+	server := httptest.NewServer(b)
+	defer server.Close()
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/ops-console/api/update/events/stream?client_id=client-admin&client_uuid=uuid-admin", nil)
+	if err != nil {
+		t.Fatalf("admin stream request setup: %v", err)
+	}
+	request.Header.Set("Cookie", "rd_admin=session")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatalf("admin stream request: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read admin stream: %v", err)
+	}
+	if response.StatusCode != http.StatusOK || !containsAll(string(body), "event: update-log", "id: 100", `{"revision":100}`) {
+		t.Fatalf("unexpected admin stream: status=%d body=%q", response.StatusCode, body)
+	}
+}
+
 func TestResumeRevisionAcceptsLegacyCommandEventID(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/rd/update/v1/policy/stream", nil)
 	request.Header.Set("Last-Event-ID", "0123456789abcdef0123456789abcdef")

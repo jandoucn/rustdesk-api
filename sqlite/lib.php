@@ -234,7 +234,8 @@ function ensure_schema(PDO $db): void {
     'CREATE TABLE IF NOT EXISTS device_update_keys (device_id TEXT NOT NULL,uuid TEXT NOT NULL,public_key TEXT NOT NULL,first_seen_at INTEGER NOT NULL,last_seen_at INTEGER NOT NULL,PRIMARY KEY(device_id,uuid))',
     'CREATE TABLE IF NOT EXISTS device_update_nonces (device_id TEXT NOT NULL,uuid TEXT NOT NULL,nonce TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(device_id,uuid,nonce))',
     'CREATE INDEX IF NOT EXISTS device_update_nonces_created ON device_update_nonces(created_at)',
-    'CREATE TABLE IF NOT EXISTS device_update_events (id INTEGER PRIMARY KEY AUTOINCREMENT,command_id TEXT,device_id TEXT NOT NULL,uuid TEXT NOT NULL,from_version TEXT,to_version TEXT,from_build_seq INTEGER,to_build_seq INTEGER,status TEXT NOT NULL,source TEXT,error_code TEXT,started_at INTEGER NOT NULL,finished_at INTEGER)'];
+    'CREATE TABLE IF NOT EXISTS device_update_events (id INTEGER PRIMARY KEY AUTOINCREMENT,command_id TEXT,device_id TEXT NOT NULL,uuid TEXT NOT NULL,from_version TEXT,to_version TEXT,from_build_seq INTEGER,to_build_seq INTEGER,status TEXT NOT NULL,source TEXT,error_code TEXT,started_at INTEGER NOT NULL,finished_at INTEGER)',
+    'CREATE INDEX IF NOT EXISTS device_update_events_device ON device_update_events(device_id,uuid,started_at)'];
     foreach($sql as $s)$db->exec($s);
     foreach(['rustdesk_users'=>['is_admin'=>0,'enabled'=>1,'address_book_scope'=>"'self'",'auth_version'=>0],'rustdesk_token'=>['auth_version'=>0],'device_reports'=>['last_heartbeat'=>0]] as $t=>$fs){$existing=table_columns($db,$t);foreach($fs as $f=>$d)if(!in_array($f,$existing,true))$db->exec("ALTER TABLE `$t` ADD COLUMN `$f` ".($f==='address_book_scope'?'TEXT NOT NULL DEFAULT "self"':'INTEGER NOT NULL DEFAULT '.$d));}
     $db->exec("UPDATE rustdesk_users SET address_book_scope='all' WHERE is_admin=1 AND (address_book_scope IS NULL OR address_book_scope='self')");
@@ -269,5 +270,10 @@ function backup_database(PDO $db,string $target): void {
     if(database_driver()!=='sqlite')throw new RuntimeException('Online backup is only available for SQLite');$target=database_path($target);if(file_exists($target))throw new RuntimeException('Backup destination exists');$db->exec('VACUUM INTO '.$db->quote($target));$copy=new PDO('sqlite:'.$target);configure_pdo($copy);if($copy->query('PRAGMA integrity_check')->fetchColumn()!=='ok')throw new RuntimeException('Backup integrity check failed');@chmod($target,0600);
 }
 function migrate_database(PDO $db,string $dir): void {
-    configure_pdo($db);$meta=db_one($db,"SELECT name FROM sqlite_master WHERE type='table' AND name='app_meta'");if($meta&&db_one($db,"SELECT value FROM app_meta WHERE `key`='schema_version' AND value='14'"))return;$legacy=db_one($db,"SELECT name FROM sqlite_master WHERE type='table' AND name='rustdesk_users'");if($legacy)backup_database($db,$dir.'/rustdesk.before-v14.'.bin2hex(random_bytes(6)).'.db');txn($db,function(PDO $db){ensure_schema($db);migrate_device_deployment_identity($db);db_insert_ignore($db,'app_meta',['key'=>'migrated_at','value'=>(string)time()]);db_upsert($db,'app_meta',['key'=>'schema_version','value'=>'14'],['key'],['value']);});
+    configure_pdo($db);$meta=db_one($db,"SELECT name FROM sqlite_master WHERE type='table' AND name='app_meta'");if($meta&&db_one($db,"SELECT value FROM app_meta WHERE `key`='schema_version' AND value='14'")){ensure_sqlite_update_indexes($db);return;}$legacy=db_one($db,"SELECT name FROM sqlite_master WHERE type='table' AND name='rustdesk_users'");if($legacy)backup_database($db,$dir.'/rustdesk.before-v14.'.bin2hex(random_bytes(6)).'.db');txn($db,function(PDO $db){ensure_schema($db);migrate_device_deployment_identity($db);db_insert_ignore($db,'app_meta',['key'=>'migrated_at','value'=>(string)time()]);db_upsert($db,'app_meta',['key'=>'schema_version','value'=>'14'],['key'],['value']);});
+}
+
+function ensure_sqlite_update_indexes(PDO $db): void {
+    if (database_driver() !== 'sqlite') return;
+    $db->exec('CREATE INDEX IF NOT EXISTS device_update_events_device ON device_update_events(device_id,uuid,started_at)');
 }

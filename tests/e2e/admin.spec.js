@@ -64,7 +64,7 @@ function persistNetworkPayload(id, uuid, network) {
   return JSON.parse(output.trim());
 }
 
-function recordLatestUpdateLifecycle(id, uuid, action, events) {
+function recordLatestUpdateLifecycle(id, uuid, action, events, baseTimestamp = null) {
   const container = process.env.RUSTDESK_API_CONTAINER;
   if (!container) throw new Error('RUSTDESK_API_CONTAINER is required for update lifecycle E2E');
   const encoded = Buffer.from(JSON.stringify(events), 'utf8').toString('base64');
@@ -74,14 +74,14 @@ function recordLatestUpdateLifecycle(id, uuid, action, events) {
     "$row=db_one($db,'SELECT command_id FROM device_update_commands WHERE device_id=:id AND uuid=:uuid AND action=:action ORDER BY created_at DESC,command_id DESC LIMIT 1',['id'=>getenv('TEST_DEVICE_ID'),'uuid'=>getenv('TEST_DEVICE_UUID'),'action'=>getenv('TEST_COMMAND_ACTION')]);",
     "if(!$row)throw new RuntimeException('missing command');",
     "$events=json_decode((string)base64_decode((string)getenv('TEST_UPDATE_EVENTS'),true),true,32,JSON_THROW_ON_ERROR);",
-    '$now=time();',
+    '$now=(int)(getenv("TEST_EVENT_BASE")!==""?getenv("TEST_EVENT_BASE"):time());',
     "foreach($events as $offset=>$event){db_exec($db,'INSERT OR REPLACE INTO device_update_events(command_id,device_id,uuid,from_version,to_version,from_build_seq,to_build_seq,status,source,error_code,started_at,finished_at) VALUES(:command,:id,:uuid,:from_version,:to_version,:from_build,:to_build,:status,:source,:error,:started,:finished)',['command'=>$row['command_id'],'id'=>getenv('TEST_DEVICE_ID'),'uuid'=>getenv('TEST_DEVICE_UUID'),'from_version'=>$event['from_version']??null,'to_version'=>$event['to_version']??null,'from_build'=>$event['from_build_seq']??null,'to_build'=>$event['to_build_seq']??null,'status'=>$event['status'],'source'=>'remote_command','error'=>$event['error_code']??null,'started'=>$now+((int)$offset),'finished'=>isset($event['finished'])?$now+((int)$offset):null]);}",
     "$last=end($events);db_exec($db,'UPDATE device_update_commands SET status=:status,last_error=:error,updated_at=:updated WHERE command_id=:command',['status'=>$last['status'],'error'=>$last['error_code']??null,'updated'=>$now+count($events),'command'=>$row['command_id']]);",
     "echo $row['command_id'];",
   ].join('');
   return execFileSync('docker', [
     'exec', '-e', `TEST_DEVICE_ID=${id}`, '-e', `TEST_DEVICE_UUID=${uuid}`,
-    '-e', `TEST_COMMAND_ACTION=${action}`, '-e', `TEST_UPDATE_EVENTS=${encoded}`,
+    '-e', `TEST_COMMAND_ACTION=${action}`, '-e', `TEST_UPDATE_EVENTS=${encoded}`, '-e', `TEST_EVENT_BASE=${baseTimestamp || ''}`,
     container, 'php', '-r', php,
   ], { encoding: 'utf8' }).trim();
 }
@@ -521,7 +521,7 @@ test('selected clients can be removed in bulk after confirmation', async ({ page
 test('selected clients receive batch check commands and scheduled-update policy', async ({ page, request }) => {
   const suffix = Date.now().toString(36);
   const ids = [`batch-update-ui-${suffix}-1`, `batch-update-ui-${suffix}-2`];
-  await Promise.all(ids.map(id => reportClient(request, id)));
+  for (const id of ids) await reportClient(request, id);
   await loginAdmin(page);
   await page.goto(`${adminPath}/devices`);
   await page.locator('#q').fill(`batch-update-ui-${suffix}`);
@@ -728,6 +728,19 @@ test('client details streams update logs and refreshes reported build identity',
   await expect(dialog.locator('#update-command-log')).toContainText(`构建 ${buildSeq - 1} -> ${buildSeq}`);
   await expect(dialog.locator('#update-command-log')).toContainText('下载完成');
   await expect(dialog.locator('#update-command-log')).toContainText('正在安装');
+  await expect(dialog.locator('#update-log-zone')).toHaveText(/本地时区：.+/);
+
+  const historicalDate = new Date(Date.now() - 86400000);
+  const historicalDateValue = [historicalDate.getFullYear(), String(historicalDate.getMonth() + 1).padStart(2, '0'), String(historicalDate.getDate()).padStart(2, '0')].join('-');
+  recordLatestUpdateLifecycle(deviceId, uuid, 'install', [
+    { status: 'completed', from_version: '9.8.9', from_build_seq: buildSeq - 2, to_version: '9.9.9', to_build_seq: buildSeq - 1, error_code: 'historical_marker', finished: true },
+  ], Math.floor(historicalDate.getTime() / 1000) + 3600);
+  await expect(dialog.locator('#update-command-log')).not.toContainText('historical_marker');
+  await dialog.locator('#update-log-date').fill(historicalDateValue);
+  await expect(dialog.locator('#update-command-log')).toContainText('historical_marker', { timeout: 5000 });
+  expect(await dialog.locator('#update-command-log').evaluate(node => node.clientHeight === 210 || node.clientHeight === 230)).toBeTruthy();
+  await dialog.locator('#update-log-today').click();
+  await expect(dialog.locator('#update-command-log')).not.toContainText('historical_marker', { timeout: 5000 });
 
   await expect((await request.post('/api/sysinfo', { data: {
     id: deviceId, uuid, hostname: `${deviceId}-host`, product: 'rustdesk-yan', edition: 'standard',
