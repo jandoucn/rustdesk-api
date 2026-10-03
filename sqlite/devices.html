@@ -131,6 +131,10 @@
             <button id="details-install-update" class="button primary" type="button">立即安装更新</button>
           </div>
           <div id="update-command-history" class="details-grid"><p class="muted">暂无一次性更新命令</p></div>
+          <div class="update-log-window" aria-labelledby="update-log-title">
+            <div class="update-log-head"><span id="update-log-title">更新执行日志</span><span id="update-log-state">等待命令</span></div>
+            <div id="update-command-log" class="update-command-log" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0"><p class="update-log-empty">尚无更新日志</p></div>
+          </div>
         </section>
       </div>
       <div class="dialog-actions"><button id="details-close" class="button" type="button">关闭</button></div>
@@ -152,7 +156,7 @@
       });
     }
     const labels = { online: '在线', recent: '最近在线', offline: '离线', unreported: '未上报' };
-    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, pendingLoad: null, aliasDevice: null, policyDevice: null, timer: null, commandTimer: null, lastUpdated: 0, selected: new Map(), assignmentUsers: [], assignmentDevices: [] };
+    const state = { csrf: '', q: '', devices: [], total: 0, loading: false, pendingLoad: null, aliasDevice: null, policyDevice: null, timer: null, commandTimer: null, commandRequestToken: 0, lastUpdated: 0, selected: new Map(), assignmentUsers: [], assignmentDevices: [] };
 
     async function api(url, options = {}) {
       const headers = new Headers(options.headers || {});
@@ -293,23 +297,89 @@
       const response = await api('__ADMIN_PATH__/api/update/policies/batch', { method: 'PATCH', body: JSON.stringify({ enable_scheduled_update: $('batch-scheduled-enabled').checked, scheduled_update_interval_hours: hours, ...(all ? { all: true } : { devices }) }) });
       setFeedback('定时检查策略已更新：' + response.updated + ' 台客户端', 'success');
     }
+    function updateLogTime(value) {
+      if (!value) return '--:--:--';
+      return new Date(Number(value) * 1000).toLocaleTimeString([], { hour12: false });
+    }
+    function releaseTransition(event) {
+      const fromVersion = event.from_version || '未知版本'; const toVersion = event.to_version || event.command_target_version || '未知版本';
+      const fromBuild = event.from_build_seq == null ? '未知' : event.from_build_seq; const toBuild = event.to_build_seq == null ? (event.command_target_build_seq == null ? '未知' : event.command_target_build_seq) : event.to_build_seq;
+      const prefix = event.action === 'check' ? '检查前' : '更新';
+      return prefix + ' ' + fromVersion + ' -> ' + toVersion + ' | 构建 ' + fromBuild + ' -> ' + toBuild;
+    }
+    function renderUpdateLog(commands, events) {
+      const log = $('update-command-log'); const wasNearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
+      const entries = [];
+      commands.forEach(command => entries.push({ at: Number(command.created_at || 0), order: 0, tone: 'command', text: '> ' + (command.action === 'install' ? '立即安装更新' : '立即检查更新') + ' 已下发' + (command.target_version ? ' | 目标 ' + command.target_version + ' | 构建 ' + detailValue(command.target_build_seq) : '') }));
+      events.forEach(event => {
+        const actionLabel = event.action === 'install' ? 'INSTALL' : (event.action === 'check' ? 'CHECK' : 'EVENT');
+        entries.push({ at: Number(event.started_at || event.finished_at || 0), order: Number(event.id || 0), tone: event.status === 'failed' || event.status === 'rollback_failed' ? 'error' : (['installed','completed','no_update'].includes(event.status) ? 'success' : 'progress'), text: '[' + actionLabel + '] ' + (event.status_label || event.status) + ' | ' + releaseTransition(event) + (event.error_code ? ' | 错误 ' + event.error_code : '') });
+      });
+      entries.sort((left, right) => left.at - right.at || left.order - right.order);
+      log.replaceChildren();
+      if (!entries.length) { const empty = document.createElement('p'); empty.className = 'update-log-empty'; empty.textContent = '尚无更新日志'; log.append(empty); $('update-log-state').textContent = '等待命令'; return; }
+      entries.forEach(entry => { const line = document.createElement('div'); line.className = 'update-log-line ' + entry.tone; line.append(textLine('update-log-time', '[' + updateLogTime(entry.at) + ']'), textLine('update-log-message', entry.text)); log.append(line); });
+      const active = commands.find(command => !['installed','completed','no_update','failed','expired','rolled_back','rollback_failed'].includes(command.status));
+      $('update-log-state').textContent = active ? (active.status_label || active.status) : '已同步';
+      if (wasNearBottom || !log.dataset.rendered) log.scrollTop = log.scrollHeight;
+      log.dataset.rendered = 'true';
+    }
+    function renderDetailsBody(device) {
+      $('details-device').textContent = [device.alias || device.hostname || device.id, device.id].filter(Boolean).join(' · ');
+      const privateIps = Array.isArray(device.private_ips) ? device.private_ips.join('、') : device.private_ips;
+      const groups = [
+        ['发行身份', [['客户端身份', device.client_id], ['客户端 UUID', device.client_uuid || device.uuid], ['产品', device.product], ['版本类型', device.edition], ['版本', device.version || device.version_text], ['构建号', device.build_number], ['构建序号', device.build_seq], ['渠道', device.channel], ['平台', platformLabel(device.platform)], ['架构', device.arch || device.client_arch], ['发行形态', distributionLabel(device.distribution)], ['安装模式', installModeLabel(device.install_mode)], ['源码提交', device.source_commit]]],
+        ['机器', [['主机名', device.hostname], ['系统用户', device.username], ['设备 ID', device.id], ['UUID', device.uuid], ['操作系统', device.os], ['系统版本', device.os_version], ['CPU', device.cpu], ['内存', device.memory]]],
+        ['网络', [['公网 IP', device.public_ip], ['地区', geoLabel(device.geo)], ['时区', device.geo?.timezone], ['内网 IP', privateIps]]],
+        ['运行与升级', [['当前状态', labels[presence(device)]], ['最后心跳', device.last_heartbeat ? new Date(Number(device.last_heartbeat) * 1000).toLocaleString() : ''], ['最近活动', device.last_seen ? new Date(Number(device.last_seen) * 1000).toLocaleString() : ''], ['当前连接数', Array.isArray(device.heartbeat_payload?.conns) ? device.heartbeat_payload.conns.length : ''], ['通讯录用户', Array.isArray(device.address_book_user_ids) && device.address_book_user_ids.length ? device.address_book_user_ids.join(', ') : '无'], ['启动时检查更新', device.enable_check_update === null || device.enable_check_update === undefined ? null : (device.enable_check_update ? '已开启' : '已关闭')], ['自动更新', device.allow_auto_update === null || device.allow_auto_update === undefined ? null : (device.allow_auto_update ? '已开启' : '已关闭')], ['定时检查更新', device.enable_scheduled_update === null || device.enable_scheduled_update === undefined ? null : (device.enable_scheduled_update ? '已开启' : '已关闭')], ['定时检查间隔', device.scheduled_update_interval_hours ? device.scheduled_update_interval_hours + ' 小时' : null], ['最近检查', device.last_update_check], ['检查状态', device.last_update_status], ['错误信息', device.last_update_error], ['更新来源', device.last_update_source]]],
+      ];
+      const body = $('details-body'); body.replaceChildren();
+      groups.forEach(([title, entries]) => {
+        const section = document.createElement('section'); section.className = 'details-section';
+        const heading = document.createElement('h4'); heading.textContent = title; section.append(heading);
+        entries.forEach(([label, value]) => { const line = document.createElement('div'); line.className = 'details-line'; const shown = detailValue(value); const valueNode = textLine('details-value', shown); if (shown === '未上报' || shown === '未声明') valueNode.classList.add('is-empty'); line.append(textLine('details-label', label), valueNode); section.append(line); });
+        body.append(section);
+      });
+    }
+    async function refreshDetailsDevice(device, requestToken) {
+      const response = await api('__ADMIN_PATH__/api/devices/' + encodeURIComponent(device.id) + '?uuid=' + encodeURIComponent(device.uuid));
+      const current = (Array.isArray(response.data) ? response.data : []).find(item => deviceKey(item) === deviceKey(device));
+      if (requestToken !== state.commandRequestToken) return;
+      if (!current || !state.policyDevice || deviceKey(state.policyDevice) !== deviceKey(device)) return;
+      const index = state.devices.findIndex(item => deviceKey(item) === deviceKey(device)); if (index >= 0) state.devices[index] = current;
+      state.policyDevice = current; renderDetailsBody(current);
+    }
     async function loadUpdateCommands(device, options = {}) {
+      const requestToken = ++state.commandRequestToken;
       const history = $('update-command-history');
       if (!options.quiet) history.replaceChildren(textLine('muted', '正在读取命令状态...'));
       try {
-        const response = await api('__ADMIN_PATH__/api/update/commands/' + encodeURIComponent(device.id) + '?uuid=' + encodeURIComponent(device.uuid));
-        if (!state.policyDevice || deviceKey(state.policyDevice) !== deviceKey(device) || !$('details-dialog').open) return;
+        const query = '?uuid=' + encodeURIComponent(device.uuid);
+        const [response, eventResponse] = await Promise.all([
+          api('__ADMIN_PATH__/api/update/commands/' + encodeURIComponent(device.id) + query),
+          api('__ADMIN_PATH__/api/update/events/' + encodeURIComponent(device.id) + query),
+        ]);
+        if (requestToken !== state.commandRequestToken || !state.policyDevice || deviceKey(state.policyDevice) !== deviceKey(device) || !$('details-dialog').open) return;
         const commands = Array.isArray(response.data) ? response.data : [];
+        const events = Array.isArray(eventResponse.data) ? eventResponse.data : [];
         history.replaceChildren();
-        if (!commands.length) { history.append(textLine('muted', '暂无一次性更新命令')); return; }
-        commands.slice(0, 5).forEach(command => {
-          const line = document.createElement('div'); line.className = 'details-line';
-          const action = command.action === 'install' ? '立即更新' : '立即检查';
-          const when = command.created_at ? new Date(Number(command.created_at) * 1000).toLocaleString() : '';
-          line.append(textLine('details-label', action), textLine('details-value', [command.status_label || command.status, when].filter(Boolean).join(' · ')));
-          history.append(line);
-        });
-      } catch (error) { if (!options.quiet) history.replaceChildren(textLine('form-error', error.message)); }
+        if (!commands.length) history.append(textLine('muted', '暂无一次性更新命令'));
+        else commands.slice(0, 5).forEach(command => {
+            const line = document.createElement('div'); line.className = 'details-line';
+            const action = command.action === 'install' ? '立即更新' : '立即检查';
+            const when = command.created_at ? new Date(Number(command.created_at) * 1000).toLocaleString() : '';
+            line.append(textLine('details-label', action), textLine('details-value', [command.status_label || command.status, when].filter(Boolean).join(' · ')));
+            history.append(line);
+          });
+        renderUpdateLog(commands, events);
+        await refreshDetailsDevice(device, requestToken);
+      } catch (error) {
+        if (!options.quiet && requestToken === state.commandRequestToken && state.policyDevice && deviceKey(state.policyDevice) === deviceKey(device) && $('details-dialog').open) {
+          history.replaceChildren(textLine('form-error', '读取失败：' + error.message));
+          $('update-command-log').replaceChildren(textLine('update-log-error', '读取失败：' + error.message));
+          $('update-log-state').textContent = '读取失败';
+        }
+      }
     }
     function startCommandRefresh() {
       if (state.commandTimer) clearInterval(state.commandTimer);
@@ -320,6 +390,7 @@
     function stopCommandRefresh() {
       if (state.commandTimer) clearInterval(state.commandTimer);
       state.commandTimer = null;
+      state.commandRequestToken += 1;
     }
     async function sendUpdateCommand(device, action, button) {
       const label = action === 'install' ? '安装' : '检查';
@@ -333,28 +404,10 @@
     }
     function openDetails(device) {
       $('details-title').textContent = '客户端详情';
-      $('details-device').textContent = [device.alias || device.hostname || device.id, device.id].filter(Boolean).join(' · ');
-      const privateIps = Array.isArray(device.private_ips) ? device.private_ips.join('、') : device.private_ips;
-      const groups = [
-        ['发行身份', [['客户端身份', device.client_id], ['客户端 UUID', device.client_uuid || device.uuid], ['产品', device.product], ['版本类型', device.edition], ['版本', device.version || device.version_text], ['构建号', device.build_number], ['构建序号', device.build_seq], ['渠道', device.channel], ['平台', platformLabel(device.platform)], ['架构', device.arch || device.client_arch], ['发行形态', distributionLabel(device.distribution)], ['安装模式', installModeLabel(device.install_mode)], ['源码提交', device.source_commit]]],
-        ['机器', [['主机名', device.hostname], ['系统用户', device.username], ['设备 ID', device.id], ['UUID', device.uuid], ['操作系统', device.os], ['系统版本', device.os_version], ['CPU', device.cpu], ['内存', device.memory]]],
-        ['网络', [['公网 IP', device.public_ip], ['地区', geoLabel(device.geo)], ['时区', device.geo?.timezone], ['内网 IP', privateIps]]],
-        ['运行与升级', [['当前状态', labels[presence(device)]], ['最后心跳', device.last_heartbeat ? new Date(Number(device.last_heartbeat) * 1000).toLocaleString() : ''], ['最近活动', device.last_seen ? new Date(Number(device.last_seen) * 1000).toLocaleString() : ''], ['当前连接数', Array.isArray(device.heartbeat_payload?.conns) ? device.heartbeat_payload.conns.length : ''], ['通讯录用户', Array.isArray(device.address_book_user_ids) && device.address_book_user_ids.length ? device.address_book_user_ids.join(', ') : '无'], ['启动时检查更新', device.enable_check_update === null || device.enable_check_update === undefined ? null : (device.enable_check_update ? '已开启' : '已关闭')], ['自动更新', device.allow_auto_update === null || device.allow_auto_update === undefined ? null : (device.allow_auto_update ? '已开启' : '已关闭')], ['定时检查更新', device.enable_scheduled_update === null || device.enable_scheduled_update === undefined ? null : (device.enable_scheduled_update ? '已开启' : '已关闭')], ['定时检查间隔', device.scheduled_update_interval_hours ? device.scheduled_update_interval_hours + ' 小时' : null], ['最近检查', device.last_update_check], ['检查状态', device.last_update_status], ['错误信息', device.last_update_error], ['更新来源', device.last_update_source]]],
-      ];
-      const body = $('details-body'); body.replaceChildren();
-      groups.forEach(([title, entries]) => {
-        const section = document.createElement('section'); section.className = 'details-section';
-        const heading = document.createElement('h4'); heading.textContent = title; section.append(heading);
-        entries.forEach(([label, value]) => {
-          const line = document.createElement('div'); line.className = 'details-line';
-          const shown = detailValue(value); const valueNode = textLine('details-value', shown);
-          if (shown === '未上报' || shown === '未声明') valueNode.classList.add('is-empty');
-          line.append(textLine('details-label', label), valueNode); section.append(line);
-        });
-        body.append(section);
-      });
-      loadUpdatePolicy(device); loadUpdateCommands(device);
+      state.policyDevice = device; renderDetailsBody(device);
+      $('update-command-log').replaceChildren(textLine('update-log-empty', '正在连接更新日志...')); $('update-log-state').textContent = '连接中';
       $('details-dialog').showModal();
+      loadUpdatePolicy(device); loadUpdateCommands(device);
       startCommandRefresh();
     }
 

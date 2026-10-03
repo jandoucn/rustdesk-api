@@ -1370,6 +1370,62 @@ class IntegrationTest(unittest.TestCase):
         db.commit()
         db.close()
 
+    def test_update_event_log_is_scoped_and_install_requests_fresh_sysinfo(self):
+        self.admin_csrf()
+        suffix = uuid.uuid4().hex[:10]
+        device_id = f"update-log-{suffix}"
+        device_uuid = f"update-log-uuid-{suffix}"
+        other_uuid = f"update-log-other-{suffix}"
+        current_build = 2026100106
+        target_build = 2026100201
+        now = int(time.time())
+        for current_uuid in (device_uuid, other_uuid):
+            self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": current_uuid, "conns": []})
+            self.client.json("POST", "/?s=/api/sysinfo", {
+                "id": device_id, "uuid": current_uuid, "hostname": device_id,
+                "product": "rustdesk-yan", "edition": "standard", "platform": "windows",
+                "arch": "x86_64", "version": "1.5.0", "build_number": "20261001.6",
+                "build_seq": current_build, "channel": "stable",
+            })
+
+        command_id = "a" + uuid.uuid4().hex[:31]
+        other_command_id = "b" + uuid.uuid4().hex[:31]
+        db = sqlite3.connect(self.db)
+        command_values = (device_id, device_uuid, "install", "stable", "1.5.1", target_build, "installed", None, now - 5, now + 3600, now, 1)
+        other_values = (device_id, other_uuid, "check", "stable", "1.5.1", target_build, "completed", None, now - 4, now + 3600, now, 1)
+        db.execute("INSERT INTO device_update_commands(command_id,device_id,uuid,action,channel,target_version,target_build_seq,status,last_error,created_at,expires_at,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (command_id, *command_values))
+        db.execute("INSERT INTO device_update_commands(command_id,device_id,uuid,action,channel,target_version,target_build_seq,status,last_error,created_at,expires_at,updated_at,updated_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (other_command_id, *other_values))
+        db.execute("INSERT INTO device_update_events(command_id,device_id,uuid,from_version,to_version,from_build_seq,to_build_seq,status,source,error_code,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (command_id, device_id, device_uuid, "1.5.0", "1.5.1", current_build, target_build, "installed", "remote_command", None, now - 3, now))
+        db.execute("INSERT INTO device_update_events(command_id,device_id,uuid,from_version,to_version,from_build_seq,to_build_seq,status,source,error_code,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (other_command_id, device_id, other_uuid, "1.5.0", "1.5.1", current_build, target_build, "completed", "remote_command", None, now - 2, now))
+        db.commit()
+        db.close()
+
+        events_path = f"/?s=/ops-x9/api/update/events/{device_id}&uuid={device_uuid}"
+        _, event_log, _ = self.client.json("GET", events_path)
+        self.assertEqual(len(event_log["data"]), 1)
+        self.assertEqual(event_log["data"][0]["command_id"], command_id)
+        self.assertEqual(event_log["data"][0]["action"], "install")
+        self.assertEqual(event_log["data"][0]["status_label"], "安装完成")
+        self.assertEqual((event_log["data"][0]["from_version"], event_log["data"][0]["to_version"]), ("1.5.0", "1.5.1"))
+        self.assertEqual((event_log["data"][0]["from_build_seq"], event_log["data"][0]["to_build_seq"]), (current_build, target_build))
+        self.assertEqual(self.client.json("GET", f"/?s=/ops-x9/api/update/events/{device_id}", expected=(422,))[0], 422)
+
+        _, heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_uuid, "conns": []})
+        self.assertEqual(heartbeat, {"sysinfo": True})
+        _, snapshot, _ = self.client.json("GET", f"/?s=/ops-x9/api/devices/{device_id}?uuid={device_uuid}")
+        self.assertEqual(snapshot["total"], 1)
+        self.assertEqual(snapshot["data"][0]["build_seq"], current_build)
+        self.client.json("POST", "/?s=/api/sysinfo", {
+            "id": device_id, "uuid": device_uuid, "version": "1.5.1",
+            "build_number": "20261002.1", "build_seq": target_build,
+        })
+        _, refreshed_heartbeat, _ = self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_uuid, "conns": []})
+        self.assertEqual(refreshed_heartbeat, {})
+        db = sqlite3.connect(self.db)
+        payload = json.loads(db.execute("SELECT payload FROM device_reports WHERE id=? AND uuid=?", (device_id, device_uuid)).fetchone()[0])
+        self.assertEqual((payload["version"], payload["build_number"], payload["build_seq"]), ("1.5.1", "20261002.1", target_build))
+        db.close()
+
     def test_one_shot_commands_resolve_latest_release_without_reported_package_kind(self):
         csrf = self.admin_csrf()
         suffix = uuid.uuid4().hex[:10]

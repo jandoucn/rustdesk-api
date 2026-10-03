@@ -64,20 +64,25 @@ function persistNetworkPayload(id, uuid, network) {
   return JSON.parse(output.trim());
 }
 
-function setLatestUpdateCommandStatus(id, uuid, status) {
+function recordLatestUpdateLifecycle(id, uuid, action, events) {
   const container = process.env.RUSTDESK_API_CONTAINER;
-  if (!container) throw new Error('RUSTDESK_API_CONTAINER is required for update-command status E2E');
+  if (!container) throw new Error('RUSTDESK_API_CONTAINER is required for update lifecycle E2E');
+  const encoded = Buffer.from(JSON.stringify(events), 'utf8').toString('base64');
   const php = [
     "require '/var/www/html/lib.php';",
     '$db=open_database();',
-    "$row=db_one($db,'SELECT command_id FROM device_update_commands WHERE device_id=:id AND uuid=:uuid ORDER BY created_at DESC,command_id DESC LIMIT 1',['id'=>getenv('TEST_DEVICE_ID'),'uuid'=>getenv('TEST_DEVICE_UUID')]);",
+    "$row=db_one($db,'SELECT command_id FROM device_update_commands WHERE device_id=:id AND uuid=:uuid AND action=:action ORDER BY created_at DESC,command_id DESC LIMIT 1',['id'=>getenv('TEST_DEVICE_ID'),'uuid'=>getenv('TEST_DEVICE_UUID'),'action'=>getenv('TEST_COMMAND_ACTION')]);",
     "if(!$row)throw new RuntimeException('missing command');",
-    "db_exec($db,'UPDATE device_update_commands SET status=:status,updated_at=:updated WHERE command_id=:command',['status'=>getenv('TEST_COMMAND_STATUS'),'updated'=>time(),'command'=>$row['command_id']]);",
+    "$events=json_decode((string)base64_decode((string)getenv('TEST_UPDATE_EVENTS'),true),true,32,JSON_THROW_ON_ERROR);",
+    '$now=time();',
+    "foreach($events as $offset=>$event){db_exec($db,'INSERT OR REPLACE INTO device_update_events(command_id,device_id,uuid,from_version,to_version,from_build_seq,to_build_seq,status,source,error_code,started_at,finished_at) VALUES(:command,:id,:uuid,:from_version,:to_version,:from_build,:to_build,:status,:source,:error,:started,:finished)',['command'=>$row['command_id'],'id'=>getenv('TEST_DEVICE_ID'),'uuid'=>getenv('TEST_DEVICE_UUID'),'from_version'=>$event['from_version']??null,'to_version'=>$event['to_version']??null,'from_build'=>$event['from_build_seq']??null,'to_build'=>$event['to_build_seq']??null,'status'=>$event['status'],'source'=>'remote_command','error'=>$event['error_code']??null,'started'=>$now+((int)$offset),'finished'=>isset($event['finished'])?$now+((int)$offset):null]);}",
+    "$last=end($events);db_exec($db,'UPDATE device_update_commands SET status=:status,last_error=:error,updated_at=:updated WHERE command_id=:command',['status'=>$last['status'],'error'=>$last['error_code']??null,'updated'=>$now+count($events),'command'=>$row['command_id']]);",
     "echo $row['command_id'];",
   ].join('');
   return execFileSync('docker', [
     'exec', '-e', `TEST_DEVICE_ID=${id}`, '-e', `TEST_DEVICE_UUID=${uuid}`,
-    '-e', `TEST_COMMAND_STATUS=${status}`, container, 'php', '-r', php,
+    '-e', `TEST_COMMAND_ACTION=${action}`, '-e', `TEST_UPDATE_EVENTS=${encoded}`,
+    container, 'php', '-r', php,
   ], { encoding: 'utf8' }).trim();
 }
 
@@ -665,7 +670,7 @@ test('desktop release renders as installed and keeps UUID out of the inventory r
   await expect(row).not.toContainText('UUID');
 });
 
-test('client details sends one-shot check and install commands and shows command status', async ({ page, request }) => {
+test('client details streams update logs and refreshes reported build identity', async ({ page, request }) => {
   const deviceId = `update-command-${Date.now().toString(36)}`;
   const uuid = `${deviceId}-uuid`;
   const buildSeq = Date.now();
@@ -702,6 +707,7 @@ test('client details sends one-shot check and install commands and shows command
   await expect(page.locator('#status')).toContainText('安装命令已发送');
   await expect(page.locator('#details-dialog')).toContainText('最近更新命令');
   await expect(page.locator('#details-dialog')).toContainText('等待客户端接收');
+  await expect(dialog.locator('#update-command-log')).toBeVisible();
   const persistedCommands = updateCommandSqlSnapshot(deviceId, uuid);
   expect(persistedCommands).toHaveLength(publishedCommands.length + 2);
   expect(persistedCommands.filter(command => command.action === 'check')).toHaveLength(2);
@@ -709,8 +715,44 @@ test('client details sends one-shot check and install commands and shows command
   for (const command of persistedCommands) {
     expect(command).toEqual({ action: command.action, target_version: '9.9.9', target_build_seq: buildSeq, status: 'pending' });
   }
-  setLatestUpdateCommandStatus(deviceId, uuid, 'installing');
-  await expect(page.locator('#details-dialog')).toContainText('正在安装', { timeout: 5000 });
+  recordLatestUpdateLifecycle(deviceId, uuid, 'check', [
+    { status: 'checking', from_version: '9.9.9', from_build_seq: buildSeq - 1, to_version: '9.9.9', to_build_seq: buildSeq },
+    { status: 'completed', from_version: '9.9.9', from_build_seq: buildSeq - 1, to_version: '9.9.9', to_build_seq: buildSeq, finished: true },
+  ]);
+  recordLatestUpdateLifecycle(deviceId, uuid, 'install', [
+    { status: 'started', from_version: '9.9.9', from_build_seq: buildSeq - 1, to_version: '9.9.9', to_build_seq: buildSeq },
+    { status: 'downloaded', from_version: '9.9.9', from_build_seq: buildSeq - 1, to_version: '9.9.9', to_build_seq: buildSeq },
+    { status: 'installing', from_version: '9.9.9', from_build_seq: buildSeq - 1, to_version: '9.9.9', to_build_seq: buildSeq },
+  ]);
+  await expect(dialog.locator('#update-command-log')).toContainText('检查前 9.9.9', { timeout: 5000 });
+  await expect(dialog.locator('#update-command-log')).toContainText(`构建 ${buildSeq - 1} -> ${buildSeq}`);
+  await expect(dialog.locator('#update-command-log')).toContainText('下载完成');
+  await expect(dialog.locator('#update-command-log')).toContainText('正在安装');
+
+  await expect((await request.post('/api/sysinfo', { data: {
+    id: deviceId, uuid, hostname: `${deviceId}-host`, product: 'rustdesk-yan', edition: 'standard',
+    version: '9.9.9', build_number: '20261002.1', build_seq: buildSeq, channel: 'stable',
+    platform: 'Windows', arch: 'x86_64', install_mode: 'installed',
+  } })).ok()).toBeTruthy();
+  await expect(dialog.locator('#details-body')).toContainText('20261002.1', { timeout: 5000 });
+  await expect(dialog.locator('#details-body')).toContainText(String(buildSeq));
+  expect(await dialog.locator('#update-command-log').evaluate(node => node.scrollWidth <= node.clientWidth)).toBeTruthy();
+
+  recordLatestUpdateLifecycle(deviceId, uuid, 'install', [
+    { status: 'failed', from_version: '9.9.9', from_build_seq: buildSeq - 1, to_version: '9.9.9', to_build_seq: buildSeq, error_code: 'checksum_mismatch', finished: true },
+  ]);
+  await expect(dialog.locator('#update-command-log')).toContainText('执行失败', { timeout: 5000 });
+  await expect(dialog.locator('#update-command-log')).toContainText('checksum_mismatch');
+  await dialog.locator('#details-close').click();
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  await expect(dialog.locator('#update-command-log')).toContainText('checksum_mismatch');
+  await dialog.locator('#update-command-log').focus();
+  await expect(dialog.locator('#update-command-log')).toBeFocused();
+  await page.route(`${adminPath}/api/update/events/**`, route => route.abort());
+  await dialog.locator('#details-close').click();
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  await expect(dialog.locator('#update-command-log')).toContainText('读取失败', { timeout: 5000 });
+  await page.unroute(`${adminPath}/api/update/events/**`);
 });
 
 test('inventory backfills GeoLite region and timezone for a stored public IP', async ({ page, request }) => {
@@ -833,7 +875,7 @@ test('client inventory loads and manages devices beyond the first 200 rows', asy
 test('client inventory select-all checks every visible device row', async ({ page, request }) => {
   const suffix = Date.now().toString(36);
   const ids = Array.from({ length: 3 }, (_, index) => `select-all-${suffix}-${index}`);
-  await Promise.all(ids.map(id => reportClient(request, id)));
+  for (const id of ids) await reportClient(request, id);
 
   await loginAdmin(page);
   await page.getByRole('link', { name: '客户端管理' }).click();

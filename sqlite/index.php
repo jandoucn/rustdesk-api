@@ -782,6 +782,14 @@ function public_update_command(array $row): array
     $row['status_label'] = command_status_label((string)$row['status']);
     return $row;
 }
+function public_update_event(array $row): array
+{
+    foreach (['id','from_build_seq','to_build_seq','command_target_build_seq','started_at','finished_at'] as $field) {
+        if (array_key_exists($field, $row) && $row[$field] !== null) $row[$field] = (int)$row[$field];
+    }
+    $row['status_label'] = command_status_label((string)$row['status']);
+    return $row;
+}
 function expire_update_commands(PDO $db, string $id, string $uuid): void
 {
     db_exec($db, "UPDATE device_update_commands SET status='expired',updated_at=:now WHERE device_id=:id AND uuid=:uuid AND expires_at<=:now AND status='pending'", ['now'=>time(),'id'=>$id,'uuid'=>$uuid]);
@@ -793,6 +801,65 @@ function update_command_client(PDO $db, string $id, string $uuid): array
     $client = merge_json_objects(decoded_payload($deployment['payload'] ?? null), decoded_payload($report['payload'] ?? null));
     if (text_field($client, 'arch', 32) === '') $client['arch'] = text_field($client, 'client_arch', 32);
     return $client;
+}
+function admin_device_snapshot(PDO $db, array $actor, string $id, string $uuid): array
+{
+    $reportRow = db_one($db, 'SELECT id,uuid,payload,last_seen,last_heartbeat,heartbeat_payload,runtime_payload,network_payload FROM device_reports WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
+    $deployment = db_one($db, 'SELECT id,uuid,uid,payload,updated_at FROM device_deployments WHERE id=:id AND uuid=:uuid', ['id'=>$id,'uuid'=>$uuid]);
+    if (!$reportRow && !$deployment) fail(404, '客户端不存在');
+    $report = decoded_payload($reportRow['payload'] ?? null); $deploy = decoded_payload($deployment['payload'] ?? null);
+    $runtime = decoded_payload($reportRow['runtime_payload'] ?? null); $network = decoded_payload($reportRow['network_payload'] ?? null);
+    $release = $reportRow ? canonical_release_identity($db, release_identity($report, $runtime)) : [];
+    $publicIp = is_public_ip((string)($network['public_ip'] ?? '')) ? (string)$network['public_ip'] : '';
+    $storedGeo = $network['geo'] ?? null; $geo = is_array($storedGeo) && $storedGeo !== [] ? $storedGeo : public_ip_geo($publicIp);
+    $profile = db_one($db, 'SELECT guid FROM ab_profiles WHERE uid=:uid AND personal=1', ['uid'=>$actor['id']]);
+    $alias = null;
+    if ($profile) {
+        $peer = db_one($db, 'SELECT payload FROM ab_profile_peers WHERE guid=:guid AND id=:id', ['guid'=>$profile['guid'],'id'=>$id]);
+        $peerPayload = decoded_payload($peer['payload'] ?? null); if (array_key_exists('alias', $peerPayload) && is_string($peerPayload['alias'])) $alias = $peerPayload['alias'];
+    }
+    if ($alias === null) {
+        $peer = db_one($db, 'SELECT alias FROM rustdesk_peers WHERE uid=:uid AND id=:id ORDER BY deviceid DESC LIMIT 1', ['uid'=>$actor['id'],'id'=>$id]);
+        if ($peer) $alias = $peer['alias'] === null ? '' : (string)$peer['alias'];
+    }
+    $addressBookUserIds = array_map(static fn($row) => (int)$row['uid'], db_all($db, 'SELECT a.uid FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.personal=1 AND p.id=:id ORDER BY a.uid', ['id'=>$id]));
+    foreach (db_all($db, 'SELECT uid FROM rustdesk_peers WHERE id=:id ORDER BY uid', ['id'=>$id]) as $assignment) if (!in_array((int)$assignment['uid'], $addressBookUserIds, true)) $addressBookUserIds[] = (int)$assignment['uid'];
+    sort($addressBookUserIds, SORT_NUMERIC);
+    if ((string)($actor['address_book_scope'] ?? 'self') !== 'all') $addressBookUserIds = in_array((int)$actor['id'], $addressBookUserIds, true) ? [(int)$actor['id']] : [];
+    $lastHeartbeat = (int)($reportRow['last_heartbeat'] ?? 0); $lastSeen = (int)($reportRow['last_seen'] ?? 0);
+    $platform = (string)($release['platform'] ?? ($report['os'] ?? ($deploy['platform'] ?? '')));
+    $row = [
+        'id'=>$id,'uuid'=>$uuid,'owner_id'=>$deployment && $deployment['uid'] !== null ? (int)$deployment['uid'] : null,
+        'hostname'=>$report['hostname'] ?? ($deploy['device_name'] ?? ''),'username'=>$report['username'] ?? ($deploy['device_username'] ?? ''),
+        'platform'=>$platform,'os'=>(string)($release['os'] ?? ($report['os'] ?? '')),'os_version'=>(string)($release['os_version'] ?? ''),
+        'cpu'=>$report['cpu'] ?? '','memory'=>$report['memory'] ?? '','version'=>($release['version'] ?? '') !== '' ? $release['version'] : ($report['version'] ?? ''),
+        'client_id'=>$release['client_id'] ?? '','client_uuid'=>$release['client_uuid'] ?? '','product'=>$release['product'] ?? '','edition'=>$release['edition'] ?? '',
+        'build_number'=>$release['build_number'] ?? '','build_seq'=>(int)($release['build_seq'] ?? 0),'source_commit'=>$release['source_commit'] ?? '',
+        'channel'=>$release['channel'] ?? '','arch'=>$release['arch'] ?? ($report['client_arch'] ?? ''),'distribution'=>$release['distribution'] ?? '',
+        'install_mode'=>$release['install_mode'] ?? '','client_arch'=>$release['arch'] ?? ($report['client_arch'] ?? ''),'executable_name'=>$runtime['executable_name'] ?? ($report['executable_name'] ?? ''),
+        'public_ip'=>$publicIp,'private_ips'=>$network['private_ips'] ?? [],'geo'=>$geo,'version_text'=>$release['version'] ?? '',
+        'heartbeat_version'=>decoded_payload($reportRow['heartbeat_payload'] ?? null)['ver'] ?? null,'heartbeat_payload'=>decoded_payload($reportRow['heartbeat_payload'] ?? null),
+        'runtime_payload'=>$runtime,'network_payload'=>$network,'last_seen'=>$lastSeen,'last_heartbeat'=>$lastHeartbeat,
+        'enable_check_update'=>array_key_exists('enable_check_update', $runtime) ? (bool)$runtime['enable_check_update'] : null,
+        'allow_auto_update'=>array_key_exists('allow_auto_update', $runtime) ? (bool)$runtime['allow_auto_update'] : null,
+        'enable_scheduled_update'=>array_key_exists('enable_scheduled_update', $runtime) ? (bool)$runtime['enable_scheduled_update'] : null,
+        'scheduled_update_interval_hours'=>isset($runtime['scheduled_update_interval_hours']) ? (int)$runtime['scheduled_update_interval_hours'] : null,
+        'last_update_check'=>$runtime['last_update_check'] ?? '','last_update_status'=>$runtime['last_update_status'] ?? '',
+        'last_update_error'=>$runtime['last_update_error'] ?? '','last_update_source'=>$runtime['last_update_source'] ?? '',
+        'updated_at'=>$deployment ? (int)$deployment['updated_at'] : $lastSeen,'presence'=>device_presence($lastHeartbeat, time()),'deployed'=>$deployment !== null,
+        'alias'=>$alias,'address_book_user_ids'=>$addressBookUserIds,'alias_owner_id'=>$alias !== null ? (int)$actor['id'] : null,'alias_owner_name'=>$alias !== null ? $actor['username'] : null,
+    ];
+    return $row;
+}
+function successful_install_requires_sysinfo(PDO $db, string $id, string $uuid): bool
+{
+    if (database_driver() !== 'sqlite') return false;
+    $command = db_one($db, "SELECT target_version,target_build_seq,updated_at FROM device_update_commands WHERE device_id=:id AND uuid=:uuid AND action='install' AND status IN ('installed','completed') AND target_version IS NOT NULL AND target_build_seq IS NOT NULL ORDER BY updated_at DESC,command_id DESC LIMIT 1", ['id'=>$id,'uuid'=>$uuid]);
+    if (!$command) return false;
+    $client = update_command_client($db, $id, $uuid);
+    $current = ['version'=>text_field($client, 'version', 32, '0.0.0'), 'build_seq'=>(int)($client['build_seq'] ?? 0)];
+    $target = ['version'=>(string)$command['target_version'], 'build_seq'=>(int)$command['target_build_seq']];
+    return compare_release($target, $current) > 0;
 }
 function create_update_command(PDO $db, array $actor, string $id, array $data): array
 {
@@ -1815,7 +1882,15 @@ try {
         }
         reply(['ok'=>true]+$saved+($command!==null?['immediate_command'=>$command,'message'=>'更新策略已保存，已下发立即更新命令']:[]));
     }
-    if ($adminApi && preg_match('#^/admin/api/update/events(?:/([^/]+))?$#',$path,$match)) { admin_user($db); $id=isset($match[1])?rawurldecode($match[1]):''; $where=$id?' WHERE device_id=:id':''; reply(['data'=>db_all($db,'SELECT * FROM device_update_events'.$where.' ORDER BY started_at DESC LIMIT 200',$id?['id'=>$id]:[])]); }
+    if ($adminApi && preg_match('#^/admin/api/update/events(?:/([^/]+))?$#',$path,$match)) {
+        admin_user($db);
+        $id=isset($match[1])?rawurldecode($match[1]):'';
+        if($id==='')reply(['data'=>array_map('public_update_event',db_all($db,'SELECT e.*,c.action,c.target_version AS command_target_version,c.target_build_seq AS command_target_build_seq FROM device_update_events e LEFT JOIN device_update_commands c ON c.command_id=e.command_id ORDER BY e.started_at DESC,e.id DESC LIMIT 200'))]);
+        $uuid=text_field($_GET,'uuid',256); if($uuid==='')fail(422,'设备 UUID 不能为空');
+        [$id,$uuid]=device_update_identity($db,$id,$uuid);
+        $rows=db_all($db,'SELECT e.*,c.action,c.target_version AS command_target_version,c.target_build_seq AS command_target_build_seq FROM device_update_events e LEFT JOIN device_update_commands c ON c.command_id=e.command_id WHERE e.device_id=:id AND e.uuid=:uuid ORDER BY e.started_at DESC,e.id DESC LIMIT 200',['id'=>$id,'uuid'=>$uuid]);
+        reply(['data'=>array_map('public_update_event',$rows)]);
+    }
     if ($adminApi && preg_match('#^/admin/api/users(?:/([1-9][0-9]*))?$#', $path, $match)) {
         $actor = admin_user($db); $id = isset($match[1]) ? (int)$match[1] : 0;
         if (!$id && $_SERVER['REQUEST_METHOD'] === 'GET') {
@@ -2142,6 +2217,11 @@ try {
     }
     if ($adminApi && preg_match('#^/admin/api/devices(?:/([^/]+))?$#', $path, $match)) {
         $actor = admin_user($db); $id = isset($match[1]) ? rawurldecode($match[1]) : '';
+        if ($id !== '' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+            $uuid = text_field($_GET, 'uuid', 256); if ($uuid === '') fail(422, '设备 UUID 不能为空');
+            [$id, $uuid] = device_update_identity($db, $id, $uuid);
+            reply(['total'=>1, 'data'=>[admin_device_snapshot($db, $actor, $id, $uuid)]]);
+        }
         if ($id === '' && $_SERVER['REQUEST_METHOD'] === 'GET') {
             [$limit,$offset]=pagination(); $q=$_GET['q']??''; if(!is_string($q)||strlen($q)>128) fail(422,'搜索内容过长');
             $presenceFilter=$_GET['presence']??($_GET['status']??'');
@@ -2404,7 +2484,7 @@ try {
             'heartbeat_payload'=>json_encode($d,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR),
             'runtime_payload'=>null,'network_payload'=>json_object_text($existingNetwork),
         ],['id','uuid'],['last_seen','last_heartbeat','heartbeat_payload','network_payload']);
-        reply($known ? new stdClass() : ['sysinfo' => true]);
+        reply(!$known || successful_install_requires_sysinfo($db,$id,$uuid) ? ['sysinfo' => true] : new stdClass());
     }
     if (in_array($path, ['/api/audit/conn', '/api/audit/file', '/api/audit/alarm'], true)) {
         method('POST'); $d = json_body(); $id = text_field($d, 'id', 128); $uuid = text_field($d, 'uuid', 256);
