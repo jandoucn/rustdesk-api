@@ -138,6 +138,8 @@ Every client-management change must prove:
 
 The management page at `${RUSTDESK_ADMIN_PATH}/address-book` operates on the signed-in administrator's personal address book only. The list merges legacy `rustdesk_peers`/`address_books.payload` data with current `ab_profile_peers` data. When both stores contain the same ID, the personal-profile payload has field priority; a row that exists in only one store still appears.
 
+The address-book page never switches to another administrator's book and never performs cross-user copy/move operations. Cross-user assignment remains an inventory operation in the client-management page (`/api/devices/address-book` and `/api/devices/address-book/preview`), where an administrator can select exact `(id, uuid)` identities and target users. This keeps personal CRUD ownership separate from fleet distribution while reusing the same three-store transaction and SQL reconciliation checks.
+
 Peer create, update and delete are transactional across:
 
 1. `ab_profile_peers` for the current personal profile;
@@ -149,6 +151,8 @@ Unknown peer and top-level JSON fields survive updates. Removing a contact does 
 Tags have a name and color. Rename/delete changes exact tag array members in all three stores and leaves similar names, such as `ops-prod` when renaming `ops`, and free-text notes untouched.
 
 `admin_peer_favorites` is Web-console metadata scoped by administrator UID. Favorite writes are idempotent. The UI must explicitly say that a background favorite is not the RustDesk client's native/local favorite and is not synchronized as one.
+
+The address-book client details dialog reuses the client-management update controls for the selected `(id, uuid)`: policy flags, channel/target fields, check/install commands, targeted build refresh, and the fixed-height terminal log. The log is limited to the selected local calendar date by default, supports historical date ranges, consumes the update event stream with a short polling fallback, and closes its stream/timer with the dialog. When one ID has multiple UUID identities, the dialog keeps the address-book-bound UUID and displays an explicit identity-change warning.
 
 Management API routes, relative to `${RUSTDESK_ADMIN_PATH}/api/address-book`, are:
 

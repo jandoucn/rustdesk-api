@@ -35,10 +35,6 @@
           </div>
         </div>
 
-        <section id="address-book-owner-panel" class="panel compact-panel" aria-label="通讯录用户选择">
-          <div class="toolbar"><div class="field grow"><label for="address-book-owner">当前通讯录用户</label><input id="address-book-owner" class="input" list="address-book-users" placeholder="搜索用户名或输入用户 ID" autocomplete="off"><datalist id="address-book-users"></datalist></div><button id="switch-address-book-owner" class="button" type="button">打开通讯录</button></div>
-        </section>
-
         <div class="sync-notice" role="note">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke-width="2"/><path d="M12 11v5M12 8h.01" stroke-width="2" stroke-linecap="round"/></svg>
           <div><strong>同步边界</strong><span>后台收藏只用于此管理页面筛选，不会同步到 RustDesk 客户端本机的原生收藏栏。</span></div>
@@ -61,9 +57,8 @@
           </div>
           <div id="batch-toolbar" class="toolbar batch-toolbar">
             <span id="batch-selection" class="field-hint">已选择 0 个客户端</span>
-            <div class="field filter"><label for="batch-action">批量操作</label><select id="batch-action" class="select"><option value="add_tags">添加标签</option><option value="remove_tags">移除标签</option><option value="copy">复制到用户</option><option value="move">移动到用户</option><option value="remove">从通讯录移除</option></select></div>
+            <div class="field filter"><label for="batch-action">批量操作</label><select id="batch-action" class="select"><option value="add_tags">添加标签</option><option value="remove_tags">移除标签</option><option value="remove">从通讯录移除</option></select></div>
             <div id="batch-tags-field" class="field grow"><label for="batch-tags">标签</label><input id="batch-tags" class="input" placeholder="多个标签用逗号分隔"></div>
-            <div id="batch-target-field" class="field filter hidden"><label for="batch-target">目标用户</label><select id="batch-target" class="select"></select></div>
             <button id="apply-batch" class="button primary" type="button" disabled>应用批量操作</button>
           </div>
           <p id="address-book-status" class="feedback" aria-live="polite">正在读取个人通讯录...</p>
@@ -84,7 +79,8 @@
     <form id="peer-form" class="dialog-form">
       <div class="dialog-head"><h3 id="peer-dialog-title">新增客户端</h3><p id="peer-dialog-description">客户端会添加到当前管理员的个人通讯录。</p></div>
       <div class="dialog-body">
-        <div class="field"><label for="peer-id">RustDesk ID</label><input id="peer-id" class="input mono" maxlength="128" placeholder="例如：123 456 789" autocomplete="off" required><span class="field-hint">编辑后客户端 ID 不可更改。</span></div>
+        <div class="field"><label for="peer-id">RustDesk ID</label><input id="peer-id" class="input mono" list="client-library-options" maxlength="128" placeholder="搜索客户端或手动输入离线 ID" autocomplete="off" required><datalist id="client-library-options"></datalist><span id="peer-library-hint" class="field-hint">可从客户端库选择并自动带出 UUID、主机名和版本；也可手动添加离线客户端。</span></div>
+        <div id="peer-client-summary" class="sync-notice hidden" role="status"></div>
         <div class="field"><label for="peer-alias">别名</label><input id="peer-alias" class="input" maxlength="255" placeholder="例如：上海前台电脑" autocomplete="off"></div>
         <div class="field"><label for="peer-note">说明</label><textarea id="peer-note" class="textarea" maxlength="4096" rows="3" placeholder="内部用途、位置或维护说明"></textarea></div>
         <fieldset class="tag-picker"><legend>标签</legend><div id="peer-tags" class="tag-options" role="group" aria-label="客户端标签"></div></fieldset>
@@ -118,11 +114,15 @@
     </div>
   </dialog>
 
+  <dialog id="client-details-dialog" aria-labelledby="client-details-title">
+    <div class="dialog-form wide-dialog"><div class="dialog-head"><h3 id="client-details-title">客户端详情</h3><p id="client-details-device"></p></div><div class="details-scroll"><div id="client-details-body" class="details-grid"></div><p id="ab-identity-warning" class="feedback warning hidden" role="status">检测到同一客户端 ID 对应多个 UUID，当前详情绑定的是通讯录保存的 UUID，请核对后再下发更新。</p><section class="details-section"><h4>更新策略</h4><div class="policy-checks"><label class="check" for="ab-enable-check-update"><input id="ab-enable-check-update" type="checkbox">启动时检查软件更新</label><label class="check" for="ab-allow-auto-update"><input id="ab-allow-auto-update" type="checkbox">自动更新</label><label class="check" for="ab-enable-scheduled-update"><input id="ab-enable-scheduled-update" type="checkbox">定时检查更新</label></div><div class="policy-controls"><div class="field"><label for="ab-scheduled-hours">定时检查间隔（小时）</label><input id="ab-scheduled-hours" class="input" type="number" min="1" max="168" value="5"></div><div class="field"><label for="ab-update-mode">更新方式</label><select id="ab-update-mode" class="select"><option value="notify">仅提示</option><option value="download">自动下载</option><option value="auto_install">自动安装</option><option value="disabled">关闭更新</option><option value="immediate">立即更新</option></select></div><div class="field"><label for="ab-update-channel">更新通道</label><select id="ab-update-channel" class="select"><option value="stable">stable</option><option value="beta">beta</option></select></div><div class="field"><label for="ab-update-version">指定版本</label><input id="ab-update-version" class="input"></div><div class="field"><label for="ab-update-build">指定 build_seq</label><input id="ab-update-build" class="input" inputmode="numeric"></div></div><button id="ab-policy-save" class="button primary" type="button">保存更新策略</button><p id="ab-policy-error" class="form-error" role="alert"></p></section><section class="details-section"><h4>更新命令与日志</h4><div class="dialog-actions"><button id="ab-check-update" class="button" type="button">立即检查更新</button><button id="ab-install-update" class="button primary" type="button">立即安装更新</button></div><div class="update-log-window"><div class="update-log-head"><span>更新执行日志</span><span id="ab-log-state">等待命令</span></div><div class="update-log-toolbar"><label for="ab-log-date">日志日期</label><input id="ab-log-date" type="date"><button id="ab-log-today" class="button small" type="button">今天</button></div><div id="ab-update-log" class="update-command-log" role="log" tabindex="0"><p class="update-log-empty">尚无更新日志</p></div></div></section></div><div class="dialog-actions"><button id="client-details-close" class="button" type="button">关闭</button></div></div>
+  </dialog>
+
   <script>
   'use strict';
   (() => {
     const $ = id => document.getElementById(id);
-    const state = { csrf: '', actor: null, targetUser: null, users: [], selected: new Set(), page: 1, size: 50, total: 0, q: '', tag: '', favorite: false, presence: 'all', peers: [], tags: [], summary: {}, loading: false, pendingLoad: null, loadGeneration: 0, editingPeer: null, editingTag: null, confirmAction: null, returnToTags: false };
+    const state = { csrf: '', actor: null, targetUser: null, users: [], devices: [], selected: new Set(), page: 1, size: 50, total: 0, q: '', tag: '', favorite: false, presence: 'all', peers: [], tags: [], summary: {}, loading: false, pendingLoads: [], loadGeneration: 0, feedbackRevision: 0, feedbackLockUntil: 0, editingPeer: null, editingTag: null, confirmAction: null, returnToTags: false, detailDevice: null, detailTimer: null, detailStream: null };
     const starIcon = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9L12 3Z" stroke-width="2" stroke-linejoin="round"/></svg>';
 
     async function api(url, options = {}) {
@@ -136,7 +136,7 @@
       return data;
     }
 
-    function setFeedback(message, kind = '') { $('address-book-status').textContent = message; $('address-book-status').className = 'feedback' + (kind ? ' ' + kind : ''); }
+    function setFeedback(message, kind = '') { state.feedbackRevision += 1; if (kind === 'success' && /已保存|已加入|已取消|已移除|操作完成/.test(message)) state.feedbackLockUntil = Date.now() + 3000; $('address-book-status').textContent = message; $('address-book-status').className = 'feedback' + (kind ? ' ' + kind : ''); }
     function appendCell(row, label, className = '') { const cell = document.createElement('td'); cell.dataset.label = label; if (className) cell.className = className; row.append(cell); return cell; }
     function textLine(className, value) { const span = document.createElement('span'); span.className = className; span.textContent = value; return span; }
     function detailValue(value) { return value === undefined || value === null || value === '' ? '未上报' : String(value); }
@@ -149,7 +149,7 @@
     function isFavorite(peer) { return peer.favorite === true || peer.favorite === 1 || peer.is_favorite === true || peer.is_favorite === 1; }
     function colorHex(value) { const number = Number(value); return number ? '#' + ((number >>> 0) & 0xffffff).toString(16).padStart(6, '0') : '#176b87'; }
     function colorNumber(value) { return Number.parseInt('ff' + String(value).replace('#', ''), 16); }
-    function targetQuery() { return state.targetUser ? 'user_id=' + encodeURIComponent(state.targetUser.id) : ''; }
+    function targetQuery() { return ''; }
     function targetUrl(path) { return path + (path.includes('?') ? '&' : '?') + targetQuery(); }
     function peerPath(id) { return targetUrl('__ADMIN_PATH__/api/address-book/peers/' + encodeURIComponent(id)); }
 
@@ -226,9 +226,10 @@
         const activityCell = appendCell(row, '最近活动'); const activity = Number(peer.last_heartbeat || peer.last_seen || 0); activityCell.append(textLine('cell-title', relativeTime(activity))); if (activity) activityCell.append(textLine('cell-subtitle', new Date(activity * 1000).toLocaleString()));
 
         const actionsCell = appendCell(row, '操作', 'actions-cell'); const actions = document.createElement('div'); actions.className = 'row-actions';
+        const details = document.createElement('button'); details.type = 'button'; details.className = 'button small'; details.textContent = '详情'; details.setAttribute('aria-label', '查看客户端详情'); details.addEventListener('click', () => openClientDetails(peer));
         const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'button small'; edit.textContent = '编辑客户端'; edit.setAttribute('aria-label', '编辑客户端'); edit.addEventListener('click', () => openPeerDialog(peer));
         const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button small danger'; remove.textContent = '删除客户端'; remove.setAttribute('aria-label', '删除客户端'); remove.addEventListener('click', () => confirmPeerDelete(peer));
-        actions.append(edit, remove); actionsCell.append(actions); body.append(row);
+        actions.append(details, edit, remove); actionsCell.append(actions); body.append(row);
       });
       updateStats(); updatePager(); updateBatchControls();
     }
@@ -236,9 +237,10 @@
     async function load(options = {}) {
       const generation = ++state.loadGeneration;
       if (!state.targetUser) return;
-      if (state.loading) { state.pendingLoad = options; return; }
+      if (state.loading) return new Promise((resolve, reject) => state.pendingLoads.push({ options, resolve, reject }));
       state.loading = true; $('refresh-address-book').disabled = true; updatePager();
-      if (!options.quiet) setFeedback('正在读取个人通讯录...');
+      if (!options.quiet && Date.now() >= state.feedbackLockUntil) setFeedback('正在读取个人通讯录...');
+      const feedbackRevision = state.feedbackRevision;
       try {
         const params = new URLSearchParams({ q: state.q, tag: state.tag, page: String(state.page), pageSize: String(state.size), user_id: String(state.targetUser.id) });
         if (state.favorite) params.set('favorite', '1');
@@ -251,14 +253,14 @@
         state.total = Number(data.total ?? state.peers.length) || 0;
         state.summary = data.summary && typeof data.summary === 'object' ? data.summary : {};
         renderTagFilter(); renderPeers();
-        setFeedback('已加载 ' + state.total + ' 个匹配客户端', 'success');
+        if (feedbackRevision === state.feedbackRevision && Date.now() >= state.feedbackLockUntil && (!options.quiet || !$('address-book-status').classList.contains('success'))) setFeedback('已加载 ' + state.total + ' 个匹配客户端', 'success');
       } catch (error) {
         if (generation !== state.loadGeneration) return;
         if (String(error.message).includes('登录')) location.href = '__ADMIN_PATH__';
         else setFeedback(error.message, 'error');
       } finally {
         state.loading = false; $('refresh-address-book').disabled = false; updatePager();
-        const pending = state.pendingLoad; state.pendingLoad = null; if (pending) load(pending);
+        const pending = state.pendingLoads.splice(0); if (pending.length) load(pending[pending.length - 1].options).then(() => pending.forEach(item => item.resolve()), error => pending.forEach(item => item.reject(error)));
       }
     }
 
@@ -274,12 +276,26 @@
       (peer ? $('peer-alias') : $('peer-id')).focus();
     }
 
+    function renderClientLibrary() {
+      const list = $('client-library-options'); if (!list) return; list.replaceChildren();
+      state.devices.forEach(device => { const option = document.createElement('option'); option.value = String(device.id || ''); option.label = [device.hostname, device.version, device.uuid].filter(Boolean).join(' · '); option.dataset.uuid = device.uuid || ''; list.append(option); });
+    }
+    function fillClientFromLibrary() {
+      const id = $('peer-id').value.trim(); const device = state.devices.find(item => String(item.id || '') === id); const summary = $('peer-client-summary');
+      if (!device || state.editingPeer) { summary.classList.add('hidden'); return; }
+      $('peer-alias').value = $('peer-alias').value || device.alias || device.hostname || '';
+      summary.classList.remove('hidden'); summary.textContent = '已选择客户端：' + [device.hostname || '未命名', device.uuid ? 'UUID ' + device.uuid : '', device.version ? '版本 ' + device.version : '', device.presence ? ({ online: '在线', recent: '最近在线', offline: '离线' }[device.presence] || device.presence) : ''].filter(Boolean).join(' · ');
+    }
+
     async function savePeer(event) {
       event.preventDefault();
       const button = $('peer-save'); button.disabled = true; $('peer-error').textContent = '';
       const creating = !state.editingPeer;
       const id = state.editingPeer ? String(state.editingPeer.id) : $('peer-id').value.trim();
+      const selectedDevice = state.devices.find(item => String(item.id || '') === id);
       const payload = { id, alias: $('peer-alias').value.trim(), note: $('peer-note').value.trim(), tags: Array.from($('peer-tags').querySelectorAll('input:checked'), input => input.value) };
+      const uuid = selectedDevice?.uuid || state.editingPeer?.uuid;
+      if (uuid) payload.uuid = uuid;
       try {
         if (state.editingPeer) await api(peerPath(id), { method: 'PATCH', body: JSON.stringify(payload) });
         else await api(targetUrl('__ADMIN_PATH__/api/address-book/peers'), { method: 'POST', body: JSON.stringify(payload) });
@@ -329,9 +345,8 @@
       event.preventDefault(); const button = $('tag-save'); button.disabled = true; $('tag-error').textContent = '';
       const name = $('tag-name').value.trim(); const payload = { name, new: name, old: state.editingTag?.name || '', color: colorNumber($('tag-color').value) };
       try {
-        if (state.editingTag) await api(targetUrl('__ADMIN_PATH__/api/address-book/tags/' + encodeURIComponent(state.editingTag.name)), { method: 'PATCH', body: JSON.stringify(payload) });
-        else await api(targetUrl('__ADMIN_PATH__/api/address-book/tags'), { method: 'POST', body: JSON.stringify(payload) });
-        resetTagEditor(); await load({ quiet: true }); renderTagManagement();
+        const result = state.editingTag ? await api(targetUrl('__ADMIN_PATH__/api/address-book/tags/' + encodeURIComponent(state.editingTag.name)), { method: 'PATCH', body: JSON.stringify(payload) }) : await api(targetUrl('__ADMIN_PATH__/api/address-book/tags'), { method: 'POST', body: JSON.stringify(payload) });
+        resetTagEditor(); await load({ quiet: true }); if (result.name && !state.tags.some(tag => tag.name === result.name)) state.tags.push({ name: result.name, color: Number(result.color || 0), count: 0 }); renderTagManagement();
       } catch (error) { $('tag-error').textContent = error.message; }
       finally { button.disabled = false; }
     }
@@ -353,40 +368,21 @@
     }
 
     function renderUsers() {
-      const list = $('address-book-users'); list.replaceChildren();
-      const target = $('batch-target'); target.replaceChildren(new Option('选择目标用户', ''));
-      state.users.forEach(user => {
-        const option = document.createElement('option'); option.value = user.username; option.label = 'ID ' + user.id; list.append(option);
-        if (!state.targetUser || Number(user.id) !== Number(state.targetUser.id)) target.add(new Option(user.username, String(user.id)));
-      });
-      $('address-book-owner').value = state.targetUser?.username || '';
-      $('address-book-owner-panel').classList.toggle('hidden', state.actor?.address_book_scope !== 'all');
-    }
-    function resolveOwner() {
-      const value = $('address-book-owner').value.trim();
-      return state.users.find(user => String(user.id) === value || user.username === value);
-    }
-    async function switchOwner() {
-      const target = resolveOwner();
-      if (!target) { setFeedback('没有找到该用户', 'error'); return; }
-      state.targetUser = target; state.page = 1; state.selected.clear(); renderUsers();
-      const url = new URL(location.href); url.searchParams.set('user_id', target.id); url.searchParams.delete('presence'); history.replaceState(null, '', url);
-      await load();
+      state.targetUser = state.actor;
     }
     function updateBatchControls() {
       const count = state.selected.size; $('batch-selection').textContent = '已选择 ' + count + ' 个客户端'; $('apply-batch').disabled = count === 0;
-      const action = $('batch-action').value; $('batch-tags-field').classList.toggle('hidden', !['add_tags', 'remove_tags'].includes(action)); $('batch-target-field').classList.toggle('hidden', !['copy', 'move'].includes(action));
+      const action = $('batch-action').value; $('batch-tags-field').classList.toggle('hidden', !['add_tags', 'remove_tags'].includes(action));
       const visibleIds = state.peers.map(peer => String(peer.id)); const selectedVisible = visibleIds.filter(id => state.selected.has(id)).length;
       $('select-all-peers').checked = visibleIds.length > 0 && selectedVisible === visibleIds.length; $('select-all-peers').indeterminate = selectedVisible > 0 && selectedVisible < visibleIds.length;
     }
     async function performBatch(action, payload) {
       const result = await api(targetUrl('__ADMIN_PATH__/api/address-book/batch'), { method: 'POST', body: JSON.stringify(payload) });
-      state.selected.clear(); await load({ quiet: true }); setFeedback('操作成功：已更新 ' + result.changed + ' 个客户端', 'success');
+      state.selected.clear(); await load({ quiet: true }); const summary = ['新增 ' + (result.added ?? result.changed ?? 0), '更新 ' + (result.updated ?? 0), '跳过 ' + (result.skipped_existing ?? 0), '失败 ' + (result.failed ?? 0)].join('，'); setFeedback('操作完成：' + summary, result.failed ? 'error' : 'success');
     }
     async function applyBatch() {
       const action = $('batch-action').value; const payload = { action, peer_ids: Array.from(state.selected) };
       if (['add_tags', 'remove_tags'].includes(action)) payload.tags = $('batch-tags').value.split(',').map(value => value.trim()).filter(Boolean);
-      if (['copy', 'move'].includes(action)) payload.target_user_id = Number($('batch-target').value);
       if (action === 'remove') {
         openConfirm('批量移除通讯录客户端', '确认从当前用户的通讯录移除选中的 ' + payload.peer_ids.length + ' 个客户端？客户端上报和部署记录不会被删除。', '确认移除', () => performBatch(action, payload));
         return;
@@ -413,19 +409,38 @@
     });
     $('search-address-book').addEventListener('click', () => { state.q = $('address-search').value.trim(); state.page = 1; load(); }); $('address-search').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); $('search-address-book').click(); } });
     $('tag-filter').addEventListener('change', () => { state.tag = $('tag-filter').value; state.page = 1; load(); }); $('address-presence-filter').addEventListener('change', () => { state.presence = $('address-presence-filter').value; state.page = 1; load(); }); $('favorite-only').addEventListener('change', () => { state.favorite = $('favorite-only').checked; state.page = 1; load(); }); $('refresh-address-book').addEventListener('click', () => load());
-    async function exportAddressBook(format) { const params = new URLSearchParams({ format, q: state.q, tag: state.tag, user_id: String(state.targetUser?.id || '') }); const response = await fetch('__ADMIN_PATH__/api/address-book/export?' + params, { credentials: 'same-origin', headers: { Accept: format === 'json' ? 'application/json' : 'text/csv', 'X-CSRF-Token': state.csrf } }); if (!response.ok) throw Error('导出失败'); const blob = await response.blob(); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = 'rustdesk-address-book.' + (format === 'json' ? 'json' : 'csv'); link.click(); URL.revokeObjectURL(url); }
+    async function exportAddressBook(format) { const params = new URLSearchParams({ format, q: state.q, tag: state.tag, favorite: state.favorite ? '1' : '', presence: state.presence === 'all' ? '' : state.presence, user_id: String(state.targetUser?.id || '') }); const response = await fetch('__ADMIN_PATH__/api/address-book/export?' + params, { credentials: 'same-origin', headers: { Accept: format === 'json' ? 'application/json' : 'text/csv', 'X-CSRF-Token': state.csrf } }); if (!response.ok) throw Error('导出失败'); const blob = await response.blob(); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = 'rustdesk-address-book.' + (format === 'json' ? 'json' : 'csv'); link.click(); URL.revokeObjectURL(url); }
     $('address-export-csv').addEventListener('click', () => exportAddressBook('csv').catch(error => setFeedback(error.message, 'error'))); $('address-export-json').addEventListener('click', () => exportAddressBook('json').catch(error => setFeedback(error.message, 'error')));
-    $('address-import').addEventListener('change', async event => { const file = event.target.files?.[0]; if (!file) return; try { const content = await file.text(); const format = file.name.toLowerCase().endsWith('.json') ? 'json' : 'csv'; const parsed = format === 'json' ? JSON.parse(content) : content; const payload = { format, data: parsed }; const data = await api(targetUrl('__ADMIN_PATH__/api/address-book/import/preview'), { method: 'POST', body: JSON.stringify(payload) }); const plan = data.plan || {}; setFeedback('导入预览：' + (plan.add || []).length + ' 条新增、' + (plan.already_present || []).length + ' 条已存在、' + (plan.invalid || []).length + ' 条无效', 'success'); if (window.confirm('确认应用这份通讯录导入？')) { await api(targetUrl('__ADMIN_PATH__/api/address-book/import/apply'), { method: 'POST', body: JSON.stringify(payload) }); await load({ quiet: true }); setFeedback('通讯录导入已应用', 'success'); } } catch (error) { setFeedback(error.message, 'error'); } finally { event.target.value = ''; } });
+    function localDateValue(date = new Date()) { const y = date.getFullYear(); const m = String(date.getMonth() + 1).padStart(2, '0'); const d = String(date.getDate()).padStart(2, '0'); return y + '-' + m + '-' + d; }
+    function renderClientDetails(device) { const body = $('client-details-body'); body.replaceChildren(); [['客户端 ID', device.id], ['UUID', device.uuid], ['主机名', device.hostname], ['版本', device.version], ['构建号', device.build_number], ['构建序号', device.build_seq], ['平台', platformLabel(device.platform)], ['状态', device.presence], ['最近心跳', device.last_heartbeat ? new Date(Number(device.last_heartbeat) * 1000).toLocaleString() : '未上报']].forEach(([label, value]) => { const line = document.createElement('div'); line.className = 'details-line'; line.append(textLine('details-label', label), textLine('details-value', detailValue(value))); body.append(line); }); $('ab-identity-warning').classList.toggle('hidden', !device.identity_changed); }
+    function clientLogRange(date) { const start = new Date(date + 'T00:00:00'); const end = new Date(start); end.setDate(end.getDate() + 1); return '&from=' + Math.floor(start.getTime() / 1000) + '&to=' + Math.floor(end.getTime() / 1000); }
+    async function loadClientLogs() { const device = state.detailDevice; if (!device) return; try { const query = '?uuid=' + encodeURIComponent(device.uuid || '') + clientLogRange($('ab-log-date').value || localDateValue()); const [commands, events] = await Promise.all([api('__ADMIN_PATH__/api/update/commands/' + encodeURIComponent(device.id) + query), api('__ADMIN_PATH__/api/update/events/' + encodeURIComponent(device.id) + query)]); const log = $('ab-update-log'); const wasNearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 48; log.replaceChildren(); const rows = [...(commands.data || []).map(item => ({ at: item.created_at, tone: 'command', text: '> ' + (item.action === 'install' ? '立即安装更新' : '立即检查更新') + ' 已下发' + (item.target_version ? ' · 目标 ' + item.target_version + ' · 构建 ' + detailValue(item.target_build_seq) : '') })), ...(events.data || []).map(item => ({ at: item.started_at || item.finished_at, tone: item.status === 'failed' || item.status === 'rollback_failed' ? 'error' : (['installed', 'completed', 'no_update'].includes(item.status) ? 'success' : 'progress'), text: '[' + (item.action || 'EVENT').toUpperCase() + '] ' + (item.status_label || item.status) + ' · ' + (item.from_version || '未知版本') + ' -> ' + (item.to_version || item.command_target_version || '未知版本') + ' · 构建 ' + (item.from_build_seq ?? '未知') + ' -> ' + (item.to_build_seq ?? item.command_target_build_seq ?? '未知') + (item.error_code ? ' · 错误 ' + item.error_code : '') }))].sort((a, b) => Number(a.at || 0) - Number(b.at || 0)); if (!rows.length) log.append(textLine('update-log-empty', '尚无更新日志')); rows.forEach(item => { const line = document.createElement('div'); line.className = 'update-log-line ' + item.tone; line.append(textLine('update-log-time', '[' + new Date(Number(item.at || 0) * 1000).toLocaleTimeString([], { hour12: false }) + ']'), textLine('update-log-message', item.text)); log.append(line); }); if (wasNearBottom || !log.dataset.rendered) log.scrollTop = log.scrollHeight; log.dataset.rendered = 'true'; const active = (commands.data || []).find(item => !['installed', 'completed', 'no_update', 'failed', 'expired', 'rolled_back', 'rollback_failed'].includes(item.status)); $('ab-log-state').textContent = active ? (active.status_label || active.status) : (rows.length ? '已同步' : '暂无日志'); } catch (error) { $('ab-log-state').textContent = '读取失败'; $('ab-update-log').replaceChildren(textLine('update-log-error', '读取失败：' + error.message)); } }
+    async function openClientDetails(peer) { const device = state.devices.find(item => String(item.id) === String(peer.id) && (!peer.uuid || String(item.uuid) === String(peer.uuid))) || state.devices.find(item => String(item.id) === String(peer.id)) || peer; state.detailDevice = device; $('client-details-title').textContent = '客户端详情'; $('client-details-device').textContent = [device.hostname || device.alias || device.id, device.id].filter(Boolean).join(' · '); $('ab-log-date').value = localDateValue(); $('ab-policy-error').textContent = ''; renderClientDetails(device); $('client-details-dialog').showModal(); try { const policy = await api('__ADMIN_PATH__/api/update/policies/' + encodeURIComponent(device.id) + '?uuid=' + encodeURIComponent(device.uuid || '') + '&channel=stable'); $('ab-enable-check-update').checked = Boolean(policy.enable_check_update); $('ab-allow-auto-update').checked = Boolean(policy.allow_auto_update); $('ab-enable-scheduled-update').checked = Boolean(policy.enable_scheduled_update); $('ab-scheduled-hours').value = String(policy.scheduled_update_interval_hours || 5); $('ab-update-mode').value = policy.mode || 'notify'; $('ab-update-channel').value = policy.channel || 'stable'; $('ab-update-version').value = policy.target_version || ''; $('ab-update-build').value = policy.target_build_seq == null ? '' : String(policy.target_build_seq); } catch (error) { $('ab-policy-error').textContent = error.message; } loadClientLogs(); if (window.EventSource && device.uuid) { state.detailStream?.close(); state.detailStream = new EventSource('__ADMIN_PATH__/api/update/events/stream?client_id=' + encodeURIComponent(device.id) + '&client_uuid=' + encodeURIComponent(device.uuid), { withCredentials: true }); state.detailStream.addEventListener('update-log', () => { if (state.detailDevice) loadClientLogs(); }); } if (state.detailTimer) clearInterval(state.detailTimer); state.detailTimer = setInterval(() => { if (!document.hidden && state.detailDevice) { loadClientLogs(); refreshClientDetails(); } }, 2000); }
+    function closeClientDetails() { state.detailStream?.close(); state.detailStream = null; if (state.detailTimer) clearInterval(state.detailTimer); state.detailTimer = null; state.detailDevice = null; $('client-details-dialog').close(); }
+    async function refreshClientDetails() { const device = state.detailDevice; if (!device) return; try { const response = await api('__ADMIN_PATH__/api/devices/' + encodeURIComponent(device.id) + '?uuid=' + encodeURIComponent(device.uuid || '')); const current = (response.data || []).find(item => String(item.uuid || '') === String(device.uuid || '')) || response.data?.[0]; if (current) { state.detailDevice = current; renderClientDetails(current); } else { throw Error('未找到匹配的客户端身份'); } } catch (error) { $('ab-log-state').textContent = '构建信息刷新失败'; $('ab-policy-error').textContent = '构建信息刷新失败：' + (error?.message || '未知错误'); } }
+    async function sendClientUpdate(action) { const device = state.detailDevice; if (!device) return; try { await api('__ADMIN_PATH__/api/update/commands/' + encodeURIComponent(device.id), { method: 'POST', body: JSON.stringify({ uuid: device.uuid, action }) }); $('ab-log-state').textContent = '命令已发送'; await Promise.all([loadClientLogs(), refreshClientDetails()]); } catch (error) { $('ab-log-state').textContent = error.message; } }
+    async function saveClientPolicy() { const device = state.detailDevice; if (!device) return; const build = $('ab-update-build').value.trim(); const hours = Number($('ab-scheduled-hours').value); if (build && !/^\d+$/.test(build)) { $('ab-policy-error').textContent = 'build_seq 必须是非负整数'; return; } if (!Number.isInteger(hours) || hours < 1 || hours > 168) { $('ab-policy-error').textContent = '定时检查间隔必须在 1 到 168 小时之间'; return; } try { await api('__ADMIN_PATH__/api/update/policies/' + encodeURIComponent(device.id), { method: 'PATCH', body: JSON.stringify({ uuid: device.uuid, mode: $('ab-update-mode').value, channel: $('ab-update-channel').value, target_version: $('ab-update-version').value.trim() || null, target_build_seq: build ? Number(build) : null, auto_install: $('ab-update-mode').value === 'auto_install', enable_check_update: $('ab-enable-check-update').checked, allow_auto_update: $('ab-allow-auto-update').checked, enable_scheduled_update: $('ab-enable-scheduled-update').checked, scheduled_update_interval_hours: hours }) }); $('ab-policy-error').textContent = '更新策略已保存'; } catch (error) { $('ab-policy-error').textContent = error.message; } }
+    $('address-import').addEventListener('change', async event => { const file = event.target.files?.[0]; if (!file) return; try { const content = await file.text(); const format = file.name.toLowerCase().endsWith('.json') ? 'json' : 'csv'; const parsed = format === 'json' ? JSON.parse(content) : content; const payload = { format, data: parsed }; const data = await api(targetUrl('__ADMIN_PATH__/api/address-book/import/preview'), { method: 'POST', body: JSON.stringify(payload) }); const plan = data.plan || {}; openConfirm('确认导入通讯录', '预览：' + (plan.add || []).length + ' 条新增、' + (plan.already_present || []).length + ' 条已存在、' + (plan.invalid || []).length + ' 条无效。确认应用？', '应用导入', async () => { await api(targetUrl('__ADMIN_PATH__/api/address-book/import/apply'), { method: 'POST', body: JSON.stringify(payload) }); await load({ quiet: true }); setFeedback('通讯录导入已应用', 'success'); }); } catch (error) { setFeedback(error.message, 'error'); } finally { event.target.value = ''; } });
     $('address-prev').addEventListener('click', () => { if (state.page > 1) { state.page -= 1; load(); } }); $('address-next').addEventListener('click', () => { state.page += 1; load(); });
+    $('peer-id').addEventListener('change', fillClientFromLibrary);
+    $('client-details-close').addEventListener('click', () => closeClientDetails());
+    $('client-details-dialog').addEventListener('close', () => { state.detailStream?.close(); state.detailStream = null; if (state.detailTimer) clearInterval(state.detailTimer); state.detailTimer = null; state.detailDevice = null; });
+    $('ab-log-today').addEventListener('click', () => { $('ab-log-date').value = localDateValue(); loadClientLogs(); });
+    $('ab-log-date').addEventListener('change', loadClientLogs);
+    $('ab-check-update').addEventListener('click', () => sendClientUpdate('check'));
+    $('ab-install-update').addEventListener('click', () => sendClientUpdate('install'));
+    $('ab-policy-save').addEventListener('click', saveClientPolicy);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) { load({ quiet: true }); if (state.detailDevice) loadClientLogs(); } });
+    setInterval(() => { if (!document.hidden) { load({ quiet: true }); if (state.detailDevice) loadClientLogs(); } }, 5000);
 
-    $('switch-address-book-owner').addEventListener('click', switchOwner); $('address-book-owner').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); switchOwner(); } });
+    $('peer-id').addEventListener('input', fillClientFromLibrary);
     $('batch-action').addEventListener('change', updateBatchControls); $('apply-batch').addEventListener('click', applyBatch); $('select-all-peers').addEventListener('change', event => { state.peers.forEach(peer => event.target.checked ? state.selected.add(String(peer.id)) : state.selected.delete(String(peer.id))); renderPeers(); });
     api('__ADMIN_PATH__/api/session').then(async data => {
       state.csrf = data.csrf || ''; state.actor = data.user || null;
       if (!state.actor) { location.href = '__ADMIN_PATH__'; return; }
       $('who').textContent = '当前：' + state.actor.username; $('avatar').textContent = String(state.actor.username || 'A').slice(0, 1).toUpperCase();
-      const options = await api('__ADMIN_PATH__/api/address-book/assignment-options'); state.users = Array.isArray(options.users) ? options.users : [];
-      const requested = new URL(location.href).searchParams.get('user_id'); state.targetUser = state.users.find(user => String(user.id) === requested) || state.users.find(user => Number(user.id) === Number(state.actor.id)) || state.actor;
+      state.users = [state.actor]; state.targetUser = state.actor;
+      try { let page = 1; let total = 0; const devices = []; do { const batch = await api('__ADMIN_PATH__/api/devices?page=' + page + '&pageSize=200'); const rows = Array.isArray(batch.data) ? batch.data : []; devices.push(...rows); total = Number(batch.total) || devices.length; if (!rows.length) break; page += 1; } while (devices.length < total); state.devices = devices; renderClientLibrary(); } catch (_) { state.devices = []; }
       const presence = new URL(location.href).searchParams.get('presence'); if (['online','recent','offline','unreported'].includes(presence)) { state.presence = presence; $('address-presence-filter').value = presence; }
       renderUsers(); load();
     }).catch(() => { location.href = '__ADMIN_PATH__'; });

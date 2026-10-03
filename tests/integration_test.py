@@ -2290,6 +2290,15 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(counts, (0, 0, 1))
         self.assertFalse(any(p["id"] == peer_id for p in deleted_book["peers"]))
 
+    def test_21b_address_book_rejects_invalid_uuid_identity(self):
+        csrf = self.admin_csrf()
+        for value in [123, "", "x" * 257, "bad\u0000uuid"]:
+            self.client.json(
+                "POST", "/?s=/ops-x9/api/address-book/peers",
+                {"id": "invalid-uuid-" + uuid.uuid4().hex[:8], "uuid": value},
+                {"X-CSRF-Token": csrf}, expected=(422,),
+            )
+
     def test_22_admin_address_book_tags_rename_exact_values_in_all_stores(self):
         csrf = self.admin_csrf()
         peer_id = "admin-tag-peer"
@@ -2300,6 +2309,12 @@ class IntegrationTest(unittest.TestCase):
             {"id": peer_id, "alias": "tag-peer", "tags": ["ops", "ops-prod"], "note": "ops must remain in free text"},
             {"X-CSRF-Token": csrf}, expected=(201,),
         )
+        db = sqlite3.connect(self.db)
+        db.execute(
+            "INSERT INTO rustdesk_peers(uid,id,username,hostname,alias,platform,tags,hash) VALUES (1,?,?,?,?,?,?,?)",
+            ("legacy-tag-only", "legacy", "legacy-host", "legacy", "linux", "ops", "legacy-hash"),
+        )
+        db.commit(); db.close()
         self.client.json(
             "PATCH", "/?s=/ops-x9/api/address-book/tags/ops",
             {"name": "core", "color": 4278255360}, {"X-CSRF-Token": csrf},
@@ -2311,6 +2326,7 @@ class IntegrationTest(unittest.TestCase):
             (peer_id,),
         ).fetchone()[0])
         legacy_tags = db.execute("SELECT tags FROM rustdesk_peers WHERE uid=1 AND id=?", (peer_id,)).fetchone()[0]
+        legacy_only_tags = db.execute("SELECT tags FROM rustdesk_peers WHERE uid=1 AND id='legacy-tag-only'").fetchone()[0]
         exact_book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=1").fetchone()[0])
         exact_peer = next(p for p in exact_book["peers"] if p["id"] == peer_id)
         tag_rows = db.execute(
@@ -2320,6 +2336,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(set(profile_payload["tags"]), {"core", "ops-prod"})
         self.assertEqual(profile_payload["note"], "ops must remain in free text")
         self.assertEqual(set(legacy_tags.split(",")), {"core", "ops-prod"})
+        self.assertEqual(legacy_only_tags, "core")
         self.assertEqual(set(exact_peer["tags"]), {"core", "ops-prod"})
         self.assertIn(("core", 4278255360), tag_rows)
         self.assertNotIn(("ops", 4283215696), tag_rows)
@@ -2396,123 +2413,174 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(len(second["data"]), 5)
         self.assertEqual(len({row["id"] for row in first["data"] + second["data"]}), 205)
 
-    def test_25b_cross_user_address_book_crud_batch_counts_and_scope(self):
+    def test_25c_address_book_batch_reports_exact_changed_and_skipped_counts(self):
         csrf = self.admin_csrf()
         suffix = uuid.uuid4().hex[:8]
-        _, source_created, _ = self.client.json(
-            "POST", "/?s=/ops-x9/api/users",
-            {"username": f"book-source-{suffix}", "password": "1", "enabled": True, "address_book_scope": "self"},
-            {"X-CSRF-Token": csrf}, expected=(201,),
+        peer_ids = [f"batch-stats-{suffix}-{index}" for index in range(3)]
+        for index, peer_id in enumerate(peer_ids):
+            self.client.json(
+                "POST", "/?s=/ops-x9/api/address-book/peers",
+                {"id": peer_id, "alias": f"stats-{index}", "tags": ["existing"] if index == 0 else []},
+                {"X-CSRF-Token": csrf}, expected=(201,),
+            )
+
+        _, first, _ = self.client.json(
+            "POST", "/?s=/ops-x9/api/address-book/batch",
+            {"action": "add_tags", "peer_ids": peer_ids, "tags": ["managed"]},
+            {"X-CSRF-Token": csrf},
         )
-        _, target_created, _ = self.client.json(
-            "POST", "/?s=/ops-x9/api/users",
-            {"username": f"book-target-{suffix}", "password": "1", "enabled": True, "address_book_scope": "self"},
-            {"X-CSRF-Token": csrf}, expected=(201,),
+        self.assertEqual(first["requested"], 3)
+        self.assertEqual(first["updated"], 3)
+        self.assertEqual(first["skipped_existing"], 0)
+        self.assertEqual(first["changed"], 3)
+
+        _, second, _ = self.client.json(
+            "POST", "/?s=/ops-x9/api/address-book/batch",
+            {"action": "add_tags", "peer_ids": peer_ids, "tags": ["managed"]},
+            {"X-CSRF-Token": csrf},
         )
-        source_uid, target_uid = int(source_created["id"]), int(target_created["id"])
-        self.client.json("PATCH", f"/?s=/ops-x9/api/users/{source_uid}",
-            {"is_admin": True, "address_book_scope": "self"}, {"X-CSRF-Token": csrf})
-        online_id, offline_id, fresh_id = f"book-online-{suffix}", f"book-offline-{suffix}", f"book-fresh-{suffix}"
-        self.client.json("POST", "/?s=/api/heartbeat", {"id": online_id, "uuid": online_id + "-uuid", "conns": []})
-        source_query = f"&user_id={source_uid}"
+        self.assertEqual(second["requested"], 3)
+        self.assertEqual(second["updated"], 0)
+        self.assertEqual(second["skipped_existing"], 3)
+        self.assertEqual(second["changed"], 0)
 
-        self.client.json("POST", "/?s=/ops-x9/api/address-book/tags" + source_query,
-            {"name": "old", "color": 4282668390}, {"X-CSRF-Token": csrf}, expected=(201,))
-        self.client.json("POST", "/?s=/ops-x9/api/address-book/tags" + source_query,
-            {"name": "managed", "color": 4283215696}, {"X-CSRF-Token": csrf}, expected=(201,))
-
-        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers" + source_query,
-            {"id": online_id, "alias": "在线入口", "tags": ["ops"], "note": "source", "future": {"keep": 1}},
-            {"X-CSRF-Token": csrf}, expected=(201,))
-        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers" + source_query,
-            {"id": offline_id, "alias": "离线入口", "tags": ["old"], "future": {"keep": 2}},
-            {"X-CSRF-Token": csrf}, expected=(201,))
-        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers" + source_query,
-            {"id": fresh_id, "alias": "新复制入口", "tags": ["fresh-tag"], "future": {"keep": 3}},
-            {"X-CSRF-Token": csrf}, expected=(201,))
-        self.client.json("POST", f"/?s=/ops-x9/api/address-book/peers&user_id={target_uid}",
-            {"id": online_id, "alias": "目标在线别名", "tags": ["target-online"], "note": "target online", "future": {"target": 1}},
-            {"X-CSRF-Token": csrf}, expected=(201,))
-        self.client.json("POST", f"/?s=/ops-x9/api/address-book/peers&user_id={target_uid}",
-            {"id": offline_id, "alias": "目标离线别名", "tags": ["target-offline"], "note": "target offline", "future": {"target": 2}},
-            {"X-CSRF-Token": csrf}, expected=(201,))
-        self.client.json("PATCH", f"/?s=/ops-x9/api/address-book/favorites/{online_id}&user_id={target_uid}",
-            {"favorite": True}, {"X-CSRF-Token": csrf})
-        self.client.json("PATCH", f"/?s=/ops-x9/api/address-book/peers/{online_id}" + source_query,
-            {"alias": "在线入口-更新"}, {"X-CSRF-Token": csrf})
-        self.client.json("PATCH", f"/?s=/ops-x9/api/address-book/favorites/{online_id}" + source_query,
-            {"favorite": True}, {"X-CSRF-Token": csrf})
-        self.client.json("POST", "/?s=/ops-x9/api/address-book/tags" + source_query,
-            {"name": "temp-tag", "color": 4283215696}, {"X-CSRF-Token": csrf}, expected=(201,))
-        self.client.json("PATCH", "/?s=/ops-x9/api/address-book/tags/temp-tag" + source_query,
-            {"name": "renamed-tag", "color": 4292030255}, {"X-CSRF-Token": csrf})
-        self.client.json("DELETE", "/?s=/ops-x9/api/address-book/tags/renamed-tag" + source_query,
-            None, {"X-CSRF-Token": csrf})
-        for payload in (
-            {"action": "add_tags", "peer_ids": [online_id, offline_id], "tags": ["managed"]},
-            {"action": "remove_tags", "peer_ids": [offline_id], "tags": ["old"]},
-            {"action": "copy", "peer_ids": [online_id], "target_user_id": target_uid},
-            {"action": "move", "peer_ids": [offline_id], "target_user_id": target_uid},
-            {"action": "copy", "peer_ids": [fresh_id], "target_user_id": target_uid},
-        ):
-            self.client.json("POST", "/?s=/ops-x9/api/address-book/batch" + source_query, payload, {"X-CSRF-Token": csrf})
-
-        _, source_listing, _ = self.client.json("GET", f"/?s=/ops-x9/api/address-book&user_id={source_uid}&page=1&pageSize=20")
-        _, target_listing, _ = self.client.json("GET", f"/?s=/ops-x9/api/address-book&user_id={target_uid}&page=1&pageSize=20")
-        self.assertEqual({row["id"] for row in source_listing["data"]}, {online_id, fresh_id})
-        self.assertEqual({row["id"] for row in target_listing["data"]}, {online_id, offline_id, fresh_id})
-        copied = next(row for row in target_listing["data"] if row["id"] == online_id)
-        moved = next(row for row in target_listing["data"] if row["id"] == offline_id)
-        self.assertEqual(copied["future"], {"target": 1})
-        self.assertEqual(copied["alias"], "目标在线别名")
-        self.assertEqual(copied["tags"], ["target-online"])
-        self.assertTrue(copied["favorite"])
-        self.assertEqual(moved["future"], {"target": 2})
-        self.assertEqual(moved["alias"], "目标离线别名")
-        self.assertEqual(moved["tags"], ["target-offline"])
-        self.assertEqual(next(row for row in target_listing["data"] if row["id"] == fresh_id)["future"], {"keep": 3})
-
-        _, users, _ = self.client.json("GET", "/?s=/ops-x9/api/users&q=book-&page=1&pageSize=50")
-        indexed_users = {row["id"]: row for row in users["data"]}
-        self.assertEqual((indexed_users[source_uid]["address_book_count"], indexed_users[source_uid]["address_book_online_count"]), (2, 1))
-        self.assertEqual((indexed_users[target_uid]["address_book_count"], indexed_users[target_uid]["address_book_online_count"]), (3, 1))
+        _, removed, _ = self.client.json(
+            "POST", "/?s=/ops-x9/api/address-book/batch",
+            {"action": "remove", "peer_ids": [peer_ids[0], peer_ids[1]]},
+            {"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(removed["requested"], 2)
+        self.assertEqual(removed["removed"], 2)
+        self.assertEqual(removed["changed"], 2)
 
         db = sqlite3.connect(self.db)
-        source_guid = db.execute("SELECT guid FROM ab_profiles WHERE uid=? AND personal=1", (source_uid,)).fetchone()[0]
-        target_guid = db.execute("SELECT guid FROM ab_profiles WHERE uid=? AND personal=1", (target_uid,)).fetchone()[0]
-        source_profile = json.loads(db.execute("SELECT payload FROM ab_profile_peers WHERE guid=? AND id=?", (source_guid, online_id)).fetchone()[0])
-        target_profile = json.loads(db.execute("SELECT payload FROM ab_profile_peers WHERE guid=? AND id=?", (target_guid, online_id)).fetchone()[0])
-        source_book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=?", (source_uid,)).fetchone()[0])
-        target_book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=?", (target_uid,)).fetchone()[0])
-        self.assertEqual(source_profile["future"], {"keep": 1})
-        self.assertEqual(target_profile["future"], {"target": 1})
-        self.assertEqual(db.execute("SELECT alias,tags FROM rustdesk_peers WHERE uid=? AND id=?", (source_uid, online_id)).fetchone(), ("在线入口-更新", "ops,managed"))
-        self.assertEqual({peer["id"] for peer in source_book["peers"]}, {online_id, fresh_id})
-        self.assertEqual({peer["id"] for peer in target_book["peers"]}, {online_id, offline_id, fresh_id})
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM admin_peer_favorites WHERE uid=? AND id=?", (source_uid, online_id)).fetchone()[0], 1)
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM admin_peer_favorites WHERE uid=? AND id=?", (target_uid, online_id)).fetchone()[0], 1)
-        self.assertIn(("managed", 4283215696), set(db.execute("SELECT name,color FROM ab_profile_tags WHERE guid=?", (source_guid,))))
-        self.assertIn("managed", {row[0] for row in db.execute("SELECT tag FROM rustdesk_tags WHERE uid=?", (source_uid,))})
-        self.assertIn("managed", set(source_book["tags"]))
-        self.assertIn(("old", 4282668390), set(db.execute("SELECT name,color FROM ab_profile_tags WHERE guid=?", (source_guid,))))
-        self.assertIn("old", {row[0] for row in db.execute("SELECT tag FROM rustdesk_tags WHERE uid=?", (source_uid,))})
-        self.assertIn("old", set(source_book["tags"]))
-        self.assertIn("fresh-tag", {row[0] for row in db.execute("SELECT name FROM ab_profile_tags WHERE guid=?", (target_guid,))})
-        self.assertIn("fresh-tag", {row[0] for row in db.execute("SELECT tag FROM rustdesk_tags WHERE uid=?", (target_uid,))})
-        self.assertIn("fresh-tag", set(target_book["tags"]))
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM rustdesk_tags WHERE uid=? AND tag IN ('temp-tag','renamed-tag')", (source_uid,)).fetchone()[0], 0)
+        remaining = db.execute(
+            "SELECT id,tags FROM rustdesk_peers WHERE uid=1 AND id IN (?,?,?) ORDER BY id", peer_ids
+        ).fetchall()
         db.close()
+        self.assertEqual(remaining, [(peer_ids[2], "managed")])
 
-        scoped = HttpClient(self.url)
-        _, scoped_session, _ = scoped.json("GET", "/?s=/ops-x9/api/session")
-        _, scoped_login, _ = scoped.json("POST", "/?s=/ops-x9/api/login",
-            {"username": f"book-source-{suffix}", "password": "1"}, {"X-CSRF-Token": scoped_session["csrf"]})
-        scoped.json("GET", f"/?s=/ops-x9/api/address-book&user_id={target_uid}", expected=(403,))
-        scoped.json("POST", f"/?s=/ops-x9/api/address-book/batch&user_id={target_uid}",
-            {"action": "remove", "peer_ids": [online_id]}, {"X-CSRF-Token": scoped_login["csrf"]}, expected=(403,))
-        scoped.json("PATCH", f"/?s=/ops-x9/api/users/{source_uid}",
-            {"address_book_scope": "all"}, {"X-CSRF-Token": scoped_login["csrf"]}, expected=(403,))
-        self.client.json("DELETE", f"/?s=/ops-x9/api/users/{source_uid}", None, {"X-CSRF-Token": csrf})
+    def test_25d_address_book_export_filters_and_import_round_trip_match_sqlite(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:8]
+        self.client.json(
+            "POST", "/?s=/ops-x9/api/address-book/import/preview",
+            {"format": "json", "data": {"tags": [{"name": "invalid-color", "color": -1}], "peers": []}},
+            {"X-CSRF-Token": csrf}, expected=(422,),
+        )
+        online_id, offline_id = f"export-online-{suffix}", f"export-offline-{suffix}"
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": online_id, "uuid": online_id + "-uuid", "conns": []})
+        self.client.json("POST", "/?s=/api/sysinfo", {
+            "id": online_id, "uuid": online_id + "-uuid", "hostname": "export-online-host",
+            "version": "9.9.1", "build_number": "9001", "build_seq": 9001001,
+            "platform": "windows", "distribution": "desktop",
+        })
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers", {
+            "id": online_id, "alias": "在线导出", "tags": ["export-tag"], "note": "online-note",
+        }, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers", {
+            "id": offline_id, "alias": "离线导出", "tags": ["other-tag"], "note": "offline-note",
+        }, {"X-CSRF-Token": csrf}, expected=(201,))
+        self.client.json("PATCH", f"/?s=/ops-x9/api/address-book/favorites/{online_id}", {"favorite": True}, {"X-CSRF-Token": csrf})
+
+        _, filtered, _ = self.client.request(
+            "GET", f"/?s=/ops-x9/api/address-book/export&format=json&user_id=1&q={online_id}&tag=export-tag&favorite=1&presence=online"
+        )
+        self.assertEqual([peer["id"] for peer in filtered["peers"]], [online_id])
+        self.assertEqual(filtered["peers"][0]["build_seq"], 9001001)
+        self.assertEqual(filtered["peers"][0]["build_number"], "9001")
+        self.assertIn("uuid", filtered["peers"][0])
+
+        _, exported_book, _ = self.client.request("GET", "/?s=/ops-x9/api/address-book/export&format=json&user_id=1")
+        self.assertTrue(exported_book["tags"] and isinstance(exported_book["tags"][0], dict))
+        _, exported_preview, _ = self.client.json(
+            "POST", "/?s=/ops-x9/api/address-book/import/preview",
+            {"format": "json", "data": exported_book}, {"X-CSRF-Token": csrf}, expected=(200,),
+        )
+        self.assertIn("tags", exported_preview["plan"])
+        _, exported_applied, _ = self.client.json(
+            "POST", "/?s=/ops-x9/api/address-book/import/apply",
+            {"format": "json", "data": exported_book}, {"X-CSRF-Token": csrf}, expected=(200,),
+        )
+        self.assertGreaterEqual(exported_applied["imported"], 2)
+
+        imported_id = f"imported-{suffix}"
+        import_book = {
+            "tags": ["imported-tag"],
+            "peers": [{"id": imported_id, "alias": "导入客户端", "tags": ["imported-tag"], "note": "import-note", "future": {"keep": True}}],
+        }
+        _, preview, _ = self.client.json(
+            "POST", "/?s=/ops-x9/api/address-book/import/preview",
+            {"format": "json", "data": import_book}, {"X-CSRF-Token": csrf},
+        )
+        self.assertEqual([peer["id"] for peer in preview["plan"]["add"]], [imported_id])
+        self.assertEqual(preview["plan"]["already_present"], [])
+        _, applied, _ = self.client.json(
+            "POST", "/?s=/ops-x9/api/address-book/import/apply",
+            {"format": "json", "data": import_book}, {"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(applied["imported"], 1)
+        db = sqlite3.connect(self.db)
+        profile_payload = db.execute(
+            "SELECT p.payload FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=1 AND a.personal=1 AND p.id=?",
+            (imported_id,),
+        ).fetchone()[0]
+        legacy_row = db.execute("SELECT alias,tags FROM rustdesk_peers WHERE uid=1 AND id=?", (imported_id,)).fetchone()
+        legacy_tags = db.execute("SELECT tag FROM rustdesk_tags WHERE uid=1 ORDER BY tag").fetchall()
+        exact_book = json.loads(db.execute("SELECT payload FROM address_books WHERE uid=1").fetchone()[0])
+        db.close()
+        self.assertEqual(json.loads(profile_payload)["future"], {"keep": True})
+        self.assertEqual(legacy_row, ("导入客户端", "imported-tag"))
+        self.assertEqual(legacy_tags, [("imported-tag",)])
+        self.assertEqual(next(peer for peer in exact_book["peers"] if peer["id"] == imported_id)["note"], "import-note")
+
+    def test_25e_address_book_marks_identity_changed_for_same_id_with_multiple_uuids(self):
+        csrf = self.admin_csrf()
+        device_id = "address-book-identity-change"
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": "identity-old", "conns": []})
+        self.client.json("POST", "/?s=/api/sysinfo", {"id": device_id, "uuid": "identity-old", "hostname": "old-host", "version": "1.0.0"})
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": "identity-new", "conns": []})
+        self.client.json("POST", "/?s=/api/sysinfo", {"id": device_id, "uuid": "identity-new", "hostname": "new-host", "version": "2.0.0"})
+        self.client.json("POST", "/?s=/ops-x9/api/address-book/peers", {
+            "id": device_id, "uuid": "identity-old", "alias": "身份变更设备",
+        }, {"X-CSRF-Token": csrf}, expected=(201,))
+        _, listing, _ = self.client.json("GET", f"/?s=/ops-x9/api/address-book&q={device_id}&page=1&pageSize=20")
+        peer = next(row for row in listing["data"] if row["id"] == device_id)
+        self.assertEqual(peer["uuid"], "identity-old")
+        self.assertTrue(peer["identity_changed"])
+        self.assertEqual(peer["hostname"], "old-host")
+
+    def test_25f_all_admin_address_book_api_is_personal_but_device_assignment_is_cross_user(self):
+        csrf = self.admin_csrf()
+        suffix = uuid.uuid4().hex[:8]
+        _, created, _ = self.client.json(
+            "POST", "/?s=/ops-x9/api/users",
+            {"username": f"boundary-user-{suffix}", "password": "1", "enabled": True, "address_book_scope": "self"},
+            {"X-CSRF-Token": csrf}, expected=(201,),
+        )
+        target_uid = int(created["id"])
+        device_id, device_uuid = f"boundary-device-{suffix}", f"boundary-uuid-{suffix}"
+        self.client.json("POST", "/?s=/api/heartbeat", {"id": device_id, "uuid": device_uuid, "conns": []})
+        self.client.json("POST", "/?s=/api/sysinfo", {"id": device_id, "uuid": device_uuid, "hostname": "boundary-host"})
+
+        # The Web address-book API is always scoped to the authenticated administrator,
+        # including a full-scope administrator. Cross-user assignment stays in devices API.
+        self.client.json("GET", f"/?s=/ops-x9/api/address-book&user_id={target_uid}", expected=(403,))
+        self.client.json("POST", f"/?s=/ops-x9/api/address-book/peers&user_id={target_uid}",
+                         {"id": device_id}, {"X-CSRF-Token": csrf}, expected=(403,))
+        self.client.json("POST", f"/?s=/ops-x9/api/address-book/batch&user_id={target_uid}",
+                         {"action": "remove", "peer_ids": [device_id]}, {"X-CSRF-Token": csrf}, expected=(403,))
+
+        self.client.json("POST", "/?s=/ops-x9/api/devices/address-book",
+                         {"devices": [{"id": device_id, "uuid": device_uuid}], "user_ids": [target_uid], "mode": "add"},
+                         {"X-CSRF-Token": csrf})
+        db = sqlite3.connect(self.db)
+        assigned = db.execute(
+            "SELECT COUNT(*) FROM ab_profile_peers p JOIN ab_profiles a ON a.guid=p.guid WHERE a.uid=? AND p.id=?",
+            (target_uid, device_id),
+        ).fetchone()[0]
+        db.close()
+        self.assertEqual(assigned, 1)
         self.client.json("DELETE", f"/?s=/ops-x9/api/users/{target_uid}", None, {"X-CSRF-Token": csrf})
 
     def test_26_device_inventory_uses_id_and_uuid_as_identity(self):

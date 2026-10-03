@@ -361,6 +361,86 @@ test('address book uses inventory columns, telemetry and an explicit refresh', a
   expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
 });
 
+test('address-book client details reuses update controls and refreshes build identity', async ({ page, request }) => {
+  test.skip(!process.env.RUSTDESK_API_CONTAINER, 'requires persisted SQLite assertions inside the API container');
+  const deviceId = `address-detail-${Date.now().toString(36)}`;
+  const uuid = `${deviceId}-uuid`;
+  const oldBuild = Date.now();
+  const newBuild = oldBuild + 1;
+  await expect((await request.post('/api/heartbeat', { data: { id: deviceId, uuid, ver: 150, conns: [] } })).ok()).toBeTruthy();
+  await expect((await request.post('/api/sysinfo', { data: {
+    id: deviceId, uuid, hostname: `${deviceId}-host`, version: '2.0.0', build_number: '20261003.1', build_seq: oldBuild,
+    product: 'rustdesk-yan', edition: 'standard', channel: 'stable', platform: 'windows', arch: 'x86_64', package_kind: 'exe', install_mode: 'installed',
+  } })).ok()).toBeTruthy();
+  await loginAdmin(page);
+  await page.goto(`${adminPath}/address-book`);
+  await page.getByRole('button', { name: '新增客户端' }).click();
+  await page.locator('#peer-id').fill(deviceId);
+  await page.locator('#peer-alias').fill('更新详情客户端');
+  await page.getByRole('dialog', { name: '新增客户端' }).getByRole('button', { name: '新增客户端' }).click();
+  const row = page.locator(`[data-peer-id="${deviceId}"]`);
+  await expect(row).toBeVisible();
+  await row.getByRole('button', { name: '查看客户端详情' }).click();
+  const dialog = page.locator('#client-details-dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText('2.0.0');
+  await expect(dialog).toContainText('20261003.1');
+  await expect(dialog).toContainText(String(oldBuild));
+  await page.evaluate(async ({ adminPath, newBuild }) => {
+    const session = await (await fetch(`${adminPath}/api/session`)).json();
+    const asset = { primary: `https://download.yan.life/rustdesk/stable/address-book-${newBuild}/rustdesk.exe`, mirrors: [], size: 12, sha256: 'a'.repeat(64), signature: btoa('s'.repeat(64)), signature_key_id: 'yan-release-2026' };
+    const response = await fetch(`${adminPath}/api/update/releases`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': session.csrf }, body: JSON.stringify({ version: '2.1.0', build_seq: newBuild, channel: 'stable', manifest: { product: 'rustdesk-yan', edition: 'multi', source_commit: 'address-book-e2e', targets: { 'windows-x86_64-exe-standard': asset, 'windows-x86_64-msi-standard': { ...asset, primary: `https://download.yan.life/rustdesk/stable/address-book-${newBuild}/rustdesk.msi` } } } }) });
+    if (!response.ok) throw new Error(await response.text());
+  }, { adminPath, newBuild });
+  await dialog.locator('#ab-enable-check-update').check();
+  await dialog.locator('#ab-allow-auto-update').check();
+  await dialog.locator('#ab-enable-scheduled-update').check();
+  await dialog.locator('#ab-scheduled-hours').fill('7');
+  await dialog.locator('#ab-update-channel').selectOption('stable');
+  await dialog.locator('#ab-update-version').fill('2.1.0');
+  await dialog.locator('#ab-update-build').fill(String(newBuild));
+  await dialog.locator('#ab-policy-save').click();
+  await expect(dialog.locator('#ab-policy-error')).toContainText('已保存');
+  const policy = await (await page.request.get(`${adminPath}/api/update/policies/${encodeURIComponent(deviceId)}?uuid=${encodeURIComponent(uuid)}`)).json();
+  expect(policy).toMatchObject({ enable_check_update: true, allow_auto_update: true, enable_scheduled_update: true, scheduled_update_interval_hours: 7, channel: 'stable', target_version: '2.1.0', target_build_seq: newBuild });
+
+  await dialog.getByRole('button', { name: '立即检查更新' }).click();
+  await dialog.getByRole('button', { name: '立即安装更新' }).click();
+  const commandRows = updateCommandSqlSnapshot(deviceId, uuid);
+  expect(commandRows.filter(command => command.action === 'check').length).toBeGreaterThanOrEqual(2);
+  expect(commandRows.filter(command => command.action === 'install')).toHaveLength(1);
+  recordLatestUpdateLifecycle(deviceId, uuid, 'check', [{ status: 'completed', from_version: '2.0.0', from_build_seq: oldBuild, to_version: '2.1.0', to_build_seq: newBuild, finished: true }]);
+  recordLatestUpdateLifecycle(deviceId, uuid, 'install', [{ status: 'installing', from_version: '2.0.0', from_build_seq: oldBuild, to_version: '2.1.0', to_build_seq: newBuild }]);
+  await expect(dialog.locator('#ab-update-log')).toContainText('2.0.0', { timeout: 5000 });
+  await expect(dialog.locator('#ab-update-log')).toContainText(`构建 ${oldBuild} -> ${newBuild}`);
+  expect(await dialog.locator('#ab-update-log').evaluate(node => node.clientHeight > 0 && node.scrollHeight >= node.clientHeight)).toBeTruthy();
+
+  const historical = new Date(Date.now() - 86400000);
+  const historicalValue = [historical.getFullYear(), String(historical.getMonth() + 1).padStart(2, '0'), String(historical.getDate()).padStart(2, '0')].join('-');
+  recordLatestUpdateLifecycle(deviceId, uuid, 'install', [{ status: 'completed', from_version: '1.9.0', from_build_seq: oldBuild - 1, to_version: '2.0.0', to_build_seq: oldBuild, error_code: 'address_book_history', finished: true }], Math.floor(historical.getTime() / 1000) + 3600);
+  await expect(dialog.locator('#ab-update-log')).not.toContainText('address_book_history');
+  await dialog.locator('#ab-log-date').fill(historicalValue);
+  await expect(dialog.locator('#ab-update-log')).toContainText('address_book_history', { timeout: 5000 });
+  await dialog.locator('#ab-log-today').click();
+  await expect(dialog.locator('#ab-update-log')).not.toContainText('address_book_history', { timeout: 5000 });
+
+  await expect((await request.post('/api/sysinfo', { data: {
+    id: deviceId, uuid, hostname: `${deviceId}-host`, version: '2.1.0', build_number: '20261003.2', build_seq: newBuild,
+    product: 'rustdesk-yan', edition: 'standard', channel: 'stable', platform: 'windows', arch: 'x86_64', package_kind: 'exe', install_mode: 'installed',
+  } })).ok()).toBeTruthy();
+  await expect(dialog.locator('#client-details-body')).toContainText('20261003.2', { timeout: 5000 });
+  await expect(dialog.locator('#client-details-body')).toContainText(String(newBuild));
+  const refreshRoute = new RegExp(`${adminPath.replaceAll('/', '\\/')}\\/api\\/devices\\/${encodeURIComponent(deviceId)}\\?uuid=`);
+  await page.route(refreshRoute, route => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'simulated refresh failure' }) }));
+  await page.waitForTimeout(2300);
+  await expect(dialog.locator('#ab-policy-error')).toContainText('构建信息刷新失败');
+  await page.unroute(refreshRoute);
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
+  await dialog.locator('#client-details-close').click();
+  await expect(dialog).toBeHidden();
+});
+
 test('address-book search queued during the initial load wins over the stale response', async ({ page }) => {
   const suffix = Date.now().toString(36);
   const matchingId = `address-race-${suffix}`;
@@ -493,7 +573,7 @@ test('client details edits a per-device update policy and persists after reload'
 test('selected clients can be removed in bulk after confirmation', async ({ page, request }) => {
   const suffix = Date.now().toString(36);
   const ids = [`batch-remove-ui-${suffix}-1`, `batch-remove-ui-${suffix}-2`];
-  await Promise.all(ids.map(id => reportClient(request, id)));
+  for (const id of ids) await reportClient(request, id);
   await loginAdmin(page);
   await page.goto(`${adminPath}/devices`);
   await page.locator('#q').fill(`batch-remove-ui-${suffix}`);
@@ -1005,78 +1085,33 @@ test('personal address book manages peers tags favorites and confirmation dialog
   expect(errors).toEqual([]);
 });
 
-test('user address-book shortcut and batch actions persist for the selected user', async ({ page, request }) => {
+test('address-book API stays personal while device inventory handles cross-user assignment', async ({ page, request }) => {
   const suffix = Date.now().toString(36);
-  const sourceName = `e2e-source-${suffix}`;
   const targetName = `e2e-target-${suffix}`;
-  const firstId = `e2e-first-${suffix}`;
-  const secondId = `e2e-second-${suffix}`;
+  const deviceId = `e2e-assigned-${suffix}`;
   const errors = collectPageErrors(page);
-  await reportClient(request, firstId);
-  await reportClient(request, secondId);
+  await reportClient(request, deviceId);
   await loginAdmin(page);
   const session = await page.request.get(`${adminPath}/api/session`);
   const { csrf } = await session.json();
-  const sourceResponse = await page.request.post(`${adminPath}/api/users`, { headers: { 'X-CSRF-Token': csrf }, data: { username: sourceName, password: '1', enabled: true } });
   const targetResponse = await page.request.post(`${adminPath}/api/users`, { headers: { 'X-CSRF-Token': csrf }, data: { username: targetName, password: '1', enabled: true } });
-  const sourceId = (await sourceResponse.json()).id;
   const targetId = (await targetResponse.json()).id;
-  for (const id of [firstId, secondId]) {
-    expect((await page.request.post(`${adminPath}/api/address-book/peers?user_id=${sourceId}`, {
-      headers: { 'X-CSRF-Token': csrf }, data: { id, alias: `${id}-alias`, tags: [] },
-    })).ok()).toBeTruthy();
-  }
+  expect((await page.request.get(`${adminPath}/api/address-book?user_id=${targetId}`)).status()).toBe(403);
+  expect((await page.request.post(`${adminPath}/api/address-book/peers?user_id=${targetId}`, {
+    headers: { 'X-CSRF-Token': csrf }, data: { id: deviceId },
+  })).status()).toBe(403);
 
-  await page.reload();
-  await page.locator('#q').fill(sourceName);
+  await page.goto(`${adminPath}/devices`);
+  await page.locator('#q').fill(deviceId);
   await page.getByRole('button', { name: '搜索' }).click();
-  const userRow = page.locator('tbody tr').filter({ hasText: sourceName });
-  await expect(userRow.getByRole('link', { name: '2 个客户端' })).toBeVisible();
-  await userRow.getByRole('link', { name: '2 个客户端' }).click();
-  await expect(page).toHaveURL(new RegExp(`address-book\\?user_id=${sourceId}`));
-  await expect(page.locator('#address-book-owner')).toHaveValue(sourceName);
-  await expect(page.locator('#address-book-rows tr')).toHaveCount(2);
-
-  await page.locator(`[data-peer-id="${firstId}"] input[type="checkbox"]`).check();
-  await page.locator(`[data-peer-id="${secondId}"] input[type="checkbox"]`).check();
-  await page.locator('#batch-action').selectOption('add_tags');
-  await page.locator('#batch-tags').fill('批量标签');
-  await page.getByRole('button', { name: '应用批量操作' }).click();
-  await expect(page.locator('#address-book-status')).toContainText('已更新 2 个客户端');
-  await expect(page.locator(`[data-peer-id="${firstId}"]`)).toContainText('批量标签');
-
-  await page.locator(`[data-peer-id="${firstId}"] input[type="checkbox"]`).check();
-  await page.locator('#batch-action').selectOption('copy');
-  await page.locator('#batch-target').selectOption(String(targetId));
-  await page.getByRole('button', { name: '应用批量操作' }).click();
-  await page.locator('#address-book-owner').fill(targetName);
-  await page.locator('#address-book-owner').press('Enter');
-  await expect(page.locator(`[data-peer-id="${firstId}"]`)).toContainText('批量标签');
-
-  await page.locator('#address-book-owner').fill(sourceName);
-  await page.locator('#address-book-owner').press('Enter');
-  await page.locator(`[data-peer-id="${secondId}"] input[type="checkbox"]`).check();
-  await page.locator('#batch-action').selectOption('move');
-  await page.locator('#batch-target').selectOption(String(targetId));
-  await page.getByRole('button', { name: '应用批量操作' }).click();
-  await expect(page.locator(`[data-peer-id="${secondId}"]`)).toHaveCount(0);
-
-  await page.locator('#address-book-owner').fill(targetName);
-  await page.locator('#address-book-owner').press('Enter');
-  await expect(page.locator(`[data-peer-id="${secondId}"]`)).toBeVisible();
-  await page.locator(`[data-peer-id="${secondId}"] input[type="checkbox"]`).check();
-  await page.locator('#batch-action').selectOption('remove');
-  await page.getByRole('button', { name: '应用批量操作' }).click();
-  await page.getByRole('dialog', { name: '批量移除通讯录客户端' }).getByRole('button', { name: '确认移除' }).click();
-  await expect(page.locator(`[data-peer-id="${secondId}"]`)).toHaveCount(0);
-
-  await page.reload();
-  await expect(page.locator(`[data-peer-id="${firstId}"]`)).toContainText('批量标签');
-  const persisted = await page.evaluate(async ({ adminPath, targetId }) => (await fetch(`${adminPath}/api/address-book?user_id=${targetId}&page=1&pageSize=20`)).json(), { adminPath, targetId });
-  expect(persisted.data.map(peer => peer.id)).toContain(firstId);
-  expect(persisted.data.find(peer => peer.id === firstId).tags).toContain('批量标签');
-  expect(addressBookSqlSnapshot(sourceId, [firstId, secondId])).toEqual({ profile: [firstId], legacy: [firstId], payload: [firstId] });
-  expect(addressBookSqlSnapshot(targetId, [firstId, secondId])).toEqual({ profile: [firstId], legacy: [firstId], payload: [firstId] });
+  const row = page.locator(`[data-device-id="${deviceId}"]`);
+  await row.getByRole('checkbox', { name: `选择客户端 ${deviceId}` }).check();
+  await page.getByRole('button', { name: /加入通讯录（1）/ }).click();
+  const assignment = page.getByRole('dialog', { name: '分配通讯录' });
+  await assignment.locator(`#assignment-users input[type="checkbox"][value="${targetId}"]`).check();
+  await assignment.getByRole('button', { name: '保存分配' }).click();
+  await expect(page.getByText('通讯录分配已保存')).toBeVisible();
+  expect(addressBookSqlSnapshot(targetId, [deviceId])).toEqual({ profile: [deviceId], legacy: [deviceId], payload: [deviceId] });
   expect(errors).toEqual([]);
 });
 
@@ -1158,45 +1193,6 @@ test('self-scoped administrator cannot self-promote and replaces only personal c
   const forbidden = await page.request.get(`${adminPath}/api/address-book?user_id=${rootUser.id}`);
   expect(forbidden.status()).toBe(403);
   expect(addressBookSqlSnapshot(userId, [peerId])).toEqual({ profile: [peerId], legacy: [peerId], payload: [peerId] });
-});
-
-test('cross-user copy persists through the 390px browser workflow', async ({ page }) => {
-  const suffix = Date.now().toString(36);
-  const sourceName = `mobile-source-${suffix}`;
-  const targetName = `mobile-target-${suffix}`;
-  const peerId = `mobile-copy-${suffix}`;
-  await page.setViewportSize({ width: 390, height: 844 });
-  await loginAdmin(page);
-  const session = await page.request.get(`${adminPath}/api/session`);
-  const { csrf } = await session.json();
-  const sourceResponse = await page.request.post(`${adminPath}/api/users`, { headers: { 'X-CSRF-Token': csrf }, data: { username: sourceName, password: '1', enabled: true } });
-  const targetResponse = await page.request.post(`${adminPath}/api/users`, { headers: { 'X-CSRF-Token': csrf }, data: { username: targetName, password: '1', enabled: true } });
-  const sourceId = (await sourceResponse.json()).id;
-  const targetId = (await targetResponse.json()).id;
-  expect((await page.request.post(`${adminPath}/api/address-book/peers?user_id=${sourceId}`, {
-    headers: { 'X-CSRF-Token': csrf }, data: { id: peerId, alias: '移动端跨用户复制', tags: ['mobile'] },
-  })).ok()).toBeTruthy();
-  await page.goto(`${adminPath}/address-book?user_id=${sourceId}`);
-  await expect(page.locator('#address-book-owner')).toBeVisible();
-  await expect(page.locator('#batch-action')).toBeVisible();
-  await page.locator(`[data-peer-id="${peerId}"] input[type="checkbox"]`).check();
-  await page.locator('#batch-action').selectOption('copy');
-  await page.locator('#batch-target').selectOption(String(targetId));
-  await page.getByRole('button', { name: '应用批量操作' }).click();
-  await expect(page.locator('#address-book-status')).toContainText('操作成功：已更新 1 个客户端');
-  await page.locator('#address-book-owner').fill(targetName);
-  await page.locator('#address-book-owner').press('Enter');
-  await expect(page.locator(`[data-peer-id="${peerId}"]`)).toContainText('移动端跨用户复制');
-  await page.reload();
-  await expect(page.locator(`[data-peer-id="${peerId}"]`)).toContainText('移动端跨用户复制');
-  const persisted = await page.evaluate(async ({ adminPath, targetId }) => (await fetch(`${adminPath}/api/address-book?user_id=${targetId}&page=1&pageSize=20`)).json(), { adminPath, targetId });
-  expect(persisted.data.find(peer => peer.id === peerId).alias).toBe('移动端跨用户复制');
-  expect(addressBookSqlSnapshot(targetId, [peerId])).toEqual({ profile: [peerId], legacy: [peerId], payload: [peerId] });
-  const targetTags = addressBookTagSqlSnapshot(targetId);
-  expect(targetTags.profile).toContain('mobile');
-  expect(targetTags.legacy).toContain('mobile');
-  expect(targetTags.payload).toContain('mobile');
-  expect(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth)).toBeFalsy();
 });
 
 test('personal address book is usable without horizontal overflow at 390px', async ({ page }) => {
